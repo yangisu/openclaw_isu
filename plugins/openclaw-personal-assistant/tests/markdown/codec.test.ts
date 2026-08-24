@@ -24,6 +24,46 @@ describe('typed markdown codec', () => {
     expect(serialized).toContain('- status: done');
   });
 
+  it('round-trips fixture bytes exactly, including preamble boundary newlines and field order', () => {
+    const text = fixture('TASKS.md');
+    const serialized = serializeDocument(parseDocument('task', text));
+
+    expect(serialized).toBe(text);
+    expect(serialized.indexOf('- status: open')).toBeLessThan(serialized.indexOf('- priority: high'));
+    expect(serialized.indexOf('- priority: high')).toBeLessThan(serialized.indexOf('- custom_field: "keep-me"'));
+  });
+
+  it('round-trips multi-record body boundaries exactly', () => {
+    const text = [
+      '# Tasks',
+      '',
+      '### T-20260825-001 첫 번째',
+      '- type: "task"',
+      '- status: open',
+      '- priority: normal',
+      '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00',
+      '- source: "telegram"',
+      '',
+      '첫 본문',
+      '',
+      '### T-20260825-002 두 번째',
+      '- type: "task"',
+      '- status: open',
+      '- priority: normal',
+      '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00',
+      '- source: "telegram"',
+      '',
+      '둘째 본문',
+      '',
+    ].join('\n');
+
+    const serialized = serializeDocument(parseDocument('task', text));
+    expect(serialized).toBe(text);
+    expect(serialized).toContain('첫 본문\n\n### T-20260825-002');
+  });
+
   it.each([
     ['task', 'TASKS.md'],
     ['study', 'STUDY.md'],
@@ -78,6 +118,43 @@ describe('typed markdown codec', () => {
     parsed.records[0].fields.target_id = 'T-20260825-001';
 
     expect(serializeDocument(parsed)).toContain('- target_id: T-20260825-001');
+  });
+
+  it('omits a deleted optional parsed field instead of serializing undefined', () => {
+    const parsed = parseDocument('task', fixture('TASKS.md'));
+    delete parsed.records[0].fields.due_at;
+
+    const serialized = serializeDocument(parsed);
+    expect(serialized).not.toContain('- due_at:');
+    expect(parseDocument('task', serialized).records[0].fields).not.toHaveProperty('due_at');
+  });
+
+  it('validates and serializes archive metadata added to a record', () => {
+    const parsed = parseDocument('task', fixture('TASKS.md'));
+    parsed.records[0].fields.archived_at = 'invalid';
+    expect(() => validateRecord(parsed.records[0])).toThrow(
+      expect.objectContaining({ code: 'invalid_timestamp' }),
+    );
+
+    parsed.records[0].fields.archived_at = '2026-08-25T12:00:00+09:00';
+    parsed.records[0].fields.archive_reason = 'completed elsewhere';
+    const reparsed = parseDocument('task', serializeDocument(parsed));
+    expect(reparsed.records[0].fields).toMatchObject({
+      archived_at: '2026-08-25T12:00:00+09:00',
+      archive_reason: 'completed elsewhere',
+    });
+  });
+
+  it.each([
+    ['title', (parsed: ReturnType<typeof parseDocument>) => { parsed.records[0].title = 'bad\rtitle'; }],
+    ['body', (parsed: ReturnType<typeof parseDocument>) => { parsed.records[0].body = 'bad\rbody'; }],
+  ])('rejects an edited %s containing CR', (_name, edit) => {
+    const parsed = parseDocument('task', fixture('TASKS.md'));
+    edit(parsed);
+
+    expect(() => serializeDocument(parsed)).toThrow(
+      expect.objectContaining({ code: 'invalid_line_endings' }),
+    );
   });
 
   it.each([

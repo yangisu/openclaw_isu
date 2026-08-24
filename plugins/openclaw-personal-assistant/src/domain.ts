@@ -31,6 +31,8 @@ interface CommonRecordFields {
   created_at: string;
   updated_at: string;
   source: string;
+  archived_at?: string;
+  archive_reason?: string;
 }
 
 export interface TaskRecord extends CommonRecordFields {

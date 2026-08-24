@@ -146,10 +146,6 @@ function assertIdForKind(kind: RecordKind, id: string): void {
   }
 }
 
-function rawField(record: ParsedRecord, key: string): string | undefined {
-  return record.orderedFields.find(field => field.key === key)?.rawValue;
-}
-
 function requireField(record: ParsedRecord, key: string): unknown {
   if (!(key in record.fields)) invalid('missing_required_field', `missing required field: ${key}`);
   return record.fields[key];
@@ -212,6 +208,8 @@ function assertCommon(record: ParsedRecord): void {
   assertTimestamp(requireField(record, 'created_at'));
   assertTimestamp(requireField(record, 'updated_at'));
   assertJsonStringField(record, 'source');
+  if ('archived_at' in record.fields) assertTimestamp(record.fields.archived_at);
+  if ('archive_reason' in record.fields) assertJsonStringField(record, 'archive_reason', false);
 }
 
 /** Validates one parsed record against the section 5.1 Markdown contract. */
@@ -314,34 +312,36 @@ export function parseDocument(
   if (!RECORD_KINDS.has(kind)) invalid('invalid_document', 'unknown document kind');
   if (text.includes('\r')) invalid('invalid_line_endings', 'Markdown must use LF line endings');
 
-  const lines = text.split('\n');
-  const headingIndexes = lines.flatMap((line, index) => line.startsWith('### ') ? [index] : []);
-  const firstHeading = headingIndexes[0] ?? lines.length;
+  const headings = [...text.matchAll(/^### [^\n]*(?:\n|$)/gm)];
+  const firstHeading = headings[0]?.index ?? text.length;
   const document: ParsedDocument = {
     kind,
-    preamble: lines.slice(0, firstHeading).join('\n'),
+    preamble: text.slice(0, firstHeading),
     records: [],
   };
   const seenIds = new Set(existingIds);
 
-  for (let headingIndex = 0; headingIndex < headingIndexes.length; headingIndex += 1) {
-    const start = headingIndexes[headingIndex];
-    const end = headingIndexes[headingIndex + 1] ?? lines.length;
-    const heading = HEADING.exec(lines[start]);
+  for (let headingIndex = 0; headingIndex < headings.length; headingIndex += 1) {
+    const matchedHeading = headings[headingIndex];
+    const start = matchedHeading.index;
+    const end = headings[headingIndex + 1]?.index ?? text.length;
+    const headingLine = matchedHeading[0].endsWith('\n')
+      ? matchedHeading[0].slice(0, -1)
+      : matchedHeading[0];
+    const heading = HEADING.exec(headingLine);
     if (!heading) invalid('invalid_heading', 'record heading must use ### <ID> <title>');
     const [, id, title] = heading;
     if (title.trim().length === 0) invalid('empty_title', 'record title cannot be empty');
 
+    const content = text.slice(start + matchedHeading[0].length, end);
+    const separator = content.indexOf('\n\n');
+    if (separator < 0) invalid('invalid_document', 'fields must be followed by one blank line');
+    const fieldBlock = content.slice(0, separator);
     const orderedFields: ParsedRecord['orderedFields'] = [];
-    let cursor = start + 1;
-    while (cursor < end && lines[cursor] !== '') {
-      const field = FIELD.exec(lines[cursor]);
+    for (const line of fieldBlock.split('\n')) {
+      const field = FIELD.exec(line);
       if (!field) invalid('invalid_field', 'fields must be consecutive - key: value lines');
       orderedFields.push({ key: field[1], rawValue: field[2] });
-      cursor += 1;
-    }
-    if (cursor === end || lines[cursor] !== '') {
-      invalid('invalid_document', 'fields must be followed by one blank line');
     }
     const fields: Record<string, unknown> = {};
     for (const field of orderedFields) fields[field.key] = parseRawValue(field.rawValue);
@@ -350,7 +350,7 @@ export function parseDocument(
       title,
       orderedFields,
       fields,
-      body: lines.slice(cursor + 1, end).join('\n'),
+      body: content.slice(separator + 2),
     };
     validateRecord(record);
     const expectedKind = TYPE_TO_KIND[String(record.fields.type)];
@@ -388,7 +388,7 @@ export function serializeDocument(document: ParsedDocument): string {
     const fields: string[] = [];
     for (const field of record.orderedFields) {
       present.add(field.key);
-      if (field.key in record.fields && record.fields[field.key] === undefined) continue;
+      if (record.fields[field.key] === undefined) continue;
       fields.push(`- ${field.key}: ${serializeValue(field.key, record.fields[field.key], field.rawValue)}`);
     }
     for (const key of Object.keys(record.fields)) {
@@ -397,5 +397,7 @@ export function serializeDocument(document: ParsedDocument): string {
     }
     return `### ${record.id} ${record.title}\n${fields.join('\n')}\n\n${record.body}`;
   });
-  return document.preamble + records.join('');
+  const serialized = document.preamble + records.join('');
+  if (serialized.includes('\r')) invalid('invalid_line_endings', 'Markdown must use LF line endings');
+  return serialized;
 }
