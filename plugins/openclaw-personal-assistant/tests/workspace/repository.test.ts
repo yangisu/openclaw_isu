@@ -1,7 +1,9 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import {
+  mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -254,9 +256,11 @@ describe('WorkspaceRepository', () => {
           }
         },
       });
-      await repo.addTask('race-' + label, {
+      const mutation = repo.addTask('race-' + label, {
         title: 'Race ' + label, body: 'Body\\n', priority: 'normal', source: 'telegram',
       });
+      await writeFile(join(control, 'acquiring-' + label), 'acquiring');
+      await mutation;
       repo.close();
     `;
     const children = ['a', 'b'].map(label => spawn(
@@ -276,6 +280,7 @@ describe('WorkspaceRepository', () => {
     const exits = children.map(waitForChild);
     await Promise.all(['a', 'b'].map(label => waitForFile(join(control, `ready-${label}`))));
     await writeFile(join(control, 'start'), 'start');
+    await Promise.all(['a', 'b'].map(label => waitForFile(join(control, `acquiring-${label}`))));
     let first: 'a' | 'b';
     while (true) {
       const names = await readdir(control);
@@ -284,7 +289,6 @@ describe('WorkspaceRepository', () => {
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     const second = first === 'a' ? 'b' : 'a';
-    await new Promise(resolve => setTimeout(resolve, 200));
     const beforeRelease = await readdir(control);
     await writeFile(join(control, `release-${first}`), 'release');
     await waitForFile(join(control, `entered-${second}`));
@@ -334,6 +338,66 @@ describe('WorkspaceRepository', () => {
     expect(elapsed).toBeGreaterThanOrEqual(1_200);
     expect(result.id).toBe('T-20260825-001');
   }, 20_000);
+
+  it('canonicalizes equivalent state-directory aliases for the same-process async gate', async () => {
+    const { config, repo } = await fixture();
+    repo.close();
+    repositories.splice(repositories.indexOf(repo), 1);
+    const aliases = [`${config.stateDir}${sep}.`];
+    const link = join(dirname(config.stateDir), 'state-link');
+    try {
+      await symlink(config.stateDir, link, process.platform === 'win32' ? 'junction' : 'dir');
+      aliases.push(link);
+    } catch (error) {
+      if (!['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    }
+    if (process.platform === 'win32') {
+      const caseAlias = config.stateDir.replace(/^([a-z]):/i, drive => (
+        drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase()
+      ));
+      if (caseAlias !== config.stateDir) aliases.push(caseAlias);
+    }
+
+    for (const [index, alias] of aliases.entries()) {
+      let entered!: () => void;
+      const enteredRename = new Promise<void>(resolve => { entered = resolve; });
+      let release!: () => void;
+      const releaseRename = new Promise<void>(resolve => { release = resolve; });
+      const primary = await openRepository(config, {
+        now: fixedNow,
+        checkpoint: async phase => {
+          if (phase === 'beforeRename') {
+            entered();
+            await releaseRename;
+          }
+        },
+      });
+      const equivalent = await openRepository({ ...config, stateDir: alias }, { now: fixedNow });
+      repositories.push(primary, equivalent);
+      const firstMutation = primary.addTask(`canonical-primary-${index}`, taskInput(index * 2));
+      await enteredRename;
+      const secondMutation = equivalent.addTask(
+        `canonical-alias-${index}`,
+        taskInput(index * 2 + 1),
+      );
+      let timerAdvanced = false;
+      await new Promise<void>(resolve => setTimeout(() => {
+        timerAdvanced = true;
+        release();
+        resolve();
+      }, 25));
+      const [first, second] = await Promise.all([
+        firstMutation,
+        secondMutation,
+      ]);
+      expect(timerAdvanced).toBe(true);
+      expect(first.id).not.toBe(second.id);
+      primary.close();
+      equivalent.close();
+      repositories.splice(repositories.indexOf(primary), 1);
+      repositories.splice(repositories.indexOf(equivalent), 1);
+    }
+  }, 40_000);
 
   it('does not quarantine arbitrary user temp files', async () => {
     const { repo, workspace } = await fixture();

@@ -2,7 +2,6 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync } from 'node:fs';
 import {
   copyFile,
   mkdir,
@@ -26,6 +25,10 @@ import type {
 } from '../domain.js';
 import { parseDocument, serializeDocument } from '../markdown/codec.js';
 import { OperationLedger, type LedgerOperation } from '../state/operations.js';
+import {
+  WorkspaceLockCoordinator,
+  type CoordinatedAcquisition,
+} from './lock-coordinator.js';
 
 export type RepositoryCheckpoint = 'beforeRename' | 'afterRename' | 'afterGitCommit';
 
@@ -154,23 +157,6 @@ const DEFAULT_PREAMBLE: Readonly<Record<RecordKind, string>> = {
   daily: '# Daily Memory\n\n',
 };
 
-const LOCAL_COORDINATOR_TAILS = new Map<string, Promise<void>>();
-
-async function withLocalCoordinator<T>(path: string, work: () => Promise<T>): Promise<T> {
-  const previous = LOCAL_COORDINATOR_TAILS.get(path) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  const tail = previous.then(() => gate);
-  LOCAL_COORDINATOR_TAILS.set(path, tail);
-  await previous;
-  try {
-    return await work();
-  } finally {
-    release();
-    if (LOCAL_COORDINATOR_TAILS.get(path) === tail) LOCAL_COORDINATOR_TAILS.delete(path);
-  }
-}
-
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -297,15 +283,10 @@ function isWindowsUnsupportedDirectoryError(error: unknown): boolean {
     && ['EACCES', 'EINVAL', 'EISDIR', 'EPERM'].includes(code ?? '');
 }
 
-function isSqliteBusy(error: unknown): boolean {
-  const sqlite = error as { code?: string; errcode?: number; message?: string };
-  return sqlite.errcode === 5
-    || (sqlite.code === 'ERR_SQLITE_ERROR' && /busy|locked/i.test(sqlite.message ?? ''));
-}
-
 export class WorkspaceRepository {
   public readonly ledger: OperationLedger;
   private readonly now: () => Date;
+  private readonly lockCoordinator: WorkspaceLockCoordinator;
   private closed = false;
 
   constructor(
@@ -313,6 +294,7 @@ export class WorkspaceRepository {
     private readonly options: RepositoryOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.lockCoordinator = new WorkspaceLockCoordinator(config.stateDir);
     this.ledger = new OperationLedger(config.stateDir);
   }
 
@@ -788,34 +770,7 @@ export class WorkspaceRepository {
       await this.reconcilePendingOperations();
       return await work();
     } finally {
-      let closeError: unknown;
-      try {
-        await lock.handle.close();
-      } catch (error) {
-        closeError = error;
-      }
-      let removed = false;
-      let unlinkError: unknown;
-      try {
-        removed = await this.unlinkUnchangedLock(lockPath, lock.snapshot, 1_000);
-      } catch (error) {
-        unlinkError = error;
-      }
-      if (closeError !== undefined && unlinkError !== undefined) {
-        throw new AggregateError(
-          [closeError, unlinkError],
-          'workspace lock close and unlink both failed',
-        );
-      }
-      if (unlinkError !== undefined) throw unlinkError;
-      if (!removed) {
-        throw new WorkspaceRepositoryError(
-          'workspace_lock_ownership_lost',
-          `workspace lock ${lock.metadata.ownerId} changed before release`,
-          closeError,
-        );
-      }
-      if (closeError !== undefined) throw closeError;
+      await this.releaseHeldLock(lockPath, lock);
     }
   }
 
@@ -824,60 +779,61 @@ export class WorkspaceRepository {
     operationId: string | undefined,
     deadline: number,
   ): Promise<HeldWorkspaceLock | undefined> {
-    const coordinatorPath = join(this.config.stateDir, 'workspace-lock-coordinator.sqlite3');
-    return withLocalCoordinator(coordinatorPath, async () => {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
-      const database = new DatabaseSync(coordinatorPath);
-      chmodSync(coordinatorPath, 0o600);
-      database.exec(`PRAGMA busy_timeout = ${Math.max(1, remaining)};`);
-      let transactionOpen = false;
+    return this.lockCoordinator.attempt(deadline, async () => {
+      let lock: HeldWorkspaceLock | undefined;
       try {
-        database.exec(`
-          CREATE TABLE IF NOT EXISTS lock_coordination (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
-          ) STRICT;
-        `);
-        const transactionRemaining = deadline - Date.now();
-        if (transactionRemaining <= 0) return undefined;
-        database.exec(`PRAGMA busy_timeout = ${transactionRemaining};`);
-        database.exec('BEGIN IMMEDIATE;');
-        transactionOpen = true;
-
-        let lock: HeldWorkspaceLock | undefined;
-        try {
-          lock = await this.createWorkspaceLock(lockPath, operationId);
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          const sharingRace = process.platform === 'win32'
-            && (code === 'EACCES' || code === 'EPERM');
-          if (code !== 'EEXIST' && !sharingRace) throw error;
-          if (await this.tryRecoverStaleLock(lockPath, deadline)) {
-            lock = await this.createWorkspaceLock(lockPath, operationId);
-          }
-        }
-
-        database.exec('COMMIT;');
-        transactionOpen = false;
-        return lock;
+        lock = await this.createWorkspaceLock(lockPath, operationId);
       } catch (error) {
-        let rollbackError: unknown;
-        if (transactionOpen) {
-          try {
-            database.exec('ROLLBACK;');
-          } catch (rollback) {
-            rollbackError = rollback;
-          }
+        const code = (error as NodeJS.ErrnoException).code;
+        const sharingRace = process.platform === 'win32'
+          && (code === 'EACCES' || code === 'EPERM');
+        if (code !== 'EEXIST' && !sharingRace) throw error;
+        if (await this.tryRecoverStaleLock(lockPath, deadline)) {
+          lock = await this.createWorkspaceLock(lockPath, operationId);
         }
-        if (rollbackError !== undefined) {
-          throw new AggregateError([error, rollbackError], 'lock coordinator rollback failed');
-        }
-        if (isSqliteBusy(error)) return undefined;
-        throw error;
-      } finally {
-        database.close();
       }
+
+      if (lock === undefined) return undefined;
+      const acquisition: CoordinatedAcquisition<HeldWorkspaceLock> = {
+        value: lock,
+        cleanup: () => this.releaseHeldLock(lockPath, lock!),
+      };
+      return acquisition;
     });
+  }
+
+  private async releaseHeldLock(
+    lockPath: string,
+    lock: HeldWorkspaceLock,
+  ): Promise<void> {
+    let closeError: unknown;
+    try {
+      await lock.handle.close();
+    } catch (error) {
+      closeError = error;
+    }
+    let removed = false;
+    let unlinkError: unknown;
+    try {
+      removed = await this.unlinkUnchangedLock(lockPath, lock.snapshot, 1_000);
+    } catch (error) {
+      unlinkError = error;
+    }
+    if (closeError !== undefined && unlinkError !== undefined) {
+      throw new AggregateError(
+        [closeError, unlinkError],
+        'workspace lock close and unlink both failed',
+      );
+    }
+    if (unlinkError !== undefined) throw unlinkError;
+    if (!removed) {
+      throw new WorkspaceRepositoryError(
+        'workspace_lock_ownership_lost',
+        `workspace lock ${lock.metadata.ownerId} changed before release`,
+        closeError,
+      );
+    }
+    if (closeError !== undefined) throw closeError;
   }
 
   private async createWorkspaceLock(
