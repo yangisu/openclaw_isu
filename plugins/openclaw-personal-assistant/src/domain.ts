@@ -1,0 +1,98 @@
+export type RecordKind =
+  | 'task'
+  | 'study'
+  | 'note'
+  | 'preference'
+  | 'memory'
+  | 'inbox'
+  | 'daily';
+
+export interface OrderedField {
+  key: string;
+  rawValue: string;
+}
+
+export interface ParsedRecord {
+  id: string;
+  title: string;
+  orderedFields: OrderedField[];
+  fields: Record<string, unknown>;
+  body: string;
+}
+
+export interface ParsedDocument {
+  kind: RecordKind;
+  preamble: string;
+  records: ParsedRecord[];
+}
+
+interface CommonRecordFields {
+  type: string;
+  created_at: string;
+  updated_at: string;
+  source: string;
+}
+
+export interface TaskRecord extends CommonRecordFields {
+  type: 'task';
+  status: 'open' | 'in_progress' | 'done' | 'archived';
+  priority: 'high' | 'normal' | 'low';
+  due_at?: string;
+  completed_at?: string;
+}
+
+export interface StudyRecord extends CommonRecordFields {
+  type: 'study';
+  status: 'open' | 'in_progress' | 'done' | 'archived';
+  subject: string;
+  target_amount: number;
+  unit: string;
+  progress: number;
+  target_date?: string;
+  recurrence?: 'none' | 'daily' | 'weekly';
+  review_dates?: string[];
+}
+
+export interface NoteRecord extends CommonRecordFields {
+  type: 'note';
+  status: 'active' | 'archived';
+  url?: string;
+  tags?: string[];
+}
+
+export interface PreferenceRecord extends CommonRecordFields {
+  type: 'preference';
+  active: boolean;
+  supersedes?: string;
+}
+
+export interface MemoryRecord extends CommonRecordFields {
+  type: 'memory';
+  active: boolean;
+  supersedes?: string;
+  sensitivity?: 'normal' | 'sensitive';
+}
+
+export interface InboxRecord extends CommonRecordFields {
+  type: 'inbox';
+  status: 'pending' | 'resolved' | 'archived';
+  reason: string;
+  original_text: string;
+  resolved_at?: string;
+  target_id?: string;
+}
+
+export interface DailyRecord extends CommonRecordFields {
+  type: 'daily';
+  entry_at: string;
+  related_ids?: string[];
+}
+
+export type AssistantRecord =
+  | TaskRecord
+  | StudyRecord
+  | NoteRecord
+  | PreferenceRecord
+  | MemoryRecord
+  | InboxRecord
+  | DailyRecord;
