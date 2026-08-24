@@ -173,6 +173,13 @@ export function semanticEventHash(event: CalendarEventDraft): string {
 
 function normalizeDraftDate(value: string): string {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const fraction = /\.(\d+)(?=Z|[+-]\d{2}:?\d{2}|$)/i.exec(value);
+  if (fraction) {
+    if (fraction[1].length > 3 || /[1-9]/.test(fraction[1])) {
+      throw new Error('fractional seconds must be zero');
+    }
+    value = `${value.slice(0, fraction.index)}${value.slice(fraction.index + fraction[0].length)}`;
+  }
   const local = LOCAL_DATE_TIME.exec(value);
   if (local) {
     return ianaLocalDateToUtc({

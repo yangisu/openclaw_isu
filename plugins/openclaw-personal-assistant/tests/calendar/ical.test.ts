@@ -158,6 +158,34 @@ describe('iCalendar canonicalization', () => {
     }
   });
 
+  it.each([
+    ['floating DTSTART', 'dtstart', '2026-08-25T09:00:00.1'],
+    ['UTC DTSTART', 'dtstart', '2026-08-25T00:00:00.001Z'],
+    ['offset DTSTART', 'dtstart', '2026-08-25T09:00:00.1+09:00'],
+    ['floating DTEND', 'dtend', '2026-08-25T10:00:00.001'],
+    ['UTC DTEND', 'dtend', '2026-08-25T01:00:00.1Z'],
+    ['offset DTEND', 'dtend', '2026-08-25T10:00:00.001+09:00'],
+  ] as const)('rejects non-zero fractional seconds in %s', (_name, field, value) => {
+    const draft = {
+      calendarId: 'personal', uid: 'fractional', dtstart: '2026-08-25T00:00:00Z',
+      dtend: '2026-08-25T01:00:00Z', summary: 'Fractional', [field]: value,
+    };
+    expect(() => semanticEventHash(draft)).toThrow(/fractional seconds/i);
+    expect(() => buildIcal(draft)).toThrow(/fractional seconds/i);
+  });
+
+  it.each([
+    ['floating', '2026-08-25T09:00:00.0', '2026-08-25T10:00:00.0'],
+    ['UTC', '2026-08-25T00:00:00.00Z', '2026-08-25T01:00:00.00Z'],
+    ['offset', '2026-08-25T09:00:00.000+09:00', '2026-08-25T10:00:00.000+09:00'],
+  ])('canonicalizes zero fractional seconds for %s drafts', (_name, dtstart, dtend) => {
+    const draft = { calendarId: 'personal', uid: `zero-${_name}`, dtstart, dtend, summary: 'Zero fraction' };
+    const output = buildIcal(draft);
+    const parsed = parseIcal(output, 'personal')[0];
+    expect(output).not.toMatch(/DT(?:START|END)[^\r\n]*\.000/);
+    expect(semanticEventHash(parsed)).toBe(semanticEventHash(draft));
+  });
+
   it('emits RFC 5545 text escaping and folds every physical line at 75 UTF-8 octets', () => {
     const summary = `${'한'.repeat(35)}, semi; slash\\ line\nnext`;
     const output = buildIcal({
