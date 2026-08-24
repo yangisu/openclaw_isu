@@ -23,6 +23,17 @@ export interface CalendarEvent extends CalendarEventDraft {
 }
 
 const APPLICATION_TIMEZONE = 'Asia/Seoul';
+const LOCAL_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+
+interface WallTime {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  millisecond?: number;
+}
 
 function recurrenceData(value: ICAL.Recur): RecurrenceRule {
   const data = value.toJSON() as Record<string, unknown>;
@@ -77,8 +88,16 @@ function normalizeTime(component: ICAL.Component, name: 'dtstart' | 'dtend' | 'r
   return ianaLocalDateToUtc(value, tzid || APPLICATION_TIMEZONE).toISOString();
 }
 
-function ianaLocalDateToUtc(value: ICAL.Time, timeZone: string): Date {
-  const localAsUtc = Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second);
+function ianaLocalDateToUtc(value: WallTime, timeZone: string): Date {
+  const localAsUtc = Date.UTC(
+    value.year, value.month - 1, value.day, value.hour, value.minute, value.second, value.millisecond ?? 0,
+  );
+  const validation = new Date(localAsUtc);
+  if (validation.getUTCFullYear() !== value.year || validation.getUTCMonth() !== value.month - 1 ||
+      validation.getUTCDate() !== value.day || validation.getUTCHours() !== value.hour ||
+      validation.getUTCMinutes() !== value.minute || validation.getUTCSeconds() !== value.second) {
+    throw new Error('invalid local event date');
+  }
   let formatter: Intl.DateTimeFormat;
   try {
     formatter = new Intl.DateTimeFormat('en-US', {
@@ -99,16 +118,17 @@ function ianaLocalDateToUtc(value: ICAL.Time, timeZone: string): Date {
     .map(offset => localAsUtc - offset)
     .filter(candidate => formattedUtcMilliseconds(formatter, candidate) === localAsUtc);
   const unique = [...new Set(candidates)];
-  if (unique.length !== 1) {
-    throw new Error(`nonexistent or ambiguous local time in ${timeZone}`);
-  }
-  return new Date(unique[0]);
+  if (unique.length === 1) return new Date(unique[0]);
+  if (unique.length > 1) return new Date(Math.min(...unique));
+  if (offsets.size > 1) return new Date(localAsUtc - Math.min(...offsets));
+  throw new Error(`unable to resolve local time in ${timeZone}`);
 }
 
 function formattedUtcMilliseconds(formatter: Intl.DateTimeFormat, instant: number): number {
   const parts = Object.fromEntries(formatter.formatToParts(new Date(instant))
     .filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
-  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  const millisecond = ((instant % 1_000) + 1_000) % 1_000;
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, millisecond);
 }
 
 function pad(value: number, width = 2): string {
@@ -153,6 +173,15 @@ export function semanticEventHash(event: CalendarEventDraft): string {
 
 function normalizeDraftDate(value: string): string {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const local = LOCAL_DATE_TIME.exec(value);
+  if (local) {
+    return ianaLocalDateToUtc({
+      year: Number(local[1]), month: Number(local[2]), day: Number(local[3]),
+      hour: Number(local[4]), minute: Number(local[5]), second: Number(local[6] ?? 0),
+      millisecond: Number((local[7] ?? '').padEnd(3, '0') || 0),
+    }, APPLICATION_TIMEZONE).toISOString();
+  }
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) throw new Error('invalid local event date');
   const parsed = new Date(value);
   if (Number.isNaN(parsed.valueOf())) throw new Error('invalid event date');
   return parsed.toISOString();

@@ -102,12 +102,14 @@ describe('iCalendar canonicalization', () => {
     ]);
   });
 
-  it('handles DST boundaries predictably and fails closed for gaps and overlaps', () => {
+  it('uses the pre-gap offset and first repeated occurrence at DST boundaries', () => {
     const eventAt = (local: string, end: string) => `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:${local}\r\nDTSTART;TZID=America/New_York:${local}\r\nDTEND;TZID=America/New_York:${end}\r\nSUMMARY:DST\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
     expect(parseIcal(eventAt('20260308T013000', '20260308T014500'), 'dst')[0].dtstart).toBe('2026-03-08T06:30:00.000Z');
     expect(parseIcal(eventAt('20260308T033000', '20260308T040000'), 'dst')[0].dtstart).toBe('2026-03-08T07:30:00.000Z');
-    expect(() => parseIcal(eventAt('20260308T023000', '20260308T033000'), 'dst')).toThrow(/nonexistent|ambiguous/i);
-    expect(() => parseIcal(eventAt('20261101T013000', '20261101T023000'), 'dst')).toThrow(/nonexistent|ambiguous/i);
+    expect(parseIcal(eventAt('20260308T023000', '20260308T033000'), 'dst')[0].dtstart)
+      .toBe('2026-03-08T07:30:00.000Z');
+    expect(parseIcal(eventAt('20261101T013000', '20261101T023000'), 'dst')[0].dtstart)
+      .toBe('2026-11-01T05:30:00.000Z');
   });
 
   it('uses embedded VTIMEZONE data for custom timezone identifiers', () => {
@@ -123,6 +125,33 @@ describe('iCalendar canonicalization', () => {
     try {
       const source = `BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:floating\r\nDTSTART:20260825T090000\r\nDTEND:20260825T100000\r\nSUMMARY:Floating\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n`;
       expect(parseIcal(source, 'personal')[0].dtstart).toBe('2026-08-25T00:00:00.000Z');
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  });
+
+  it('builds and hashes floating drafts as Asia/Seoul independent of host timezone', () => {
+    const draft = {
+      calendarId: 'personal', uid: 'floating-draft', dtstart: '2026-08-25T09:00:00',
+      dtend: '2026-08-25T10:00:00', summary: 'Floating draft',
+    };
+    const previous = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      const utcHost = { hash: semanticEventHash(draft), ical: buildIcal(draft) };
+      process.env.TZ = 'America/Los_Angeles';
+      const losAngelesHost = { hash: semanticEventHash(draft), ical: buildIcal(draft) };
+      expect(losAngelesHost).toEqual(utcHost);
+      expect(utcHost.ical).toContain('DTSTART:20260825T000000Z');
+      expect(utcHost.ical).toContain('DTEND:20260825T010000Z');
+
+      const spaced = { ...draft, dtstart: '2026-08-25 09:00:00', dtend: '2026-08-25 10:00:00' };
+      process.env.TZ = 'UTC';
+      const spacedUtcHost = { hash: semanticEventHash(spaced), ical: buildIcal(spaced) };
+      process.env.TZ = 'America/Los_Angeles';
+      expect({ hash: semanticEventHash(spaced), ical: buildIcal(spaced) }).toEqual(spacedUtcHost);
+      expect(spacedUtcHost.ical).toContain('DTSTART:20260825T000000Z');
     } finally {
       if (previous === undefined) delete process.env.TZ;
       else process.env.TZ = previous;

@@ -1,23 +1,10 @@
-import { open } from 'node:fs/promises';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { CalDavError, type CalDavErrorCode } from './errors.js';
 import { type CalendarEvent, parseIcal } from './ical.js';
+import { readCalDavCredentials } from './secret.js';
 
-export type CalDavErrorCode =
-  | 'CALDAV_AUTH'
-  | 'CALDAV_TIMEOUT'
-  | 'CALDAV_XML'
-  | 'CALDAV_DUPLICATE_UID'
-  | 'CALDAV_SECRET_PERMISSIONS'
-  | 'CALDAV_SECRET'
-  | 'CALDAV_TLS_REQUIRED'
-  | 'CALDAV_HTTP';
-
-export class CalDavError extends Error {
-  constructor(public readonly code: CalDavErrorCode, message: string) {
-    super(message);
-    this.name = 'CalDavError';
-  }
-}
+export { CalDavError };
+export type { CalDavErrorCode };
 
 export interface CalDavCalendar {
   id: string;
@@ -38,13 +25,6 @@ export interface CalDavClientOptions {
   fetch?: FetchLike;
   /** Defaults to the fixed production request bound of 15 seconds. */
   timeoutMs?: number;
-  /** Test seam for platforms where fixture files cannot expose POSIX modes. */
-  secretPermissionVerifier?: (mode: number) => boolean | Promise<boolean>;
-}
-
-interface Credentials {
-  username: string;
-  password: string;
 }
 
 const DAV_HEADERS = { 'content-type': 'application/xml; charset=utf-8' };
@@ -54,7 +34,6 @@ export class CalDavClient {
   readonly #secretFile: string;
   readonly #fetch: FetchLike;
   readonly #timeoutMs: number;
-  readonly #secretPermissionVerifier: (mode: number) => boolean | Promise<boolean>;
 
   constructor(options: CalDavClientOptions) {
     this.#baseUrl = new URL(options.baseUrl);
@@ -64,7 +43,6 @@ export class CalDavClient {
     this.#secretFile = options.secretFile;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
-    this.#secretPermissionVerifier = options.secretPermissionVerifier ?? isOwnerOnlySecretMode;
   }
 
   async listCalendars(): Promise<CalDavCalendar[]> {
@@ -123,7 +101,7 @@ export class CalDavClient {
   }
 
   async #request(method: 'PROPFIND' | 'REPORT', body: string, depth: string): Promise<string> {
-    const credentials = await readCredentials(this.#secretFile, this.#secretPermissionVerifier);
+    const credentials = await readCalDavCredentials(this.#secretFile);
     const signal = AbortSignal.timeout(this.#timeoutMs);
     let response: Response;
     try {
@@ -151,33 +129,6 @@ export class CalDavClient {
       if (signal.aborted) throw new CalDavError('CALDAV_TIMEOUT', 'CalDAV request timed out');
       throw new CalDavError('CALDAV_HTTP', 'CalDAV response body failed');
     }
-  }
-}
-
-export function isOwnerOnlySecretMode(mode: number, platform: NodeJS.Platform = process.platform): boolean {
-  return platform !== 'win32' && (mode & 0o777) === 0o600;
-}
-
-async function readCredentials(
-  path: string,
-  verifyPermissions: (mode: number) => boolean | Promise<boolean>,
-): Promise<Credentials> {
-  let handle;
-  try {
-    handle = await open(path, 'r');
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || !await verifyPermissions(metadata.mode)) {
-      throw new CalDavError('CALDAV_SECRET_PERMISSIONS', 'CalDAV secret file must have mode 600');
-    }
-    const parsed = JSON.parse(await handle.readFile('utf8')) as Partial<Credentials>;
-    if (typeof parsed.username !== 'string' || !parsed.username ||
-        typeof parsed.password !== 'string' || !parsed.password) throw new Error('invalid');
-    return { username: parsed.username, password: parsed.password };
-  } catch (error) {
-    if (error instanceof CalDavError) throw error;
-    throw new CalDavError('CALDAV_SECRET', 'Invalid CalDAV secret file');
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 }
 
