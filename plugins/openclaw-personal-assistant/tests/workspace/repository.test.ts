@@ -1,5 +1,5 @@
-import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -16,6 +16,7 @@ import {
 
 const repositories: WorkspaceRepository[] = [];
 const fixedNow = () => new Date('2026-08-25T00:03:00.000Z');
+let childRepositoryUrl: string | undefined;
 
 afterEach(() => {
   while (repositories.length > 0) repositories.pop()?.close();
@@ -60,6 +61,37 @@ function taskInput(index: number): AddTaskInput {
     priority: index % 2 === 0 ? 'high' : 'normal',
     source: 'telegram',
   };
+}
+
+function repositoryUrlForChild(): string {
+  if (childRepositoryUrl !== undefined) return childRepositoryUrl;
+  const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
+  execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json']);
+  childRepositoryUrl = pathToFileURL(
+    join(process.cwd(), 'dist', 'workspace', 'repository.js'),
+  ).href;
+  return childRepositoryUrl;
+}
+
+async function waitForFile(path: string, timeout = 10_000): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (true) {
+    try {
+      await readFile(path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+}
+
+function waitForChild(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', code => resolve(code));
+  });
 }
 
 async function restart(
@@ -153,11 +185,7 @@ describe('WorkspaceRepository', () => {
 
   it('recovers a dead child process lock and quarantines only its known temp file', async () => {
     const { config, repo, workspace } = await fixture();
-    const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
-    execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json']);
-    const repositoryUrl = pathToFileURL(
-      join(process.cwd(), 'dist', 'workspace', 'repository.js'),
-    ).href;
+    const repositoryUrl = repositoryUrlForChild();
     const childProgram = `
       import { openRepository } from ${JSON.stringify(repositoryUrl)};
       const config = JSON.parse(process.env.ASSISTANT_CRASH_CONFIG);
@@ -188,6 +216,124 @@ describe('WorkspaceRepository', () => {
     expect((await readdir(workspace)).filter(name => name.includes('.tmp-'))).toEqual([]);
     expect(await readFile(join(workspace, 'TASKS.md'), 'utf8')).not.toContain('PROMOTE-ME');
   }, 30_000);
+
+  it('serializes two stale-lock reclaimers before either can replace a live owner', async () => {
+    const { config, repo, workspace } = await fixture();
+    repo.close();
+    repositories.splice(repositories.indexOf(repo), 1);
+    const deadOwner = spawn(process.execPath, ['--eval', 'process.exit(0)'], { stdio: 'ignore' });
+    const deadPid = deadOwner.pid!;
+    await waitForChild(deadOwner);
+    await writeFile(join(workspace, '.assistant.lock'), `${JSON.stringify({
+      version: 1,
+      pid: deadPid,
+      createdAt: '2026-08-25T00:00:00.000Z',
+      ownerId: 'dead-owner-identity',
+      operationId: 'dead-operation',
+    })}\n`);
+    const control = join(config.stateDir, 'race-control');
+    await mkdir(control);
+    const repositoryUrl = repositoryUrlForChild();
+    const childProgram = `
+      import { readFile, writeFile } from 'node:fs/promises';
+      import { join } from 'node:path';
+      import { openRepository } from ${JSON.stringify(repositoryUrl)};
+      const config = JSON.parse(process.env.ASSISTANT_RACE_CONFIG);
+      const label = process.env.ASSISTANT_RACE_LABEL;
+      const control = process.env.ASSISTANT_RACE_CONTROL;
+      const exists = async path => readFile(path).then(() => true, () => false);
+      await writeFile(join(control, 'ready-' + label), 'ready');
+      while (!(await exists(join(control, 'start')))) await new Promise(r => setTimeout(r, 10));
+      const repo = await openRepository(config, {
+        now: () => new Date('2026-08-25T00:03:00.000Z'),
+        checkpoint: async phase => {
+          if (phase !== 'beforeRename') return;
+          await writeFile(join(control, 'entered-' + label), 'entered');
+          while (!(await exists(join(control, 'release-' + label)))) {
+            await new Promise(r => setTimeout(r, 10));
+          }
+        },
+      });
+      await repo.addTask('race-' + label, {
+        title: 'Race ' + label, body: 'Body\\n', priority: 'normal', source: 'telegram',
+      });
+      repo.close();
+    `;
+    const children = ['a', 'b'].map(label => spawn(
+      process.execPath,
+      ['--input-type=module', '--eval', childProgram],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          ASSISTANT_RACE_CONFIG: JSON.stringify(config),
+          ASSISTANT_RACE_CONTROL: control,
+          ASSISTANT_RACE_LABEL: label,
+        },
+        stdio: 'ignore',
+      },
+    ));
+    const exits = children.map(waitForChild);
+    await Promise.all(['a', 'b'].map(label => waitForFile(join(control, `ready-${label}`))));
+    await writeFile(join(control, 'start'), 'start');
+    let first: 'a' | 'b';
+    while (true) {
+      const names = await readdir(control);
+      if (names.includes('entered-a')) { first = 'a'; break; }
+      if (names.includes('entered-b')) { first = 'b'; break; }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    const second = first === 'a' ? 'b' : 'a';
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const beforeRelease = await readdir(control);
+    await writeFile(join(control, `release-${first}`), 'release');
+    await waitForFile(join(control, `entered-${second}`));
+    await writeFile(join(control, `release-${second}`), 'release');
+    expect(await Promise.all(exits)).toEqual([0, 0]);
+
+    expect(beforeRelease.filter(name => name.startsWith('entered-'))).toHaveLength(1);
+    const coordinator = join(config.stateDir, 'workspace-lock-coordinator.sqlite3');
+    expect((await stat(coordinator)).isFile()).toBe(true);
+    if (process.platform !== 'win32') expect((await stat(coordinator)).mode & 0o777).toBe(0o600);
+    const reopened = await openRepository(config, { now: fixedNow });
+    expect(reopened.ledger).toBeDefined();
+    reopened.close();
+  }, 30_000);
+
+  it('continues after a process dies while holding the SQLite lock coordinator', async () => {
+    const { config, repo } = await fixture();
+    const coordinator = join(config.stateDir, 'workspace-lock-coordinator.sqlite3');
+    const ready = join(config.stateDir, 'coordinator-holder-ready');
+    const holderProgram = `
+      import { chmodSync } from 'node:fs';
+      import { writeFile } from 'node:fs/promises';
+      import { DatabaseSync } from 'node:sqlite';
+      const database = new DatabaseSync(process.env.ASSISTANT_COORDINATOR_PATH);
+      chmodSync(process.env.ASSISTANT_COORDINATOR_PATH, 0o600);
+      database.exec('BEGIN IMMEDIATE');
+      await writeFile(process.env.ASSISTANT_COORDINATOR_READY, 'ready');
+      setTimeout(() => process.exit(91), 1500);
+    `;
+    const holder = spawn(process.execPath, ['--input-type=module', '--eval', holderProgram], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ASSISTANT_COORDINATOR_PATH: coordinator,
+        ASSISTANT_COORDINATOR_READY: ready,
+      },
+      stdio: 'ignore',
+    });
+    const holderExit = waitForChild(holder);
+    await waitForFile(ready);
+    const startedAt = Date.now();
+
+    const result = await repo.addTask('after-coordinator-death', taskInput(1));
+
+    const elapsed = Date.now() - startedAt;
+    expect(await holderExit).toBe(91);
+    expect(elapsed).toBeGreaterThanOrEqual(1_200);
+    expect(result.id).toBe('T-20260825-001');
+  }, 20_000);
 
   it('does not quarantine arbitrary user temp files', async () => {
     const { repo, workspace } = await fixture();
@@ -342,7 +488,7 @@ describe('WorkspaceRepository', () => {
       .toBe('# Tasks\n\nRacing user edit\n');
   });
 
-  it('fails closed when an applied operation no longer matches Markdown on restart', async () => {
+  it('fails closed when a begun operation no longer matches Markdown on restart', async () => {
     let interrupt = true;
     const { config, repo, workspace } = await fixture(phase => {
       if (phase === 'afterRename' && interrupt) throw new Error('crash:afterRename');
@@ -370,6 +516,35 @@ describe('WorkspaceRepository', () => {
     ).records;
     expect(explanations).toHaveLength(1);
     expect(explanations[0].fields.operation_id).toBe('applied-mismatch');
+  });
+
+  it('records one explanation across repeated mismatches in the applied phase', async () => {
+    let interrupt = true;
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask('applied-phase-mismatch', taskInput(1)))
+      .rejects.toThrow('crash:afterGitCommit');
+    expect(repo.ledger.get('applied-phase-mismatch')?.phase).toBe('applied');
+    await writeFile(join(workspace, 'TASKS.md'), '# Tasks\n\nApplied replacement text\n');
+    interrupt = false;
+    const restarted = await restart(config, repo);
+
+    await expect(restarted.addTask('applied-phase-mismatch', taskInput(1))).rejects.toMatchObject({
+      code: 'operation_reconcile_conflict',
+    });
+    git(workspace, 'add', '--', 'INBOX.md');
+    git(workspace, 'commit', '--quiet', '-m', 'record applied conflict');
+    await expect(restarted.addTask('applied-phase-mismatch', taskInput(1))).rejects.toMatchObject({
+      code: 'operation_reconcile_conflict',
+    });
+
+    const explanations = parseDocument(
+      'inbox',
+      await readFile(join(workspace, 'INBOX.md'), 'utf8'),
+    ).records;
+    expect(explanations).toHaveLength(1);
+    expect(explanations[0].fields.operation_id).toBe('applied-phase-mismatch');
   });
 
   it('queries, updates, and archives daily records in their dated files', async () => {

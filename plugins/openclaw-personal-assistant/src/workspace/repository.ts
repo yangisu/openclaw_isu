@@ -2,6 +2,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync } from 'node:fs';
 import {
   copyFile,
   mkdir,
@@ -153,6 +154,23 @@ const DEFAULT_PREAMBLE: Readonly<Record<RecordKind, string>> = {
   daily: '# Daily Memory\n\n',
 };
 
+const LOCAL_COORDINATOR_TAILS = new Map<string, Promise<void>>();
+
+async function withLocalCoordinator<T>(path: string, work: () => Promise<T>): Promise<T> {
+  const previous = LOCAL_COORDINATOR_TAILS.get(path) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.then(() => gate);
+  LOCAL_COORDINATOR_TAILS.set(path, tail);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (LOCAL_COORDINATOR_TAILS.get(path) === tail) LOCAL_COORDINATOR_TAILS.delete(path);
+  }
+}
+
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -277,6 +295,12 @@ function isWindowsUnsupportedDirectoryError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
   return process.platform === 'win32'
     && ['EACCES', 'EINVAL', 'EISDIR', 'EPERM'].includes(code ?? '');
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  const sqlite = error as { code?: string; errcode?: number; message?: string };
+  return sqlite.errcode === 5
+    || (sqlite.code === 'ERR_SQLITE_ERROR' && /busy|locked/i.test(sqlite.message ?? ''));
 }
 
 export class WorkspaceRepository {
@@ -749,22 +773,15 @@ export class WorkspaceRepository {
     const deadline = Date.now() + 10_000;
     let lock: HeldWorkspaceLock | undefined;
     while (lock === undefined) {
-      try {
-        lock = await this.createWorkspaceLock(lockPath, operationId);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        const isWindowsSharingRace = process.platform === 'win32'
-          && (code === 'EACCES' || code === 'EPERM');
-        if (code !== 'EEXIST' && !isWindowsSharingRace) throw error;
-        if (await this.tryRecoverStaleLock(lockPath)) continue;
-        if (Date.now() >= deadline) {
-          throw new WorkspaceRepositoryError(
-            'workspace_lock_timeout',
-            'workspace lock was not acquired within 10 seconds',
-          );
-        }
-        await new Promise(resolve => setTimeout(resolve, 25 + Math.floor(Math.random() * 51)));
+      lock = await this.coordinatedLockAttempt(lockPath, operationId, deadline);
+      if (lock !== undefined) break;
+      if (Date.now() >= deadline) {
+        throw new WorkspaceRepositoryError(
+          'workspace_lock_timeout',
+          'workspace lock was not acquired within 10 seconds',
+        );
       }
+      await new Promise(resolve => setTimeout(resolve, 25 + Math.floor(Math.random() * 51)));
     }
     try {
       await this.quarantineTemporaryFiles();
@@ -800,6 +817,67 @@ export class WorkspaceRepository {
       }
       if (closeError !== undefined) throw closeError;
     }
+  }
+
+  private async coordinatedLockAttempt(
+    lockPath: string,
+    operationId: string | undefined,
+    deadline: number,
+  ): Promise<HeldWorkspaceLock | undefined> {
+    const coordinatorPath = join(this.config.stateDir, 'workspace-lock-coordinator.sqlite3');
+    return withLocalCoordinator(coordinatorPath, async () => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return undefined;
+      const database = new DatabaseSync(coordinatorPath);
+      chmodSync(coordinatorPath, 0o600);
+      database.exec(`PRAGMA busy_timeout = ${Math.max(1, remaining)};`);
+      let transactionOpen = false;
+      try {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS lock_coordination (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+          ) STRICT;
+        `);
+        const transactionRemaining = deadline - Date.now();
+        if (transactionRemaining <= 0) return undefined;
+        database.exec(`PRAGMA busy_timeout = ${transactionRemaining};`);
+        database.exec('BEGIN IMMEDIATE;');
+        transactionOpen = true;
+
+        let lock: HeldWorkspaceLock | undefined;
+        try {
+          lock = await this.createWorkspaceLock(lockPath, operationId);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          const sharingRace = process.platform === 'win32'
+            && (code === 'EACCES' || code === 'EPERM');
+          if (code !== 'EEXIST' && !sharingRace) throw error;
+          if (await this.tryRecoverStaleLock(lockPath, deadline)) {
+            lock = await this.createWorkspaceLock(lockPath, operationId);
+          }
+        }
+
+        database.exec('COMMIT;');
+        transactionOpen = false;
+        return lock;
+      } catch (error) {
+        let rollbackError: unknown;
+        if (transactionOpen) {
+          try {
+            database.exec('ROLLBACK;');
+          } catch (rollback) {
+            rollbackError = rollback;
+          }
+        }
+        if (rollbackError !== undefined) {
+          throw new AggregateError([error, rollbackError], 'lock coordinator rollback failed');
+        }
+        if (isSqliteBusy(error)) return undefined;
+        throw error;
+      } finally {
+        database.close();
+      }
+    });
   }
 
   private async createWorkspaceLock(
@@ -861,7 +939,7 @@ export class WorkspaceRepository {
     }
   }
 
-  private async tryRecoverStaleLock(lockPath: string): Promise<boolean> {
+  private async tryRecoverStaleLock(lockPath: string, deadline: number): Promise<boolean> {
     let snapshot: LockSnapshot;
     try {
       snapshot = await this.readLockSnapshot(lockPath);
@@ -878,7 +956,9 @@ export class WorkspaceRepository {
       return false;
     }
     if (!isWorkspaceLockMetadata(metadata) || !this.isProcessProvenDead(metadata.pid)) return false;
-    return this.unlinkUnchangedLock(lockPath, snapshot, 1_000);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    return this.unlinkUnchangedLock(lockPath, snapshot, Math.min(1_000, remaining));
   }
 
   private isProcessProvenDead(pid: number): boolean {
