@@ -2,11 +2,12 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CalDavClient, CalDavError } from '../../src/calendar/caldav.js';
+import { CalDavClient, CalDavError, isOwnerOnlySecretMode } from '../../src/calendar/caldav.js';
 
 const fixtureDir = new URL('../fixtures/caldav/', import.meta.url);
 const fixture = (name: string) => readFile(new URL(name, fixtureDir), 'utf8');
 const temporaryDirectories: string[] = [];
+const testPermissions = () => true;
 
 async function secretFile(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'caldav-test-'));
@@ -26,6 +27,7 @@ describe('CalDavClient', () => {
     const xml = await fixture('propfind.xml');
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/calendars/me/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
       fetch: async (_url, init) => {
         expect(init?.method).toBe('PROPFIND');
         expect(new Headers(init?.headers).get('depth')).toBe('1');
@@ -42,6 +44,7 @@ describe('CalDavClient', () => {
     const xml = await fixture('report.xml');
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/calendars/me/default/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
       fetch: async (_url, init) => {
         expect(init?.method).toBe('REPORT');
         expect(init?.signal).toBeInstanceOf(AbortSignal);
@@ -62,6 +65,7 @@ describe('CalDavClient', () => {
     const path = await secretFile();
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: path,
+      secretPermissionVerifier: testPermissions,
       fetch: async () => new Response('top-secret', { status }),
     });
     await expect(client.listCalendars()).rejects.toMatchObject({ code: 'CALDAV_AUTH' });
@@ -71,6 +75,7 @@ describe('CalDavClient', () => {
   it('maps request aborts to a stable timeout error', async () => {
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(), timeoutMs: 5,
+      secretPermissionVerifier: testPermissions,
       fetch: (_url, init) => new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
       }),
@@ -81,6 +86,7 @@ describe('CalDavClient', () => {
   it('keeps the timeout active while reading the response body', async () => {
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(), timeoutMs: 5,
+      secretPermissionVerifier: testPermissions,
       fetch: async (_url, init) => ({
         ok: true,
         status: 207,
@@ -95,6 +101,7 @@ describe('CalDavClient', () => {
   it('maps malformed XML to a stable parse error', async () => {
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
       fetch: async () => new Response(await fixture('malformed.xml'), { status: 207 }),
     });
     await expect(client.listCalendars()).rejects.toMatchObject({ code: 'CALDAV_XML' });
@@ -103,6 +110,7 @@ describe('CalDavClient', () => {
   it('rejects duplicate event UIDs with a stable error', async () => {
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/default/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
       fetch: async () => new Response(await fixture('duplicate-uid.xml'), { status: 207 }),
     });
     await expect(client.listEvents({ start: '2026-08-25T00:00:00Z', end: '2026-08-27T00:00:00Z' }))
@@ -118,8 +126,47 @@ describe('CalDavClient', () => {
       baseUrl: 'https://caldav.example.test/', secretFile: path,
       fetch: async () => new Response(await fixture('propfind.xml'), { status: 207 }),
     });
-    if (process.platform !== 'win32') {
+    await expect(client.listCalendars()).rejects.toMatchObject({ code: 'CALDAV_SECRET_PERMISSIONS' });
+  });
+
+  it('fails closed when native owner-only permissions cannot be verified', async () => {
+    expect(isOwnerOnlySecretMode(0o100600, 'linux')).toBe(true);
+    expect(isOwnerOnlySecretMode(0o100400, 'linux')).toBe(false);
+    expect(isOwnerOnlySecretMode(0o100644, 'linux')).toBe(false);
+    expect(isOwnerOnlySecretMode(0o100600, 'win32')).toBe(false);
+    if (process.platform === 'win32') {
+      const client = new CalDavClient({
+        baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
+        fetch: async () => new Response(await fixture('propfind.xml'), { status: 207 }),
+      });
       await expect(client.listCalendars()).rejects.toMatchObject({ code: 'CALDAV_SECRET_PERMISSIONS' });
     }
+  });
+
+  it('accepts only well-formed 2xx propstat statuses', async () => {
+    const response = (status: string | undefined) => `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/calendar/</d:href><d:propstat><d:prop><d:displayname>Calendar</d:displayname><d:resourcetype><c:calendar/></d:resourcetype></d:prop>${status === undefined ? '' : `<d:status>${status}</d:status>`}</d:propstat></d:response></d:multistatus>`;
+    const list = async (status: string | undefined) => new CalDavClient({
+      baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
+      fetch: async () => new Response(response(status), { status: 207 }),
+    }).listCalendars();
+    await expect(list('HTTP/1.1 201 Created')).resolves.toHaveLength(1);
+    await expect(list('HTTP/1.1 404 Not Found')).resolves.toEqual([]);
+    await expect(list(undefined)).resolves.toEqual([]);
+    await expect(list('not an HTTP status')).resolves.toEqual([]);
+  });
+
+  it('accepts a master with modified and cancelled recurrence exceptions', async () => {
+    const client = new CalDavClient({
+      baseUrl: 'https://caldav.example.test/default/', secretFile: await secretFile(),
+      secretPermissionVerifier: testPermissions,
+      fetch: async () => new Response(await fixture('recurrence-exceptions.xml'), { status: 207 }),
+    });
+    const events = await client.listEvents({ start: '2026-08-25T00:00:00Z', end: '2026-09-30T00:00:00Z' });
+    expect(events.map(event => [event.uid, event.recurrenceId, event.status])).toEqual([
+      ['series-1', undefined, 'CONFIRMED'],
+      ['series-1', '2026-09-01T00:00:00.000Z', 'CONFIRMED'],
+      ['series-1', '2026-09-08T00:00:00.000Z', 'CANCELLED'],
+    ]);
   });
 });

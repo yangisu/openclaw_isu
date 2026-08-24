@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { type CalendarEvent, parseIcal } from './ical.js';
 
@@ -38,6 +38,8 @@ export interface CalDavClientOptions {
   fetch?: FetchLike;
   /** Defaults to the fixed production request bound of 15 seconds. */
   timeoutMs?: number;
+  /** Test seam for platforms where fixture files cannot expose POSIX modes. */
+  secretPermissionVerifier?: (mode: number) => boolean | Promise<boolean>;
 }
 
 interface Credentials {
@@ -52,6 +54,7 @@ export class CalDavClient {
   readonly #secretFile: string;
   readonly #fetch: FetchLike;
   readonly #timeoutMs: number;
+  readonly #secretPermissionVerifier: (mode: number) => boolean | Promise<boolean>;
 
   constructor(options: CalDavClientOptions) {
     this.#baseUrl = new URL(options.baseUrl);
@@ -61,6 +64,7 @@ export class CalDavClient {
     this.#secretFile = options.secretFile;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
+    this.#secretPermissionVerifier = options.secretPermissionVerifier ?? isOwnerOnlySecretMode;
   }
 
   async listCalendars(): Promise<CalDavCalendar[]> {
@@ -95,7 +99,7 @@ export class CalDavClient {
 </c:calendar-query>`;
     const xml = await this.#request('REPORT', body, '1');
     const events: CalendarEvent[] = [];
-    const seenUids = new Set<string>();
+    const seenIdentities = new Set<string>();
     for (const response of responseList(parseXml(xml))) {
       const prop = successfulProperty(response);
       const calendarData = decodeNumericEntities(textValue(prop?.['calendar-data']));
@@ -107,10 +111,11 @@ export class CalDavClient {
         throw new CalDavError('CALDAV_XML', 'CalDAV response contains invalid iCalendar data');
       }
       for (const event of parsed) {
-        if (seenUids.has(event.uid)) {
+        const identity = JSON.stringify([event.uid, event.recurrenceId ?? null]);
+        if (seenIdentities.has(identity)) {
           throw new CalDavError('CALDAV_DUPLICATE_UID', 'CalDAV response contains a duplicate event UID');
         }
-        seenUids.add(event.uid);
+        seenIdentities.add(identity);
         events.push(event);
       }
     }
@@ -118,7 +123,7 @@ export class CalDavClient {
   }
 
   async #request(method: 'PROPFIND' | 'REPORT', body: string, depth: string): Promise<string> {
-    const credentials = await readCredentials(this.#secretFile);
+    const credentials = await readCredentials(this.#secretFile, this.#secretPermissionVerifier);
     const signal = AbortSignal.timeout(this.#timeoutMs);
     let response: Response;
     try {
@@ -149,25 +154,30 @@ export class CalDavClient {
   }
 }
 
-async function readCredentials(path: string): Promise<Credentials> {
-  let metadata;
+export function isOwnerOnlySecretMode(mode: number, platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32' && (mode & 0o777) === 0o600;
+}
+
+async function readCredentials(
+  path: string,
+  verifyPermissions: (mode: number) => boolean | Promise<boolean>,
+): Promise<Credentials> {
+  let handle;
   try {
-    metadata = await stat(path);
-  } catch {
-    throw new CalDavError('CALDAV_SECRET', 'Unable to read CalDAV secret file');
-  }
-  // Windows exposes synthesized POSIX modes (normally 0666); production runs
-  // under WSL/Linux, where the mode-600 contract can be enforced directly.
-  if (!metadata.isFile() || (process.platform !== 'win32' && (metadata.mode & 0o777) !== 0o600)) {
-    throw new CalDavError('CALDAV_SECRET_PERMISSIONS', 'CalDAV secret file must have mode 600');
-  }
-  try {
-    const parsed = JSON.parse(await readFile(path, 'utf8')) as Partial<Credentials>;
+    handle = await open(path, 'r');
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || !await verifyPermissions(metadata.mode)) {
+      throw new CalDavError('CALDAV_SECRET_PERMISSIONS', 'CalDAV secret file must have mode 600');
+    }
+    const parsed = JSON.parse(await handle.readFile('utf8')) as Partial<Credentials>;
     if (typeof parsed.username !== 'string' || !parsed.username ||
         typeof parsed.password !== 'string' || !parsed.password) throw new Error('invalid');
     return { username: parsed.username, password: parsed.password };
-  } catch {
+  } catch (error) {
+    if (error instanceof CalDavError) throw error;
     throw new CalDavError('CALDAV_SECRET', 'Invalid CalDAV secret file');
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -193,8 +203,15 @@ function successfulProperty(response: Record<string, unknown>): Record<string, u
   const values = response.propstat === undefined ? [] :
     (Array.isArray(response.propstat) ? response.propstat : [response.propstat]);
   const candidates = values.map(objectValue);
-  const successful = candidates.find(item => !item.status || textValue(item.status).includes(' 200 '));
+  const successful = candidates.find(item => isSuccessfulHttpStatus(textValue(item.status)));
   return successful ? objectValue(successful.prop) : undefined;
+}
+
+function isSuccessfulHttpStatus(value: string): boolean {
+  const match = /^HTTP\/\d+(?:\.\d+)?\s+(\d{3})(?:\s+.*)?$/.exec(value.trim());
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status >= 200 && status < 300;
 }
 
 function objectValue(value: unknown): Record<string, unknown> {

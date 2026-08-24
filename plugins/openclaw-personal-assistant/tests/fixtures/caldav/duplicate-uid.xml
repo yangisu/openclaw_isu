@@ -7,7 +7,7 @@ DTSTART:20260825T010000Z&#13;
 DTEND:20260825T020000Z&#13;
 SUMMARY:A&#13;
 END:VEVENT&#13;
-END:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>
+END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
   <d:response><d:href>/b.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR&#13;
 BEGIN:VEVENT&#13;
 UID:duplicate&#13;
@@ -15,5 +15,5 @@ DTSTART:20260826T010000Z&#13;
 DTEND:20260826T020000Z&#13;
 SUMMARY:B&#13;
 END:VEVENT&#13;
-END:VCALENDAR</c:calendar-data></d:prop></d:propstat></d:response>
+END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
 </d:multistatus>

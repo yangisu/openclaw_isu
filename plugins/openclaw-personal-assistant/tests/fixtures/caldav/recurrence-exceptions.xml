@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response><d:href>/series.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+BEGIN:VEVENT&#13;
+UID:series-1&#13;
+DTSTART:20260825T000000Z&#13;
+DTEND:20260825T010000Z&#13;
+RRULE:FREQ=WEEKLY&#13;
+SUMMARY:Series&#13;
+END:VEVENT&#13;
+BEGIN:VEVENT&#13;
+UID:series-1&#13;
+RECURRENCE-ID:20260901T000000Z&#13;
+DTSTART:20260901T020000Z&#13;
+DTEND:20260901T030000Z&#13;
+SUMMARY:Moved instance&#13;
+END:VEVENT&#13;
+BEGIN:VEVENT&#13;
+UID:series-1&#13;
+RECURRENCE-ID:20260908T000000Z&#13;
+DTSTART:20260908T000000Z&#13;
+DTEND:20260908T010000Z&#13;
+SUMMARY:Cancelled instance&#13;
+STATUS:CANCELLED&#13;
+END:VEVENT&#13;
+END:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/2 200</d:status></d:propstat></d:response>
+</d:multistatus>

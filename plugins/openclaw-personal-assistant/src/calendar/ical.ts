@@ -7,6 +7,7 @@ export type RecurrenceRule = Record<string, string | number | Array<string | num
 export interface CalendarEventDraft {
   calendarId: string;
   uid: string;
+  recurrenceId?: string;
   dtstart: string;
   dtend: string;
   summary: string;
@@ -38,8 +39,20 @@ function recurrenceData(value: ICAL.Recur): RecurrenceRule {
 
 function sortRecurrence(rule: RecurrenceRule): RecurrenceRule {
   return Object.fromEntries(Object.entries(rule)
-    .map(([key, value]) => [key.toLowerCase(), value] as const)
+    .map(([key, value]) => [key.toLowerCase(), canonicalRecurrenceValue(value)] as const)
     .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
+}
+
+function canonicalRecurrenceValue(value: RecurrenceRule[string]): RecurrenceRule[string] {
+  if (!Array.isArray(value)) return value;
+  const sorted = [...value].sort((left, right) => {
+    if (typeof left === 'number' && typeof right === 'number') return left - right;
+    if (typeof left === 'number') return -1;
+    if (typeof right === 'number') return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return sorted.filter((item, index) => index === 0 ||
+    typeof item !== typeof sorted[index - 1] || item !== sorted[index - 1]);
 }
 
 function requireText(component: ICAL.Component, name: string): string {
@@ -48,7 +61,7 @@ function requireText(component: ICAL.Component, name: string): string {
   return value;
 }
 
-function normalizeTime(component: ICAL.Component, name: 'dtstart' | 'dtend'): string {
+function normalizeTime(component: ICAL.Component, name: 'dtstart' | 'dtend' | 'recurrence-id'): string {
   const property = component.getFirstProperty(name);
   const value = property?.getFirstValue();
   if (!property || !(value instanceof ICAL.Time)) throw new Error(`VEVENT is missing ${name.toUpperCase()}`);
@@ -58,19 +71,44 @@ function normalizeTime(component: ICAL.Component, name: 'dtstart' | 'dtend'): st
   if (!tzid && value.zone.tzid === 'UTC') {
     return new Date(Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second)).toISOString();
   }
-  return zonedDateToUtc(value, tzid || APPLICATION_TIMEZONE).toISOString();
+  if (tzid && component.parent?.getTimeZoneByID(tzid)) {
+    return new Date(value.toUnixTime() * 1_000).toISOString();
+  }
+  return ianaLocalDateToUtc(value, tzid || APPLICATION_TIMEZONE).toISOString();
 }
 
-function zonedDateToUtc(value: ICAL.Time, timeZone: string): Date {
+function ianaLocalDateToUtc(value: ICAL.Time, timeZone: string): Date {
   const localAsUtc = Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second);
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  const parts = Object.fromEntries(formatter.formatToParts(new Date(localAsUtc))
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  } catch {
+    throw new Error(`unsupported iCalendar timezone: ${timeZone}`);
+  }
+
+  const offsets = new Set<number>();
+  for (let hours = -48; hours <= 48; hours += 6) {
+    const probe = localAsUtc + hours * 3_600_000;
+    const represented = formattedUtcMilliseconds(formatter, probe);
+    offsets.add(represented - probe);
+  }
+  const candidates = [...offsets]
+    .map(offset => localAsUtc - offset)
+    .filter(candidate => formattedUtcMilliseconds(formatter, candidate) === localAsUtc);
+  const unique = [...new Set(candidates)];
+  if (unique.length !== 1) {
+    throw new Error(`nonexistent or ambiguous local time in ${timeZone}`);
+  }
+  return new Date(unique[0]);
+}
+
+function formattedUtcMilliseconds(formatter: Intl.DateTimeFormat, instant: number): number {
+  const parts = Object.fromEntries(formatter.formatToParts(new Date(instant))
     .filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
-  const representedAsUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  return new Date(localAsUtc - (representedAsUtc - localAsUtc));
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
 }
 
 function pad(value: number, width = 2): string {
@@ -84,15 +122,17 @@ export function parseIcal(source: string, calendarId: string): CalendarEvent[] {
     const rruleValue = component.getFirstPropertyValue('rrule');
     const rrule = rruleValue instanceof ICAL.Recur ? recurrenceData(rruleValue) : undefined;
     const dtstart = normalizeTime(component, 'dtstart');
+    const recurrenceId = component.hasProperty('recurrence-id') ? normalizeTime(component, 'recurrence-id') : undefined;
     return {
       calendarId,
       uid: requireText(component, 'uid'),
+      recurrenceId,
       dtstart,
       dtend: normalizeTime(component, 'dtend'),
       summary: requireText(component, 'summary').normalize('NFC'),
       location: (component.getFirstPropertyValue('location') as string | null)?.normalize('NFC') ?? undefined,
       rrule,
-      kind: dtstart.length === 10 ? 'all-day' : rrule ? 'recurring' : 'timed',
+      kind: dtstart.length === 10 ? 'all-day' : rrule || recurrenceId ? 'recurring' : 'timed',
       status: ((component.getFirstPropertyValue('status') as string | null) ?? 'CONFIRMED').toUpperCase(),
     };
   });
@@ -126,6 +166,7 @@ export function buildIcal(draft: CalendarEventDraft): string {
 
   const event = new ICAL.Component('vevent');
   event.addPropertyWithValue('uid', draft.uid);
+  if (draft.recurrenceId) addDateProperty(event, 'recurrence-id', draft.recurrenceId);
   addDateProperty(event, 'dtstart', draft.dtstart);
   addDateProperty(event, 'dtend', draft.dtend);
   event.addPropertyWithValue('summary', draft.summary.normalize('NFC'));
