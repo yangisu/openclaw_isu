@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFile,
   mkdir,
@@ -9,10 +9,11 @@ import {
   readFile,
   readdir,
   rename,
-  stat,
   unlink,
 } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import type { AssistantConfig } from '../config.js';
 import type {
@@ -83,6 +84,30 @@ interface PreparedMutation {
   action: 'add-task' | 'update-record' | 'archive-record';
   result: MutationResult;
   files: PreparedFile[];
+}
+
+interface WorkspaceLockMetadata {
+  version: 1;
+  pid: number;
+  createdAt: string;
+  ownerId: string;
+  operationId?: string;
+}
+
+interface LockSnapshot {
+  contents: string;
+  dev: number | bigint;
+  ino: number | bigint;
+  size: number | bigint;
+  mtimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+}
+
+interface HeldWorkspaceLock {
+  handle: FileHandle;
+  metadata: WorkspaceLockMetadata;
+  snapshot: LockSnapshot;
 }
 
 const KIND_FILE: Readonly<Partial<Record<RecordKind, string>>> = {
@@ -224,6 +249,36 @@ function validateOperationId(operationId: string): void {
   }
 }
 
+function isWorkspaceLockMetadata(value: unknown): value is WorkspaceLockMetadata {
+  if (value === null || typeof value !== 'object') return false;
+  const metadata = value as Partial<WorkspaceLockMetadata>;
+  return metadata.version === 1
+    && Number.isSafeInteger(metadata.pid)
+    && (metadata.pid ?? 0) > 0
+    && typeof metadata.createdAt === 'string'
+    && Number.isFinite(Date.parse(metadata.createdAt))
+    && typeof metadata.ownerId === 'string'
+    && metadata.ownerId.length >= 16
+    && (metadata.operationId === undefined
+      || /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(metadata.operationId));
+}
+
+function sameLockSnapshot(left: LockSnapshot, right: LockSnapshot): boolean {
+  return left.contents === right.contents
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+    && left.birthtimeMs === right.birthtimeMs;
+}
+
+function isWindowsUnsupportedDirectoryError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return process.platform === 'win32'
+    && ['EACCES', 'EINVAL', 'EISDIR', 'EPERM'].includes(code ?? '');
+}
+
 export class WorkspaceRepository {
   public readonly ledger: OperationLedger;
   private readonly now: () => Date;
@@ -273,23 +328,25 @@ export class WorkspaceRepository {
   }
 
   async query(criteria: QueryCriteria = {}): Promise<ParsedRecord[]> {
-    const kinds = criteria.kind
-      ? [criteria.kind]
-      : ALL_KINDS;
-    const records: ParsedRecord[] = [];
-    for (const kind of kinds) {
-      for (const relativePath of await this.documentPaths(kind, false)) {
-        const active = await this.readDocument(kind, relativePath);
-        records.push(...active.document.records.map(cloneRecord));
-      }
-      if (criteria.includeArchived) {
-        for (const relativePath of await this.documentPaths(kind, true)) {
-          const archived = await this.readDocument(kind, relativePath);
-          records.push(...archived.document.records.map(cloneRecord));
+    return this.withLock(async () => {
+      const kinds = criteria.kind
+        ? [criteria.kind]
+        : ALL_KINDS;
+      const records: ParsedRecord[] = [];
+      for (const kind of kinds) {
+        for (const relativePath of await this.documentPaths(kind, false)) {
+          const active = await this.readDocument(kind, relativePath);
+          records.push(...active.document.records.map(cloneRecord));
+        }
+        if (criteria.includeArchived) {
+          for (const relativePath of await this.documentPaths(kind, true)) {
+            const archived = await this.readDocument(kind, relativePath);
+            records.push(...archived.document.records.map(cloneRecord));
+          }
         }
       }
-    }
-    return records.filter(record => criteria.id === undefined || record.id === criteria.id);
+      return records.filter(record => criteria.id === undefined || record.id === criteria.id);
+    });
   }
 
   close(): void {
@@ -316,7 +373,7 @@ export class WorkspaceRepository {
     }
 
     return this.withLock(async () => {
-      let current = this.ledger.get<PreparedMutation>(operationId)!;
+      const current = this.ledger.get<PreparedMutation>(operationId)!;
       if (current.phase === 'committed' || current.phase === 'replied') {
         return this.replayedResult(current);
       }
@@ -342,55 +399,72 @@ export class WorkspaceRepository {
           throw error;
         }
         this.ledger.setPreparedResult(operationId, prepared);
-        current = this.ledger.get<PreparedMutation>(operationId)!;
       }
+      return this.reconcileOperation(operationId, prepared, existing !== undefined, false);
+    }, operationId);
+  }
 
-      if (current.phase === 'begun') {
-        try {
-          await this.applyPrepared(operationId, prepared);
-        } catch (error) {
-          if (error instanceof WorkspaceRepositoryError && error.code === 'workspace_conflict') {
-            await this.appendConflictInbox(operationId, error.message).catch(nested => {
-              error.detail = { inboxAppendError: String(nested) };
-            });
-          }
-          throw error;
-        }
-        this.ledger.markApplied(operationId, prepared);
-        await this.options.checkpoint?.('afterRename');
-        current = this.ledger.get<PreparedMutation>(operationId)!;
-      }
-
-      if (current.phase !== 'applied') {
-        throw new WorkspaceRepositoryError(
-          'invalid_operation_phase',
-          `cannot reconcile operation ${operationId} in phase ${current.phase}`,
-        );
-      }
+  private async reconcileOperation(
+    operationId: string,
+    prepared: PreparedMutation,
+    replayed: boolean,
+    recovering: boolean,
+  ): Promise<MutationResult> {
+    let current = this.ledger.get<PreparedMutation>(operationId)!;
+    if (current.phase === 'committed' || current.phase === 'replied') {
+      return this.replayedResult(current);
+    }
+    if (current.phase === 'begun') {
       try {
-        await this.verifyApplied(prepared);
+        await this.applyPrepared(operationId, prepared);
       } catch (error) {
-        if (error instanceof WorkspaceRepositoryError
-          && error.code === 'operation_reconcile_conflict') {
-          await this.appendConflictInbox(operationId, error.message).catch(nested => {
-            error.detail = { inboxAppendError: String(nested) };
+        if (error instanceof WorkspaceRepositoryError && error.code === 'workspace_conflict') {
+          const conflict = recovering
+            ? new WorkspaceRepositoryError(
+              'operation_reconcile_conflict',
+              `begun operation ${operationId} cannot be safely resumed: ${error.message}`,
+              error,
+            )
+            : error;
+          await this.appendConflictInbox(operationId, conflict.message).catch(nested => {
+            conflict.detail = { cause: error, inboxAppendError: String(nested) };
           });
+          throw conflict;
         }
         throw error;
       }
-
-      let gitCommit = this.findOperationCommit(operationId);
-      if (!gitCommit) {
-        gitCommit = this.commitPrepared(operationId, prepared);
-        await this.options.checkpoint?.('afterGitCommit');
+      this.ledger.markApplied(operationId, prepared);
+      current = this.ledger.get<PreparedMutation>(operationId)!;
+    }
+    if (current.phase !== 'applied') {
+      throw new WorkspaceRepositoryError(
+        'invalid_operation_phase',
+        `cannot reconcile operation ${operationId} in phase ${current.phase}`,
+      );
+    }
+    try {
+      await this.verifyApplied(prepared);
+    } catch (error) {
+      if (error instanceof WorkspaceRepositoryError
+        && error.code === 'operation_reconcile_conflict') {
+        await this.appendConflictInbox(operationId, error.message).catch(nested => {
+          error.detail = { inboxAppendError: String(nested) };
+        });
       }
-      const committed: PreparedMutation = {
-        ...prepared,
-        result: { ...prepared.result, gitCommit },
-      };
-      this.ledger.markCommitted(operationId, committed);
-      return { ...committed.result, replayed: existing !== undefined };
-    });
+      throw error;
+    }
+
+    let gitCommit = this.findOperationCommit(operationId);
+    if (!gitCommit) {
+      gitCommit = this.commitPrepared(operationId, prepared);
+      await this.options.checkpoint?.('afterGitCommit');
+    }
+    const committed: PreparedMutation = {
+      ...prepared,
+      result: { ...prepared.result, gitCommit },
+    };
+    this.ledger.markCommitted(operationId, committed);
+    return { ...committed.result, replayed };
   }
 
   private replayedResult(operation: LedgerOperation<PreparedMutation>): MutationResult {
@@ -539,6 +613,7 @@ export class WorkspaceRepository {
   }
 
   private async applyPrepared(operationId: string, prepared: PreparedMutation): Promise<void> {
+    const pending: PreparedFile[] = [];
     for (const file of prepared.files) {
       const current = await this.readText(file.relativePath);
       const currentHash = current === null ? null : sha256(current);
@@ -549,6 +624,9 @@ export class WorkspaceRepository {
           `${file.relativePath} changed after the operation read it`,
         );
       }
+      pending.push(file);
+    }
+    for (const file of pending) {
       await this.atomicReplace(file.relativePath, file.contents, operationId, file.beforeHash);
     }
   }
@@ -593,9 +671,10 @@ export class WorkspaceRepository {
         );
       }
       await rename(temporary, target);
+      await this.options.checkpoint?.('afterRename');
       await this.syncDirectory(parent);
     } finally {
-      await handle?.close().catch(() => undefined);
+      if (handle) await handle.close();
       await unlink(temporary).catch((error: unknown) => {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       });
@@ -608,12 +687,15 @@ export class WorkspaceRepository {
       handle = await open(path, 'r');
       await handle.sync();
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (process.platform !== 'win32' || !['EACCES', 'EINVAL', 'EISDIR', 'EPERM'].includes(code ?? '')) {
-        throw error;
-      }
+      if (!isWindowsUnsupportedDirectoryError(error)) throw error;
     } finally {
-      await handle?.close().catch(() => undefined);
+      if (handle) {
+        try {
+          await handle.close();
+        } catch (error) {
+          if (!isWindowsUnsupportedDirectoryError(error)) throw error;
+        }
+      }
     }
   }
 
@@ -662,18 +744,19 @@ export class WorkspaceRepository {
     }
   }
 
-  private async withLock<T>(work: () => Promise<T>): Promise<T> {
+  private async withLock<T>(work: () => Promise<T>, operationId?: string): Promise<T> {
     const lockPath = join(this.config.workspaceDir, '.assistant.lock');
     const deadline = Date.now() + 10_000;
-    let lock;
-    while (!lock) {
+    let lock: HeldWorkspaceLock | undefined;
+    while (lock === undefined) {
       try {
-        lock = await open(lockPath, 'wx', 0o600);
+        lock = await this.createWorkspaceLock(lockPath, operationId);
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         const isWindowsSharingRace = process.platform === 'win32'
           && (code === 'EACCES' || code === 'EPERM');
         if (code !== 'EEXIST' && !isWindowsSharingRace) throw error;
+        if (await this.tryRecoverStaleLock(lockPath)) continue;
         if (Date.now() >= deadline) {
           throw new WorkspaceRepositoryError(
             'workspace_lock_timeout',
@@ -685,31 +768,246 @@ export class WorkspaceRepository {
     }
     try {
       await this.quarantineTemporaryFiles();
+      await this.reconcilePendingOperations();
       return await work();
     } finally {
-      await lock.close().catch(() => undefined);
-      await unlink(lockPath).catch((error: unknown) => {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      });
+      let closeError: unknown;
+      try {
+        await lock.handle.close();
+      } catch (error) {
+        closeError = error;
+      }
+      let removed = false;
+      let unlinkError: unknown;
+      try {
+        removed = await this.unlinkUnchangedLock(lockPath, lock.snapshot, 1_000);
+      } catch (error) {
+        unlinkError = error;
+      }
+      if (closeError !== undefined && unlinkError !== undefined) {
+        throw new AggregateError(
+          [closeError, unlinkError],
+          'workspace lock close and unlink both failed',
+        );
+      }
+      if (unlinkError !== undefined) throw unlinkError;
+      if (!removed) {
+        throw new WorkspaceRepositoryError(
+          'workspace_lock_ownership_lost',
+          `workspace lock ${lock.metadata.ownerId} changed before release`,
+          closeError,
+        );
+      }
+      if (closeError !== undefined) throw closeError;
+    }
+  }
+
+  private async createWorkspaceLock(
+    lockPath: string,
+    operationId?: string,
+  ): Promise<HeldWorkspaceLock> {
+    const handle = await open(lockPath, 'wx', 0o600);
+    const metadata: WorkspaceLockMetadata = {
+      version: 1,
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      ownerId: randomUUID(),
+      ...(operationId === undefined ? {} : { operationId }),
+    };
+    const contents = `${JSON.stringify(metadata)}\n`;
+    try {
+      await handle.writeFile(contents, 'utf8');
+      await handle.sync();
+      const info = await handle.stat();
+      return {
+        handle,
+        metadata,
+        snapshot: {
+          contents,
+          dev: info.dev,
+          ino: info.ino,
+          size: info.size,
+          mtimeMs: info.mtimeMs,
+          ctimeMs: info.ctimeMs,
+          birthtimeMs: info.birthtimeMs,
+        },
+      };
+    } catch (error) {
+      try {
+        await handle.close();
+      } finally {
+        await this.unlinkWithSharingRetry(lockPath, 1_000);
+      }
+      throw error;
+    }
+  }
+
+  private async readLockSnapshot(lockPath: string): Promise<LockSnapshot> {
+    const handle = await open(lockPath, 'r');
+    try {
+      const contents = await handle.readFile('utf8');
+      const info = await handle.stat();
+      return {
+        contents,
+        dev: info.dev,
+        ino: info.ino,
+        size: info.size,
+        mtimeMs: info.mtimeMs,
+        ctimeMs: info.ctimeMs,
+        birthtimeMs: info.birthtimeMs,
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async tryRecoverStaleLock(lockPath: string): Promise<boolean> {
+    let snapshot: LockSnapshot;
+    try {
+      snapshot = await this.readLockSnapshot(lockPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return true;
+      if (process.platform === 'win32' && (code === 'EACCES' || code === 'EPERM')) return false;
+      throw error;
+    }
+    let metadata: unknown;
+    try {
+      metadata = JSON.parse(snapshot.contents);
+    } catch {
+      return false;
+    }
+    if (!isWorkspaceLockMetadata(metadata) || !this.isProcessProvenDead(metadata.pid)) return false;
+    return this.unlinkUnchangedLock(lockPath, snapshot, 1_000);
+  }
+
+  private isProcessProvenDead(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  }
+
+  private async unlinkUnchangedLock(
+    lockPath: string,
+    expected: LockSnapshot,
+    retryMilliseconds: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + retryMilliseconds;
+    while (true) {
+      let current: LockSnapshot;
+      try {
+        current = await this.readLockSnapshot(lockPath);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return true;
+        const sharingRace = process.platform === 'win32'
+          && (code === 'EACCES' || code === 'EPERM');
+        if (!sharingRace || Date.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 31)));
+        continue;
+      }
+      if (!sameLockSnapshot(current, expected)) return false;
+      try {
+        await unlink(lockPath);
+        return true;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return true;
+        const sharingRace = process.platform === 'win32'
+          && (code === 'EACCES' || code === 'EPERM');
+        if (!sharingRace || Date.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 31)));
+      }
+    }
+  }
+
+  private async unlinkWithSharingRetry(path: string, retryMilliseconds: number): Promise<void> {
+    const deadline = Date.now() + retryMilliseconds;
+    while (true) {
+      try {
+        await unlink(path);
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return;
+        const sharingRace = process.platform === 'win32'
+          && (code === 'EACCES' || code === 'EPERM');
+        if (!sharingRace || Date.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 31)));
+      }
+    }
+  }
+
+  private unfinishedOperationIds(): string[] {
+    const database = new DatabaseSync(join(this.config.stateDir, 'operations.sqlite3'), {
+      readOnly: true,
+    });
+    try {
+      return (database.prepare(`
+        SELECT operation_id FROM operations
+        WHERE phase IN ('begun', 'applied') ORDER BY created_at, operation_id
+      `).all() as unknown as Array<{ operation_id: string }>)
+        .map(row => row.operation_id);
+    } finally {
+      database.close();
+    }
+  }
+
+  private async reconcilePendingOperations(): Promise<void> {
+    for (const operationId of this.unfinishedOperationIds()) {
+      const operation = this.ledger.get<PreparedMutation>(operationId);
+      if (!operation || operation.phase === 'committed' || operation.phase === 'replied') continue;
+      if (!isPrepared(operation.result)) {
+        if (operation.phase === 'begun') continue;
+        throw new WorkspaceRepositoryError(
+          'operation_reconcile_conflict',
+          `operation ${operationId} has no prepared recovery metadata`,
+        );
+      }
+      await this.reconcileOperation(operationId, operation.result, true, true);
     }
   }
 
   private async quarantineTemporaryFiles(): Promise<void> {
-    const directories = [
-      this.config.workspaceDir,
-      join(this.config.workspaceDir, 'archive'),
-      join(this.config.workspaceDir, 'memory'),
+    const directories: Array<{ path: string; target: RegExp }> = [
+      {
+        path: this.config.workspaceDir,
+        target: /^(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md$/,
+      },
+      {
+        path: join(this.config.workspaceDir, 'archive'),
+        target: /^(?:(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md|\d{4}-\d{2}-\d{2}\.md)$/,
+      },
+      {
+        path: join(this.config.workspaceDir, 'memory'),
+        target: /^\d{4}-\d{2}-\d{2}\.md$/,
+      },
     ];
     for (const directory of directories) {
       let names: string[];
       try {
-        names = await readdir(directory);
+        names = await readdir(directory.path);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw error;
       }
-      for (const name of names.filter(candidate => candidate.includes('.tmp-'))) {
-        const source = join(directory, name);
+      for (const name of names) {
+        const marker = name.lastIndexOf('.tmp-');
+        if (marker < 0 || !directory.target.test(name.slice(0, marker))) continue;
+        const suffix = name.slice(marker + '.tmp-'.length);
+        const candidates = suffix.endsWith('-conflict')
+          ? [suffix, suffix.slice(0, -'-conflict'.length)]
+          : [suffix];
+        const knownNonterminal = candidates.some(candidate => {
+          if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(candidate)) return false;
+          const operation = this.ledger.get(candidate);
+          return operation?.phase === 'begun' || operation?.phase === 'applied';
+        });
+        if (!knownNonterminal) continue;
+        const source = join(directory.path, name);
         const quarantineDir = join(this.config.stateDir, 'quarantine');
         await mkdir(quarantineDir, { recursive: true, mode: 0o700 });
         const destination = join(
@@ -785,8 +1083,9 @@ export class WorkspaceRepository {
 
   private async appendConflictInbox(operationId: string, message: string): Promise<void> {
     const relativePath = 'INBOX.md';
-    this.assertGitPathClean(relativePath);
     const loaded = await this.readDocument('inbox', relativePath);
+    if (loaded.document.records.some(record => record.fields.operation_id === operationId)) return;
+    this.assertGitPathClean(relativePath);
     const date = dateInSeoul(this.now());
     const used = new Set(loaded.document.records.map(record => record.id));
     let sequence = 1;
@@ -799,8 +1098,9 @@ export class WorkspaceRepository {
     const record: ParsedRecord = {
       id,
       title: 'Workspace conflict',
-      orderedFields: [],
+      orderedFields: [{ key: 'operation_id', rawValue: JSON.stringify(operationId) }],
       fields: {
+        operation_id: operationId,
         type: 'inbox',
         status: 'pending',
         reason: 'workspace_conflict',

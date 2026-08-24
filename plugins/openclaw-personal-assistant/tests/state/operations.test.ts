@@ -1,4 +1,4 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtemp } from 'node:fs/promises';
@@ -101,7 +101,10 @@ describe('OperationLedger', () => {
 
   it('stores owner-only database files', async () => {
     const { stateDir } = await openLedger();
-    const journalMode = await readFile(join(stateDir, 'operations.sqlite3'));
-    expect(journalMode.byteLength).toBeGreaterThan(0);
+    const databasePath = join(stateDir, 'operations.sqlite3');
+    expect((await readFile(databasePath)).byteLength).toBeGreaterThan(0);
+    if (process.platform !== 'win32') {
+      expect((await stat(databasePath)).mode & 0o777).toBe(0o600);
+    }
   });
 });

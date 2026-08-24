@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { AssistantConfig } from '../../src/config.js';
@@ -130,6 +131,9 @@ describe('WorkspaceRepository', () => {
 
       await expect(repo.addTask(`crash-${crashPhase}`, taskInput(1)))
         .rejects.toThrow(`crash:${crashPhase}`);
+      if (crashPhase === 'afterRename') {
+        expect(repo.ledger.get(`crash-${crashPhase}`)?.phase).toBe('begun');
+      }
       const countAfterCrash = parseDocument(
         'task',
         await readFile(join(workspace, 'TASKS.md'), 'utf8'),
@@ -146,6 +150,142 @@ describe('WorkspaceRepository', () => {
         .toHaveLength(2);
     },
   );
+
+  it('recovers a dead child process lock and quarantines only its known temp file', async () => {
+    const { config, repo, workspace } = await fixture();
+    const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
+    execFileSync(process.execPath, [tsc, '-p', 'tsconfig.json']);
+    const repositoryUrl = pathToFileURL(
+      join(process.cwd(), 'dist', 'workspace', 'repository.js'),
+    ).href;
+    const childProgram = `
+      import { openRepository } from ${JSON.stringify(repositoryUrl)};
+      const config = JSON.parse(process.env.ASSISTANT_CRASH_CONFIG);
+      const repo = await openRepository(config, {
+        now: () => new Date('2026-08-25T00:03:00.000Z'),
+        checkpoint: phase => { if (phase === 'beforeRename') process.exit(91); },
+      });
+      await repo.addTask('abrupt-child', {
+        title: 'Task 1', body: 'Body 1\\n', priority: 'normal', source: 'telegram',
+      });
+    `;
+    expect(() => execFileSync(
+      process.execPath,
+      ['--input-type=module', '--eval', childProgram],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, ASSISTANT_CRASH_CONFIG: JSON.stringify(config) },
+      },
+    ))
+      .toThrow();
+    expect(await readFile(join(workspace, '.assistant.lock'), 'utf8')).toContain('abrupt-child');
+    await writeFile(join(workspace, 'TASKS.md.tmp-abrupt-child'), 'PROMOTE-ME\n');
+
+    const result = await repo.addTask('abrupt-child', taskInput(1));
+
+    expect(result.id).toBe('T-20260825-001');
+    expect(result.replayed).toBe(true);
+    expect((await readdir(workspace)).filter(name => name.includes('.tmp-'))).toEqual([]);
+    expect(await readFile(join(workspace, 'TASKS.md'), 'utf8')).not.toContain('PROMOTE-ME');
+  }, 30_000);
+
+  it('does not quarantine arbitrary user temp files', async () => {
+    const { repo, workspace } = await fixture();
+    await writeFile(join(workspace, 'notes.tmp-draft'), 'user draft\n');
+    await writeFile(join(workspace, 'TASKS.md.tmp-user-draft'), 'user task draft\n');
+
+    await repo.addTask('leave-user-temps', taskInput(1));
+
+    expect(await readFile(join(workspace, 'notes.tmp-draft'), 'utf8')).toBe('user draft\n');
+    expect(await readFile(join(workspace, 'TASKS.md.tmp-user-draft'), 'utf8'))
+      .toBe('user task draft\n');
+  });
+
+  it('leaves ambiguous lock ownership untouched until the 10-second timeout', async () => {
+    const { repo, workspace } = await fixture();
+    await writeFile(join(workspace, '.assistant.lock'), 'not-valid-lock-metadata\n');
+    const startedAt = Date.now();
+
+    await expect(repo.addTask('ambiguous-lock', taskInput(1))).rejects.toMatchObject({
+      code: 'workspace_lock_timeout',
+    });
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(9_900);
+    expect(await readFile(join(workspace, '.assistant.lock'), 'utf8'))
+      .toBe('not-valid-lock-metadata\n');
+  }, 15_000);
+
+  it('preflights every archive target before the first rename on begun recovery', async () => {
+    let crashArchive = false;
+    const { config, repo, workspace } = await fixture(phase => {
+      if (crashArchive && phase === 'beforeRename') throw new Error('crash:beforeRename');
+    });
+    const added = await repo.addTask('preflight-add', taskInput(1));
+    crashArchive = true;
+    await expect(repo.archiveRecord('preflight-archive', added.id, 'done'))
+      .rejects.toThrow('crash:beforeRename');
+    const userText = (await readFile(join(workspace, 'TASKS.md'), 'utf8'))
+      .replace('Body 1', 'User changed body');
+    await writeFile(join(workspace, 'TASKS.md'), userText);
+    const restarted = await restart(config, repo);
+
+    await expect(restarted.archiveRecord('preflight-archive', added.id, 'done'))
+      .rejects.toMatchObject({ code: 'operation_reconcile_conflict' });
+    await expect(readFile(join(workspace, 'archive', 'TASKS.md'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(join(workspace, 'TASKS.md'), 'utf8')).toBe(userText);
+  });
+
+  it('recovers an archive crash between replacements before exposing records to query', async () => {
+    let archiveMode = false;
+    let renameCount = 0;
+    const { repo } = await fixture(phase => {
+      if (archiveMode && phase === 'afterRename' && ++renameCount === 1) {
+        throw new Error('crash:archive-after-first-rename');
+      }
+    });
+    const added = await repo.addTask('partial-add', taskInput(1));
+    archiveMode = true;
+    await expect(repo.archiveRecord('partial-archive', added.id, 'done'))
+      .rejects.toThrow('crash:archive-after-first-rename');
+    expect(repo.ledger.get('partial-archive')?.phase).toBe('begun');
+
+    const records = await repo.query({ kind: 'task', includeArchived: true });
+    expect(records).toHaveLength(1);
+    expect(records[0].fields.status).toBe('archived');
+  });
+
+  it('blocks a concurrent query until both archive replacements are complete', async () => {
+    let releaseRename!: () => void;
+    let reachedRename!: () => void;
+    const renameReached = new Promise<void>(resolve => { reachedRename = resolve; });
+    const release = new Promise<void>(resolve => { releaseRename = resolve; });
+    let archiveMode = false;
+    let renameCount = 0;
+    const { repo } = await fixture(async phase => {
+      if (archiveMode && phase === 'afterRename' && ++renameCount === 1) {
+        reachedRename();
+        await release;
+      }
+    });
+    const added = await repo.addTask('concurrent-query-add', taskInput(1));
+    archiveMode = true;
+    const archive = repo.archiveRecord('concurrent-query-archive', added.id, 'done');
+    await renameReached;
+    let querySettled = false;
+    const query = repo.query({ kind: 'task', includeArchived: true }).finally(() => {
+      querySettled = true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const settledBeforeRelease = querySettled;
+    releaseRename();
+
+    await archive;
+    const records = await query;
+    expect(settledBeforeRelease).toBe(false);
+    expect(records).toHaveLength(1);
+    expect(records[0].fields.status).toBe('archived');
+  });
 
   it('updates, queries, and archives a record without losing its body', async () => {
     const { repo, workspace } = await fixture();
@@ -219,6 +359,17 @@ describe('WorkspaceRepository', () => {
       .toBe('# Tasks\n\nReplacement user text\n');
     expect(parseDocument('inbox', await readFile(join(workspace, 'INBOX.md'), 'utf8')).records)
       .toHaveLength(1);
+    git(workspace, 'add', '--', 'INBOX.md');
+    git(workspace, 'commit', '--quiet', '-m', 'record conflict');
+    await expect(restarted.addTask('applied-mismatch', taskInput(1))).rejects.toMatchObject({
+      code: 'operation_reconcile_conflict',
+    });
+    const explanations = parseDocument(
+      'inbox',
+      await readFile(join(workspace, 'INBOX.md'), 'utf8'),
+    ).records;
+    expect(explanations).toHaveLength(1);
+    expect(explanations[0].fields.operation_id).toBe('applied-mismatch');
   });
 
   it('queries, updates, and archives daily records in their dated files', async () => {
