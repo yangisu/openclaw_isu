@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
+import { copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,12 +17,15 @@ import {
   cleanupBackupQuarantine,
   classifyDirectorySyncFailure,
   createBackup,
+  parseNtfsFileIdentity,
   parseWindowsReparseClassification,
   restoreBackup,
   validateWindowsBackupAcl,
   verifyBackup,
   writeAll,
   type AgeRunner,
+  type FileIdentityEvidence,
+  type IdentityBoundDeleter,
 } from '../../src/ops/backup.js';
 import { openRepository, type WorkspaceRepository } from '../../src/workspace/repository.js';
 
@@ -135,6 +138,13 @@ async function fixture() {
   return { root, workspaceDir, stateDir, backupDir, repository, outbox, alerts, health, clock, age: new FakeAge() };
 }
 
+async function cloneCommittedArchive(source: string, destination: string): Promise<void> {
+  await copyFile(source, destination);
+  const record = JSON.parse(await readFile(`${source}.committed`, 'utf8')) as Record<string, unknown>;
+  record.archive = destination.split(/[\\/]/).at(-1)!;
+  await writeFile(`${destination}.committed`, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+}
+
 function calendarDraft(uid = 'backup-event') {
   const event = {
     calendarId: 'personal', uid,
@@ -142,6 +152,22 @@ function calendarDraft(uid = 'backup-event') {
     summary: 'Backup coverage',
   };
   return { calendarId: event.calendarId, uid, payloadIcal: buildIcal(event), payloadHash: semanticEventHash(event) };
+}
+
+class PortableTestIdentityDeleter implements IdentityBoundDeleter {
+  readonly deletes: Array<{ path: string; expected: FileIdentityEvidence }> = [];
+  async capture(path: string): Promise<FileIdentityEvidence> {
+    const evidence = await stat(path, { bigint: true });
+    return { volumeId: evidence.dev.toString(), fileId: evidence.ino.toString() };
+  }
+  async deleteOpened(path: string, expected: FileIdentityEvidence): Promise<void> {
+    this.deletes.push({ path, expected });
+    const actual = await this.capture(path);
+    if (actual.volumeId !== expected.volumeId || actual.fileId !== expected.fileId) {
+      throw Object.assign(new Error('identity changed'), { code: 'retention_identity_changed' });
+    }
+    await unlink(path);
+  }
 }
 
 afterEach(async () => {
@@ -235,8 +261,111 @@ describe('encrypted verified backup', () => {
       durabilityDiagnostic(event) { events.push(event); },
       health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
       now: () => new Date('2026-08-25T00:00:00.000Z') });
-    expect(events).toEqual(['file', 'file', 'directory', 'directory-synced', 'directory', 'directory-synced', 'recover']);
+    expect(events.at(-1)).toBe('recover');
+    expect(events.filter(event => event === 'file')).toHaveLength(3);
+    expect(events.filter(event => event === 'directory')).toHaveLength(3);
+    expect(events.indexOf('recover')).toBeGreaterThan(events.lastIndexOf('directory'));
   });
+
+  it('requires a durable hash-bound commit record for every recovery operation', async () => {
+    const f = await fixture();
+    const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    const committedPath = `${backup.archivePath}.committed`;
+    const original = await readFile(committedPath, 'utf8');
+    await rm(committedPath);
+    await expect(verifyBackup({ archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: f.age }))
+      .rejects.toMatchObject({ code: 'archive_commit_missing' });
+    await writeFile(committedPath, original);
+    await writeFile(backup.archivePath, Buffer.concat([await readFile(backup.archivePath), Buffer.from([0])]));
+    await expect(verifyBackup({ archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: f.age }))
+      .rejects.toMatchObject({ code: 'archive_commit_mismatch' });
+  }, 30_000);
+
+  it('rejects invalid, unknown-key, and stale-manifest commit evidence', async () => {
+    const f = await fixture();
+    const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    const path = `${backup.archivePath}.committed`;
+    const original = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    for (const [mutation, code] of [
+      [(record: Record<string, unknown>) => { record.version = 2; }, 'archive_commit_invalid'],
+      [(record: Record<string, unknown>) => { record.extra = true; }, 'archive_commit_invalid'],
+      [(record: Record<string, unknown>) => { record.manifestHash = '0'.repeat(64); }, 'archive_commit_mismatch'],
+    ] as const) {
+      const changed = { ...original }; mutation(changed);
+      await writeFile(path, `${JSON.stringify(changed)}\n`);
+      await expect(verifyBackup({ archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: f.age }))
+        .rejects.toMatchObject({ code });
+    }
+  }, 30_000);
+
+  it('rejects concurrent verification while publication lacks durable commit evidence', async () => {
+    const f = await fixture(); let entered!: () => void; let release!: () => void;
+    const synchronizing = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; }); let directories = 0;
+    const creating = createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      durability: { async syncFile() {}, async syncDirectory() { if (++directories === 1) { entered(); await held; } } },
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    await synchronizing;
+    await expect(verifyBackup({ archivePath: join(f.backupDir, '2026-08-25.age'), identityFile: 'test-key', ageRunner: f.age }))
+      .rejects.toMatchObject({ code: 'archive_uncommitted' });
+    release(); await creating;
+    await expect(verifyBackup({ archivePath: join(f.backupDir, '2026-08-25.age'), identityFile: 'test-key', ageRunner: f.age }))
+      .resolves.toMatchObject({ archivePath: join(f.backupDir, '2026-08-25.age') });
+  }, 30_000);
+
+  it('does not recover health until the positive commit record is directory durable', async () => {
+    const f = await fixture(); const events: string[] = []; let directorySyncs = 0;
+    await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      durability: {
+        async syncFile(path) { events.push(`file:${path.split(/[\\/]/).at(-1)}`); },
+        async syncDirectory() { events.push(`directory:${++directorySyncs}`); if (directorySyncs === 2) throw Object.assign(new Error('disk'), { code: 'EIO' }); },
+      }, health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
+      now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toBeDefined();
+    expect(events).not.toContain('recover');
+    await expect(verifyBackup({ archivePath: join(f.backupDir, '2026-08-25.age'), identityFile: 'test-key', ageRunner: f.age }))
+      .rejects.toMatchObject({ code: expect.stringMatching(/^archive_(?:uncommitted|commit_missing)$/) });
+  }, 30_000);
+
+  it('leaves no eligible archive at every commit-record publication crash point', async () => {
+    for (const point of ['commit-file-sync', 'commit-rename', 'marker-removal-sync'] as const) {
+      const f = await fixture(); const health: string[] = []; let fileSyncs = 0; let directorySyncs = 0; let renames = 0;
+      await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+        durability: {
+          async syncFile() {
+            if (++fileSyncs === 3 && point === 'commit-file-sync') throw Object.assign(new Error('crash'), { code: 'EIO' });
+          },
+          async syncDirectory() {
+            directorySyncs += 1;
+            if (point === 'marker-removal-sync' && directorySyncs === 3) throw Object.assign(new Error('crash'), { code: 'EIO' });
+          },
+        },
+        publicationOps: {
+          async rename(source, destination) {
+            renames += 1;
+            if (point === 'commit-rename' && renames === 2) throw Object.assign(new Error('crash'), { code: 'EIO' });
+            await rename(source, destination);
+          },
+          async unlink(path) { await unlink(path); },
+        },
+        health: { report() { health.push('report'); }, recover() { health.push('recover'); } } as never,
+        now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toBeDefined();
+      expect(health).toEqual(['report']);
+      await expect(verifyBackup({ archivePath: join(f.backupDir, '2026-08-25.age'), identityFile: 'test-key', ageRunner: f.age }))
+        .rejects.toMatchObject({ code: expect.stringMatching(/^archive_(?:uncommitted|commit_missing)$/) });
+    }
+  }, 30_000);
+
+  it('reconciles success from durable commit evidence if post-publication health recovery throws', async () => {
+    const f = await fixture(); let recoveries = 0;
+    const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      health: { report() { throw new Error('must not report committed backup as failed'); }, recover() { recoveries += 1; throw new Error('journal unavailable'); } } as never,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    expect(recoveries).toBe(1);
+    await expect(verifyBackup({ archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: f.age }))
+      .resolves.toMatchObject({ archivePath: backup.archivePath });
+  }, 30_000);
 
   it('does not recover health when directory durability is unsupported', async () => {
     const f = await fixture(); const events: string[] = [];
@@ -332,6 +461,11 @@ describe('encrypted verified backup', () => {
       { rules: valid.rules.map((rule, index) => index ? { ...rule, type: 'Deny' } : rule) },
       { protected: false }, { rules: valid.rules.map((rule, index) => index ? { ...rule, inherited: true } : rule) },
     ]) expect(() => validateWindowsBackupAcl(JSON.stringify({ ...valid, ...mutation }))).toThrowError(expect.objectContaining({ code: 'acl_unsafe' }));
+  });
+
+  it('strictly parses production NTFS volume and file identity evidence', () => {
+    expect(parseNtfsFileIdentity('00ABCDEF|0123456789ABCDEF\r\n')).toEqual({ volumeId: '00ABCDEF', fileId: '0123456789ABCDEF' });
+    expect(() => parseNtfsFileIdentity('00abcdef|1')).toThrowError(expect.objectContaining({ code: 'retention_identity_delete_unavailable' }));
   });
   it('holds the repository writer boundary through the snapshot and returns immutable outbox evidence', async () => {
     const f = await fixture();
@@ -472,30 +606,48 @@ describe('encrypted verified backup', () => {
   });
 
   it('deletes only verified oldest archives while retaining at least two recovery points', async () => {
-    const f = await fixture();
+    const f = await fixture(); const identityDeleter = new PortableTestIdentityDeleter();
     const newest = await createBackup({
       ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
       now: () => new Date('2026-08-25T00:00:00.000Z'),
     });
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
     const result = await applyRetention({
-      backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2, health: f.health,
+      backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2, health: f.health, identityDeleter,
     });
     expect(result.deleted.map(path => path.split(/[\\/]/).at(-1))).toEqual(['2026-08-23.age']);
     await expect(stat(join(f.backupDir, '2026-08-24.age'))).resolves.toMatchObject({ size: expect.any(Number) });
     await expect(stat(join(f.backupDir, '2026-08-25.age'))).resolves.toMatchObject({ size: expect.any(Number) });
     expect((await readdir(f.backupDir)).filter(name => name.endsWith('.age')).sort())
       .toEqual(['2026-08-24.age', '2026-08-25.age']);
+    expect(identityDeleter.deletes).toHaveLength(2);
+    expect(identityDeleter.deletes.every(call => call.path.includes('.retention-delete'))).toBe(true);
     f.outbox.close(); f.alerts.close(); f.health.close();
+  }, 30_000);
+
+  it('fails closed when identity-bound retention deletion is unavailable', async () => {
+    const f = await fixture();
+    const newest = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    const unavailable: IdentityBoundDeleter = {
+      async capture() { throw Object.assign(new Error('unsupported'), { code: 'retention_identity_delete_unavailable' }); },
+      async deleteOpened() { throw new Error('unreachable'); },
+    };
+    await expect(applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age,
+      keep: 2, identityDeleter: unavailable })).rejects.toMatchObject({ code: 'retention_identity_delete_unavailable' });
+    await expect(stat(join(f.backupDir, '2026-08-23.age'))).resolves.toBeDefined();
+    await expect(stat(join(f.backupDir, '2026-08-23.age.committed'))).resolves.toBeDefined();
   }, 30_000);
 
   it('checks reparse classification again immediately before retention deletion', async () => {
     const f = await fixture();
     const newest = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
       now: () => new Date('2026-08-25T00:00:00.000Z') });
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
     let oldestChecks = 0;
     const result = await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
       pathSafety: { async isReparsePoint(path) { if (path.endsWith('2026-08-23.age')) { oldestChecks += 1; return oldestChecks >= 3; } return false; } } });
@@ -507,36 +659,42 @@ describe('encrypted verified backup', () => {
     const f = await fixture();
     const newest = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
       now: () => new Date('2026-08-25T00:00:00.000Z') });
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    const swapping = new PortableTestIdentityDeleter(); let swapped = false;
+    swapping.deleteOpened = async (path, expected) => {
+      if (!swapped && path.includes('.age.delete-')) {
+        swapped = true;
+        await rename(path, `${path}.verified-inode`);
+        await copyFile(newest.archivePath, path);
+      }
+      await PortableTestIdentityDeleter.prototype.deleteOpened.call(swapping, path, expected);
+    };
     await expect(applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
-      publicationOps: {
-        async rename(source, destination) {
-          await rename(source, destination);
-          if (destination.includes('.tombstone-')) {
-            await rename(destination, `${destination}.verified-inode`);
-            await copyFile(newest.archivePath, destination);
-          }
-        }, async unlink(path) { await rm(path); },
-      }, durability: { async syncFile() {}, async syncDirectory() {} } }))
+      identityDeleter: swapping, durability: { async syncFile() {}, async syncDirectory() {} } }))
       .rejects.toMatchObject({ code: 'retention_identity_changed' });
-    const names = await readdir(f.backupDir);
-    expect(names.some(name => name.includes('.tombstone-') && name.endsWith('.suspicious'))).toBe(true);
+    const names = await readdir(join(f.backupDir, '.retention-delete'), { recursive: true });
+    expect(names.some(name => name.includes('.delete-') && !name.endsWith('.verified-inode'))).toBe(true);
     expect(names.some(name => name.endsWith('.verified-inode'))).toBe(true);
   }, 30_000);
 
-  it('recovers a safe interrupted retention tombstone before re-verifying it', async () => {
+  it('keeps interrupted deletion-namespace orphans quarantined for explicit recovery', async () => {
     const f = await fixture();
     const newest = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
       now: () => new Date('2026-08-25T00:00:00.000Z') });
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
-    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
-    const tombstone = join(f.backupDir, '2026-08-23.age.tombstone-00000000-0000-4000-8000-000000000000');
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    const deletionRoot = join(f.backupDir, '.retention-delete'); await mkdir(deletionRoot, { mode: 0o700 });
+    const tombstone = join(deletionRoot, '2026-08-23.age.delete-00000000-0000-4000-8000-000000000000');
+    const commitTombstone = join(deletionRoot, '2026-08-23.age.committed.delete-00000000-0000-4000-8000-000000000000');
     await rename(join(f.backupDir, '2026-08-23.age'), tombstone);
-    const result = await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2 });
-    expect(result.deleted.map(path => path.split(/[\\/]/).at(-1))).toEqual(['2026-08-23.age']);
-    expect(await readdir(f.backupDir)).not.toContain('2026-08-23.age');
-    expect(await readdir(f.backupDir)).not.toContain(tombstone.split(/[\\/]/).at(-1));
+    await rename(join(f.backupDir, '2026-08-23.age.committed'), commitTombstone);
+    const result = await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
+      identityDeleter: new PortableTestIdentityDeleter() });
+    expect(result.deleted).toEqual([]);
+    expect(await readdir(deletionRoot)).toEqual(expect.arrayContaining([
+      tombstone.split(/[\\/]/).at(-1), commitTombstone.split(/[\\/]/).at(-1),
+    ]));
   }, 30_000);
 
   it('rejects a configured workspace junction and an injected database reparse classification', async () => {

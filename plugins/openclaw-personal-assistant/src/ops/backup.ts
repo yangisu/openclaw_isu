@@ -118,6 +118,12 @@ export interface BackupPublicationOps {
   unlink(path: string): Promise<void>;
 }
 
+export interface FileIdentityEvidence { volumeId: string; fileId: string }
+export interface IdentityBoundDeleter {
+  capture(path: string): Promise<FileIdentityEvidence>;
+  deleteOpened(path: string, expected: FileIdentityEvidence): Promise<void>;
+}
+
 export function classifyDirectorySyncFailure(
   path: string, code: string | undefined, platform = process.platform,
 ): 'unsupported' | 'non-target-fallback' | 'fatal' {
@@ -150,6 +156,7 @@ export interface RetentionInput extends BackupBase {
   backupDir: string;
   keep?: number;
   candidatePaths?: readonly string[];
+  identityDeleter?: IdentityBoundDeleter;
 }
 
 export interface VerifiedBackup {
@@ -159,6 +166,15 @@ export interface VerifiedBackup {
 }
 
 const ARCHIVE_MAGIC = Buffer.from('OCPABK01', 'ascii');
+const COMMIT_RECORD_VERSION = 1;
+interface ArchiveCommitRecord {
+  version: 1;
+  archive: string;
+  size: number;
+  sha256: string;
+  manifestId: string;
+  manifestHash: string;
+}
 export const BACKUP_ARCHIVE_LIMITS = Object.freeze({
   maxEntries: 1_000,
   maxPathBytes: 1_024,
@@ -176,7 +192,9 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
   let workRoot: string | undefined;
   let temporaryArchive: string | undefined;
   let incompleteMarker: string | undefined;
+  let temporaryCommit: string | undefined;
   let plaintextStaged = false;
+  let durablyCommitted: VerifiedBackup | undefined;
   try {
     assertNonSecretInputs(input);
     await mkdir(input.backupDir, { recursive: true, mode: 0o700 });
@@ -186,9 +204,12 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     const finalArchive = join(backupRoot, `${date}.age`);
     incompleteMarker = `${finalArchive}.uncommitted`;
     temporaryArchive = `${finalArchive}.tmp`;
+    temporaryCommit = `${finalArchive}.committed.tmp`;
     await assertAbsent(finalArchive);
     await assertAbsent(temporaryArchive);
     await assertAbsent(incompleteMarker);
+    await assertAbsent(`${finalArchive}.committed`);
+    await assertAbsent(temporaryCommit);
     workRoot = await privateStateTempRoot(stateRoot, input.pathSafety);
     await acl.verifyPrivateDirectory(workRoot);
     const snapshotRoot = join(workRoot, 'snapshot');
@@ -229,9 +250,26 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     temporaryArchive = undefined;
     try {
       await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
+      const archiveEvidence = await hashFileBounded(finalArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
+      const commitRecord: ArchiveCommitRecord = {
+        version: COMMIT_RECORD_VERSION,
+        archive: basename(finalArchive),
+        size: archiveEvidence.size,
+        sha256: archiveEvidence.sha256,
+        manifestId: backupManifestId(manifest),
+        manifestHash: backupManifestHash(manifest),
+      };
+      await writeFile(temporaryCommit, `${JSON.stringify(commitRecord)}\n`, { flag: 'wx', mode: 0o600 });
+      await durability.syncFile(temporaryCommit);
+      const commitPath = `${finalArchive}.committed`;
+      await publication.rename(temporaryCommit, commitPath);
+      temporaryCommit = undefined;
+      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
       await publication.unlink(publicationMarker);
       await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
       incompleteMarker = undefined;
+      await assertArchiveEligible(finalArchive, input.pathSafety, manifest);
+      durablyCommitted = { archivePath: finalArchive, manifest, outboxEvidence };
     } catch (error) {
       if (!(await exists(publicationMarker))) {
         await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
@@ -241,10 +279,15 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       incompleteMarker = undefined;
       throw error instanceof BackupError ? error : new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
     }
-    await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety });
+    await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety }).catch(() => undefined);
     input.health?.recover('backup');
-    return { archivePath: finalArchive, manifest, outboxEvidence };
+    return durablyCommitted;
   } catch (error) {
+    if (durablyCommitted) {
+      // The archive is already a durable recovery point. A later explicit
+      // verification can reconcile a temporarily unavailable health journal.
+      return durablyCommitted;
+    }
     reportFailure(input.health);
     if (workRoot && plaintextStaged) {
       await quarantinePrivateRoot(input.stateDir, workRoot, input.aclVerifier ?? defaultAclVerifier, input.pathSafety).then(() => { workRoot = undefined; }).catch(() => undefined);
@@ -253,6 +296,7 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
   } finally {
     if (workRoot) await cleanupPrivateRoot(workRoot).catch(() => undefined);
     if (temporaryArchive) await unlink(temporaryArchive).catch(() => undefined);
+    if (temporaryCommit) await unlink(temporaryCommit).catch(() => undefined);
     if (incompleteMarker) {
       const final = incompleteMarker.slice(0, -'.uncommitted'.length);
       if (!(await exists(final))) await unlink(incompleteMarker).catch(() => undefined);
@@ -391,6 +435,7 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     const pathSafety = input.pathSafety ?? DEFAULT_PATH_SAFETY;
     const root = await canonicalDirectoryRoot(input.backupDir, pathSafety, 'retention_root_unsafe');
     const publication = input.publicationOps ?? defaultPublicationOps;
+    const identityDeleter = input.identityDeleter ?? defaultIdentityBoundDeleter;
     await recoverRetentionTombstones(root, pathSafety, publication, input.durability ?? defaultDurability);
     const paths = input.candidatePaths
       ? [...input.candidatePaths]
@@ -415,33 +460,59 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     }
     verified.sort((left, right) => basename(right.path).localeCompare(basename(left.path)));
     const deleted: string[] = [];
-    for (const candidate of verified.slice(keep)) {
+    const deletionCandidates = verified.slice(keep);
+    if (deletionCandidates.length === 0) {
+      return { deleted, retained: verified.slice(0, Math.max(keep, 2)).map(item => item.path) };
+    }
+    const deletionParentPath = join(root, '.retention-delete');
+    await mkdir(deletionParentPath, { recursive: true, mode: 0o700 });
+    await chmod(deletionParentPath, 0o700);
+    await (input.aclVerifier ?? defaultAclVerifier).verifyPrivateDirectory(deletionParentPath);
+    const deletionParent = await canonicalDirectoryUnder(deletionParentPath, root, pathSafety);
+    const deletionRootPath = join(deletionParent, `delete-${crypto.randomUUID()}`);
+    await mkdir(deletionRootPath, { mode: 0o700 });
+    await chmod(deletionRootPath, 0o700);
+    await (input.aclVerifier ?? defaultAclVerifier).verifyPrivateDirectory(deletionRootPath);
+    const deletionRoot = await canonicalDirectoryUnder(deletionRootPath, deletionParent, pathSafety);
+    await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionParent, input.durabilityDiagnostic);
+    for (const candidate of deletionCandidates) {
       await assertArchiveEligible(candidate.path, pathSafety);
       const current = await lstat(candidate.path, { bigint: true });
       if (!sameStableFile(candidate.identity, current) || current.isSymbolicLink() || !current.isFile()
         || await pathSafety.isReparsePoint(candidate.path)) continue;
       const real = await realpath(candidate.path);
       if (!within(root, real) || real !== candidate.path) continue;
-      const tombstone = `${candidate.path}.tombstone-${crypto.randomUUID()}`;
+      const commitPath = `${candidate.path}.committed`;
+      const archiveExpected = await identityDeleter.capture(candidate.path);
+      const commitExpected = await identityDeleter.capture(commitPath);
+      const deletionId = crypto.randomUUID();
+      const tombstone = join(deletionRoot, `${basename(candidate.path)}.delete-${deletionId}`);
+      const commitTombstone = join(deletionRoot, `${basename(candidate.path)}.committed.delete-${deletionId}`);
       await publication.rename(candidate.path, tombstone);
       try {
         if (await exists(`${candidate.path}.uncommitted`)) throw new BackupError('retention_marker_race', 'Archive publication marker appeared during retention');
+        await publication.rename(commitPath, commitTombstone);
+        if (await exists(`${candidate.path}.uncommitted`)) throw new BackupError('retention_marker_race', 'Archive publication marker appeared during retention');
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionRoot, input.durabilityDiagnostic);
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, root, input.durabilityDiagnostic);
         const moved = await lstat(tombstone, { bigint: true });
         if (!sameMovedFile(candidate.identity, moved) || !moved.isFile() || moved.isSymbolicLink()
-          || await pathSafety.isReparsePoint(tombstone) || await realpath(tombstone) !== tombstone || !within(root, tombstone)) {
+          || await pathSafety.isReparsePoint(tombstone) || await realpath(tombstone) !== tombstone || !within(deletionRoot, tombstone)) {
           throw new BackupError('retention_identity_changed', 'Retention tombstone identity does not match verified archive');
         }
-        await publication.unlink(tombstone);
-        await (input.durability ?? defaultDurability).syncDirectory(root);
-      } catch (error) {
-        if (!(await exists(candidate.path)) && await exists(tombstone)) {
-          const tombstoneInfo = await lstat(tombstone, { bigint: true }).catch(() => undefined);
-          if (tombstoneInfo && sameMovedFile(candidate.identity, tombstoneInfo)) {
-            await publication.rename(tombstone, candidate.path).catch(() => undefined);
-          } else {
-            await publication.rename(tombstone, `${tombstone}.suspicious`).catch(() => undefined);
-          }
+        const movedCommit = await lstat(commitTombstone, { bigint: true });
+        if (!movedCommit.isFile() || movedCommit.isSymbolicLink() || await pathSafety.isReparsePoint(commitTombstone)
+          || await realpath(commitTombstone) !== commitTombstone || !within(deletionRoot, commitTombstone)) {
+          throw new BackupError('retention_identity_changed', 'Retention commit evidence changed during deletion');
         }
+        await identityDeleter.deleteOpened(tombstone, archiveExpected);
+        await identityDeleter.deleteOpened(commitTombstone, commitExpected);
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionRoot, input.durabilityDiagnostic);
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionParent, input.durabilityDiagnostic);
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, root, input.durabilityDiagnostic);
+      } catch (error) {
+        // Once moved, failures remain quarantined in the protected deletion
+        // namespace. No pathname-based unlink or unsafe restoration is allowed.
         throw error;
       }
       deleted.push(candidate.path);
@@ -469,7 +540,49 @@ async function recoverRetentionTombstones(
   }
 }
 
-async function assertArchiveEligible(path: string, pathSafety?: PathSafety): Promise<void> {
+function backupManifestId(manifest: BackupManifest): string {
+  return `${manifest.createdAt}:${manifest.gitHead}`;
+}
+
+function backupManifestHash(manifest: BackupManifest): string {
+  return sha256(Buffer.from(JSON.stringify(manifest), 'utf8'));
+}
+
+async function readArchiveCommitRecord(
+  archivePath: string, pathSafety: PathSafety,
+): Promise<ArchiveCommitRecord> {
+  const commitPath = `${archivePath}.committed`;
+  const info = await lstat(commitPath, { bigint: true }).catch(() => undefined);
+  if (!info) throw new BackupError('archive_commit_missing', 'Backup archive has no durable commit evidence');
+  const root = await realpath(dirname(archivePath));
+  let identity;
+  try { identity = await canonicalRegularFile(commitPath, root, pathSafety); }
+  catch { throw new BackupError('archive_commit_unsafe', 'Backup commit evidence is unsafe'); }
+  const text = await readTextBounded(identity.path, 16 * 1024);
+  await assertPathIdentity(identity, pathSafety);
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { throw new BackupError('archive_commit_invalid', 'Backup commit evidence is invalid'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new BackupError('archive_commit_invalid', 'Backup commit evidence is invalid');
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(['archive', 'manifestHash', 'manifestId', 'sha256', 'size', 'version'])) {
+    throw new BackupError('archive_commit_invalid', 'Backup commit evidence schema is invalid');
+  }
+  if (record.version !== COMMIT_RECORD_VERSION || record.archive !== basename(archivePath)
+    || !Number.isSafeInteger(record.size) || (record.size as number) < 0
+    || typeof record.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(record.sha256)
+    || typeof record.manifestId !== 'string' || record.manifestId.length > 512
+    || typeof record.manifestHash !== 'string' || !/^[0-9a-f]{64}$/.test(record.manifestHash)) {
+    throw new BackupError('archive_commit_invalid', 'Backup commit evidence fields are invalid');
+  }
+  return record as unknown as ArchiveCommitRecord;
+}
+
+async function assertArchiveEligible(
+  path: string, pathSafety?: PathSafety, expectedManifest?: BackupManifest,
+): Promise<ArchiveCommitRecord> {
   const absolute = resolve(path);
   const name = basename(absolute);
   if (!ARCHIVE_NAME.test(name) || !validArchiveDate(name)) {
@@ -478,9 +591,22 @@ async function assertArchiveEligible(path: string, pathSafety?: PathSafety): Pro
   if (await exists(`${absolute}.uncommitted`)) {
     throw new BackupError('archive_uncommitted', 'Backup archive publication is incomplete');
   }
-  const info = await lstat(absolute, { bigint: true });
+  const info = await lstat(absolute, { bigint: true }).catch(() => undefined);
+  if (!info) throw new BackupError('archive_commit_missing', 'Backup archive is not a durable committed recovery point');
   if (!info.isFile() || info.isSymbolicLink() || await (pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(absolute)
     || await realpath(absolute) !== absolute) throw new BackupError('archive_ineligible', 'Backup archive path is unsafe');
+  const safety = pathSafety ?? DEFAULT_PATH_SAFETY;
+  const record = await readArchiveCommitRecord(absolute, safety);
+  const evidence = await hashFileBounded(absolute, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
+  const after = await lstat(absolute, { bigint: true });
+  if (!sameStableFile(info, after) || evidence.size !== record.size || evidence.sha256 !== record.sha256) {
+    throw new BackupError('archive_commit_mismatch', 'Backup archive does not match its durable commit evidence');
+  }
+  if (expectedManifest && (record.manifestId !== backupManifestId(expectedManifest)
+    || record.manifestHash !== backupManifestHash(expectedManifest))) {
+    throw new BackupError('archive_commit_mismatch', 'Backup manifest does not match its durable commit evidence');
+  }
+  return record;
 }
 
 async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Promise<BackupManifest> {
@@ -575,7 +701,7 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
 async function verifyArchiveToFreshDirectory(input: VerifyBackupInput, requireEligible = true) {
   const age = input.ageRunner ?? new AgeExecRunner();
   const archivePath = resolve(input.archivePath);
-  if (requireEligible) await assertArchiveEligible(archivePath, input.pathSafety);
+  const commitRecord = requireEligible ? await assertArchiveEligible(archivePath, input.pathSafety) : undefined;
   const archiveStat = await lstat(archivePath, { bigint: true });
   if (!archiveStat.isFile() || archiveStat.isSymbolicLink()
     || await (input.pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(archivePath)) throw new BackupError('archive_unsafe', 'Backup archive is not a regular file');
@@ -587,9 +713,19 @@ async function verifyArchiveToFreshDirectory(input: VerifyBackupInput, requireEl
     const bundlePath = join(root, 'decrypted.bundle');
     const snapshotRoot = join(root, 'snapshot');
     await copyStableStreaming(realArchive, privateArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
+    if (commitRecord) {
+      const copiedEvidence = await hashFileBounded(privateArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
+      if (copiedEvidence.size !== commitRecord.size || copiedEvidence.sha256 !== commitRecord.sha256) {
+        throw new BackupError('archive_commit_mismatch', 'Copied archive does not match durable commit evidence');
+      }
+    }
     await age.decrypt(privateArchive, bundlePath, input.identityFile, input.signal);
     await unpackBundle(bundlePath, snapshotRoot);
     const manifest = await verifySnapshotLayout(snapshotRoot, input.secretCanaries ?? []);
+    if (commitRecord && (commitRecord.manifestId !== backupManifestId(manifest)
+      || commitRecord.manifestHash !== backupManifestHash(manifest))) {
+      throw new BackupError('archive_commit_mismatch', 'Verified manifest does not match durable commit evidence');
+    }
     return { root, snapshotRoot, manifest };
   } catch (error) {
     await cleanupPrivateRoot(root).catch(() => undefined);
@@ -1291,6 +1427,65 @@ const defaultDurability: BackupDurability = {
 
 const defaultPublicationOps: BackupPublicationOps = { rename, unlink };
 
+const NTFS_IDENTITY_DELETE_SCRIPT = String.raw`
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class OpenClawBoundDelete {
+  [StructLayout(LayoutKind.Sequential)] struct FILETIME { public uint Low; public uint High; }
+  [StructLayout(LayoutKind.Sequential)] struct INFO { public uint Attr; public FILETIME Creation; public FILETIME Access; public FILETIME Write; public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; }
+  [StructLayout(LayoutKind.Sequential)] struct DISPOSITION { [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile; }
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(IntPtr h, out INFO info);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetFileInformationByHandle(IntPtr h, int kind, ref DISPOSITION value, uint size);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  const uint READ_ATTRIBUTES=0x80, DELETE=0x10000, OPEN_EXISTING=3, OPEN_REPARSE_POINT=0x00200000, REPARSE_ATTRIBUTE=0x400;
+  static INFO Info(SafeFileHandle h) { INFO i; if (!GetFileInformationByHandle(h.DangerousGetHandle(), out i)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); if ((i.Attr & REPARSE_ATTRIBUTE) != 0) throw new IOException("reparse point rejected"); return i; }
+  static string Id(INFO i) { return i.Volume.ToString("X8") + "|" + (((ulong)i.IndexHigh << 32) | i.IndexLow).ToString("X16"); }
+  static SafeFileHandle Open(string path, uint access, uint share) { var h=CreateFileW(path, access, share, IntPtr.Zero, OPEN_EXISTING, OPEN_REPARSE_POINT, IntPtr.Zero); if(h.IsInvalid) { var error=Marshal.GetLastWin32Error(); h.Dispose(); throw new System.ComponentModel.Win32Exception(error); } return h; }
+  public static string Capture(string path) { using (var h=Open(path, READ_ATTRIBUTES, 7)) return Id(Info(h)); }
+  public static void Delete(string path, string expected) { using (var h=Open(path, READ_ATTRIBUTES | DELETE, 0)) { var actual=Id(Info(h)); if(actual != expected) throw new IOException("identity mismatch"); var d=new DISPOSITION { DeleteFile=true }; if(!SetFileInformationByHandle(h.DangerousGetHandle(), 4, ref d, (uint)Marshal.SizeOf(typeof(DISPOSITION)))) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); } }
+}
+'@
+if ($args[0] -eq 'capture') { [OpenClawBoundDelete]::Capture($args[1]) } elseif ($args[0] -eq 'delete') { [OpenClawBoundDelete]::Delete($args[1], $args[2]) } else { throw 'invalid operation' }
+`;
+
+async function windowsNtfsPath(path: string): Promise<{ executable: string; path: string } | undefined> {
+  if (process.platform === 'win32' && /^d:\\/i.test(path)) return { executable: 'powershell.exe', path };
+  if (process.platform === 'linux' && /^\/mnt\/d\//i.test(path)) {
+    const converted = await runExecFileCapture({ executable: 'wslpath', args: ['-w', path], timeoutMs: 10_000 });
+    return { executable: 'powershell.exe', path: converted.trim() };
+  }
+  return undefined;
+}
+
+export function parseNtfsFileIdentity(output: string): FileIdentityEvidence {
+  const match = /^([0-9A-F]{8})\|([0-9A-F]{16})$/.exec(output.trim());
+  if (!match) throw new BackupError('retention_identity_delete_unavailable', 'Authoritative NTFS file identity evidence is invalid');
+  return { volumeId: match[1]!, fileId: match[2]! };
+}
+
+const defaultIdentityBoundDeleter: IdentityBoundDeleter = {
+  async capture(path) {
+    const target = await windowsNtfsPath(path);
+    if (!target) throw new BackupError('retention_identity_delete_unavailable', 'Identity-bound deletion is unavailable for this backup filesystem');
+    try {
+      const output = (await runExecFileCapture({ executable: target.executable,
+        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT, 'capture', target.path], timeoutMs: 10_000 })).trim();
+      return parseNtfsFileIdentity(output);
+    } catch { throw new BackupError('retention_identity_delete_unavailable', 'Authoritative NTFS file identity could not be captured'); }
+  },
+  async deleteOpened(path, expected) {
+    const target = await windowsNtfsPath(path);
+    if (!target) throw new BackupError('retention_identity_delete_unavailable', 'Identity-bound deletion is unavailable for this backup filesystem');
+    try {
+      await runExecFileCapture({ executable: target.executable,
+        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT, 'delete', target.path, `${expected.volumeId}|${expected.fileId}`], timeoutMs: 10_000 });
+    } catch { throw new BackupError('retention_identity_changed', 'NTFS identity-bound deletion failed closed'); }
+  },
+};
+
 async function requirePublicationDirectorySync(
   durability: BackupDurability,
   root: string,
@@ -1311,14 +1506,20 @@ async function rollbackPublishedArchive(
   durability: BackupDurability,
   publication: BackupPublicationOps,
 ): Promise<void> {
+  const commitPath = `${finalArchive}.committed`;
+  const commitTemporary = `${commitPath}.tmp`;
   try {
     await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
+    await publication.unlink(commitPath).catch(() => undefined);
+    await publication.unlink(commitTemporary).catch(() => undefined);
     await durability.syncDirectory(root).catch(() => undefined);
     await publication.unlink(marker).catch(() => undefined);
     return;
   } catch {
     try {
       await publication.unlink(finalArchive);
+      await publication.unlink(commitPath).catch(() => undefined);
+      await publication.unlink(commitTemporary).catch(() => undefined);
       await durability.syncDirectory(root).catch(() => undefined);
       await publication.unlink(marker).catch(() => undefined);
       return;
