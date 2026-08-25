@@ -355,6 +355,14 @@ export class WorkspaceRepository {
     });
   }
 
+  /** Runs a read-side snapshot while holding the same single-writer boundary as mutations. */
+  async quiesce<T>(work: () => Promise<T>): Promise<T> {
+    if (this.closed) {
+      throw new WorkspaceRepositoryError('repository_closed', 'repository is closed');
+    }
+    return this.withLock(work);
+  }
+
   close(): void {
     if (this.closed) return;
     this.ledger.close();
