@@ -246,6 +246,7 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     const publicationMarker = incompleteMarker;
     await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
     await durability.syncFile(publicationMarker);
+    await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
     await publication.rename(temporaryArchive, finalArchive);
     temporaryArchive = undefined;
     try {
@@ -271,12 +272,20 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       await assertArchiveEligible(finalArchive, input.pathSafety, manifest);
       durablyCommitted = { archivePath: finalArchive, manifest, outboxEvidence };
     } catch (error) {
+      let markerRecoveryFailure: BackupError | undefined;
       if (!(await exists(publicationMarker))) {
-        await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
-        await durability.syncFile(publicationMarker);
+        try {
+          await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
+          await durability.syncFile(publicationMarker);
+        } catch {
+          markerRecoveryFailure = new BackupError(
+            'archive_rollback_failed',
+            `Backup publication marker durability failed; retain ${basename(publicationMarker)} and reconcile the quarantined archive manually`,
+          );
+        }
       }
       await rollbackPublishedArchive(finalArchive, publicationMarker, backupRoot, durability, publication);
-      incompleteMarker = undefined;
+      if (markerRecoveryFailure) throw markerRecoveryFailure;
       throw error instanceof BackupError ? error : new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
     }
     await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety }).catch(() => undefined);
@@ -297,10 +306,6 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     if (workRoot) await cleanupPrivateRoot(workRoot).catch(() => undefined);
     if (temporaryArchive) await unlink(temporaryArchive).catch(() => undefined);
     if (temporaryCommit) await unlink(temporaryCommit).catch(() => undefined);
-    if (incompleteMarker) {
-      const final = incompleteMarker.slice(0, -'.uncommitted'.length);
-      if (!(await exists(final))) await unlink(incompleteMarker).catch(() => undefined);
-    }
   }
 }
 
@@ -1509,23 +1514,17 @@ async function rollbackPublishedArchive(
   const commitPath = `${finalArchive}.committed`;
   const commitTemporary = `${commitPath}.tmp`;
   try {
-    await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
-    await publication.unlink(commitPath).catch(() => undefined);
-    await publication.unlink(commitTemporary).catch(() => undefined);
-    await durability.syncDirectory(root).catch(() => undefined);
-    await publication.unlink(marker).catch(() => undefined);
-    return;
-  } catch {
     try {
-      await publication.unlink(finalArchive);
-      await publication.unlink(commitPath).catch(() => undefined);
-      await publication.unlink(commitTemporary).catch(() => undefined);
-      await durability.syncDirectory(root).catch(() => undefined);
-      await publication.unlink(marker).catch(() => undefined);
-      return;
+      await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
     } catch {
-      throw new BackupError('archive_rollback_failed', `Backup publication rollback failed; ${basename(finalArchive)} remains explicitly ineligible while ${basename(marker)} exists`);
+      await publication.unlink(finalArchive);
     }
+    if (await exists(commitPath)) await publication.unlink(commitPath);
+    if (await exists(commitTemporary)) await publication.unlink(commitTemporary);
+    const syncResult = await durability.syncDirectory(root);
+    if (syncResult === 'unsupported') throw new Error('rollback directory sync unsupported');
+  } catch {
+    throw new BackupError('archive_rollback_failed', `Backup publication rollback or durability failed; retain ${basename(marker)} and reconcile the quarantined archive manually`);
   }
 }
 

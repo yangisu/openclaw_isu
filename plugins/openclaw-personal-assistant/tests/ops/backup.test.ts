@@ -263,7 +263,7 @@ describe('encrypted verified backup', () => {
       now: () => new Date('2026-08-25T00:00:00.000Z') });
     expect(events.at(-1)).toBe('recover');
     expect(events.filter(event => event === 'file')).toHaveLength(3);
-    expect(events.filter(event => event === 'directory')).toHaveLength(3);
+    expect(events.filter(event => event === 'directory')).toHaveLength(4);
     expect(events.indexOf('recover')).toBeGreaterThan(events.lastIndexOf('directory'));
   });
 
@@ -329,16 +329,24 @@ describe('encrypted verified backup', () => {
   }, 30_000);
 
   it('leaves no eligible archive at every commit-record publication crash point', async () => {
-    for (const point of ['commit-file-sync', 'commit-rename', 'marker-removal-sync'] as const) {
+    for (const point of [
+      'archive-directory-sync', 'commit-file-sync', 'commit-rename', 'commit-directory-sync',
+      'marker-removal-sync', 'marker-recreation-sync',
+    ] as const) {
       const f = await fixture(); const health: string[] = []; let fileSyncs = 0; let directorySyncs = 0; let renames = 0;
-      await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      const failure = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
         durability: {
           async syncFile() {
             if (++fileSyncs === 3 && point === 'commit-file-sync') throw Object.assign(new Error('crash'), { code: 'EIO' });
+            if (fileSyncs === 4 && point === 'marker-recreation-sync') throw Object.assign(new Error('crash'), { code: 'EIO' });
           },
           async syncDirectory() {
             directorySyncs += 1;
-            if (point === 'marker-removal-sync' && directorySyncs === 3) throw Object.assign(new Error('crash'), { code: 'EIO' });
+            if (point === 'archive-directory-sync' && directorySyncs === 2) throw Object.assign(new Error('crash'), { code: 'EIO' });
+            if (point === 'commit-directory-sync' && directorySyncs === 3) throw Object.assign(new Error('crash'), { code: 'EIO' });
+            if ((point === 'marker-removal-sync' || point === 'marker-recreation-sync') && directorySyncs === 4) {
+              throw Object.assign(new Error('crash'), { code: 'EIO' });
+            }
           },
         },
         publicationOps: {
@@ -350,11 +358,44 @@ describe('encrypted verified backup', () => {
           async unlink(path) { await unlink(path); },
         },
         health: { report() { health.push('report'); }, recover() { health.push('recover'); } } as never,
-        now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toBeDefined();
+        now: () => new Date('2026-08-25T00:00:00.000Z') }).then(() => undefined, error => error as { code?: string });
+      expect(failure).toBeDefined();
+      if (point === 'marker-recreation-sync') expect(failure).toMatchObject({ code: 'archive_rollback_failed' });
       expect(health).toEqual(['report']);
+      expect(await readdir(f.backupDir)).toContain('2026-08-25.age.uncommitted');
+      expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
       await expect(verifyBackup({ archivePath: join(f.backupDir, '2026-08-25.age'), identityFile: 'test-key', ageRunner: f.age }))
-        .rejects.toMatchObject({ code: expect.stringMatching(/^archive_(?:uncommitted|commit_missing)$/) });
+        .rejects.toMatchObject({ code: 'archive_uncommitted' });
     }
+  }, 30_000);
+
+  it('retains the durable marker and reports rollback failure when rollback directory sync fails', async () => {
+    const f = await fixture(); let directorySyncs = 0; const health: string[] = [];
+    await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      durability: {
+        async syncFile() {},
+        async syncDirectory() { directorySyncs += 1; if (directorySyncs >= 2) throw Object.assign(new Error('sync unavailable'), { code: 'EIO' }); },
+      }, health: { report() { health.push('report'); }, recover() { health.push('recover'); } } as never,
+      now: () => new Date('2026-08-25T00:00:00.000Z') }))
+      .rejects.toMatchObject({ code: 'archive_rollback_failed' });
+    expect(directorySyncs).toBeGreaterThanOrEqual(2);
+    expect(await readdir(f.backupDir)).toContain('2026-08-25.age.uncommitted');
+    expect(health).toEqual(['report']);
+  }, 30_000);
+
+  it('rejects a recovered archive and commit pair whenever its durable marker remains', async () => {
+    const f = await fixture(); const health: string[] = [];
+    const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    await writeFile(`${backup.archivePath}.uncommitted`, 'publication pending\n', { mode: 0o600 });
+    await expect(verifyBackup({ archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: f.age,
+      health: { report() { health.push('report'); }, recover() { health.push('recover'); } } as never }))
+      .rejects.toMatchObject({ code: 'archive_uncommitted' });
+    const restoreRoot = join(f.root, 'marker-restore'); await mkdir(restoreRoot);
+    await expect(restoreBackup({ archivePath: backup.archivePath, restoreRoot, identityFile: 'test-key', ageRunner: f.age }))
+      .rejects.toMatchObject({ code: 'archive_uncommitted' });
+    expect((await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2 })).retained).toEqual([]);
+    expect(health).toEqual(['report']);
   }, 30_000);
 
   it('reconciles success from durable commit evidence if post-publication health recovery throws', async () => {
@@ -373,13 +414,15 @@ describe('encrypted verified backup', () => {
       durability: { async syncFile() {}, async syncDirectory() { return 'unsupported' as const; } },
       health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
       now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'archive_directory_sync_unsupported' });
-    expect(events).toEqual(['report']); expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
+    expect(events).toEqual(['report']);
+    expect(await readdir(f.backupDir)).toContain('2026-08-25.age.uncommitted');
+    expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
   }, 30_000);
 
   it('rolls back when the marker-unlink directory sync fails', async () => {
     const f = await fixture(); let directorySyncs = 0; const events: string[] = [];
     await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
-      durability: { async syncFile() {}, async syncDirectory() { if (++directorySyncs === 2) throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
+      durability: { async syncFile() {}, async syncDirectory() { if (++directorySyncs === 4) throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
       health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
       now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'archive_directory_sync_failed' });
     expect(events).toEqual(['report']); expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
@@ -397,16 +440,18 @@ describe('encrypted verified backup', () => {
   });
 
   it('rolls back a post-rename directory-sync failure and surfaces rollback failure safely', async () => {
-    const rolledBack = await fixture(); const events: string[] = [];
+    const rolledBack = await fixture(); const events: string[] = []; let directorySyncs = 0;
     await expect(createBackup({ ...rolledBack, recipient: 'age1test', identityFile: 'test-key', ageRunner: rolledBack.age,
-      durability: { async syncFile() {}, async syncDirectory() { throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
+      durability: { async syncFile() {}, async syncDirectory() { if (++directorySyncs >= 2) throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
       health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
-      now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'archive_directory_sync_failed' });
-    expect(events).toEqual(['report']); expect(await readdir(rolledBack.backupDir)).not.toContain('2026-08-25.age');
+      now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'archive_rollback_failed' });
+    expect(events).toEqual(['report']);
+    expect(await readdir(rolledBack.backupDir)).toContain('2026-08-25.age.uncommitted');
+    expect(await readdir(rolledBack.backupDir)).not.toContain('2026-08-25.age');
 
-    const stuck = await fixture(); let renames = 0;
+    const stuck = await fixture(); let renames = 0; let stuckDirectorySyncs = 0;
     await expect(createBackup({ ...stuck, recipient: 'age1test', identityFile: 'test-key', ageRunner: stuck.age,
-      durability: { async syncFile() {}, async syncDirectory() { throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
+      durability: { async syncFile() {}, async syncDirectory() { if (++stuckDirectorySyncs >= 2) throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
       publicationOps: {
         async rename(source, destination) { if (++renames === 1) await rename(source, destination); else throw new Error('rollback rename denied'); },
         async unlink() { throw new Error('rollback unlink denied'); },
