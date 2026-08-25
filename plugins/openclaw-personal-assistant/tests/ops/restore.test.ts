@@ -8,7 +8,7 @@ import { afterEach, expect, it } from 'vitest';
 import { SubsystemHealthStore } from '../../src/state/health.js';
 import { AlertLedger } from '../../src/state/alerts.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
-import { createBackup, restoreBackup, type AgeRunner } from '../../src/ops/backup.js';
+import { createBackup, restoreBackup, verifyScheduledRestore, type AgeRunner } from '../../src/ops/backup.js';
 import { runExecFile } from '../../src/ops/process.js';
 import { openRepository, type WorkspaceRepository } from '../../src/workspace/repository.js';
 
@@ -103,3 +103,63 @@ it('terminates a timed-out child with a stable bounded-process error', async () 
     timeoutMs: 50,
   })).rejects.toMatchObject({ code: 'process_timeout' });
 });
+
+it('restores a credential-free reachable Git snapshot without dangling secret objects', async () => {
+  const f = await fixture();
+  execFileSync('git', ['remote', 'add', 'origin', 'https://backup-user:backup-password@example.test/repo.git'], {
+    cwd: f.workspaceDir,
+  });
+  const dangling = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+    cwd: f.workspaceDir, input: 'DANGLING-SECRET-CANARY', encoding: 'utf8',
+  }).trim();
+  const backup = await createBackup({
+    ...f, recipient: 'git-key', identityFile: 'git-key', ageRunner: f.age,
+    secretCanaries: ['DANGLING-SECRET-CANARY'],
+    now: () => new Date('2026-08-25T00:00:00.000Z'),
+  });
+  const restoreRoot = join(f.root, 'git-restores');
+  await mkdir(restoreRoot);
+  const restored = await restoreBackup({
+    archivePath: backup.archivePath, restoreRoot, identityFile: 'git-key', ageRunner: f.age,
+  });
+  const restoredWorkspace = join(restored.restorePath, 'workspace');
+  expect(execFileSync('git', ['remote'], { cwd: restoredWorkspace, encoding: 'utf8' }).trim()).toBe('');
+  expect(() => execFileSync('git', ['cat-file', '-e', dangling], {
+    cwd: restoredWorkspace, stdio: 'ignore',
+  })).toThrow();
+  expect(await readFile(join(restored.restorePath, 'git', 'repository.bundle'))).not.toContain('backup-password');
+  f.outbox.close(); f.health.close();
+}, 30_000);
+
+it('rejects a canary in reachable Git history even after the working file is removed', async () => {
+  const f = await fixture();
+  await writeFile(join(f.workspaceDir, 'history-secret.txt'), 'REACHABLE-HISTORY-CANARY\n');
+  execFileSync('git', ['add', 'history-secret.txt'], { cwd: f.workspaceDir });
+  execFileSync('git', ['commit', '--quiet', '-m', 'secret history'], { cwd: f.workspaceDir });
+  await rm(join(f.workspaceDir, 'history-secret.txt'));
+  execFileSync('git', ['add', '-u'], { cwd: f.workspaceDir });
+  execFileSync('git', ['commit', '--quiet', '-m', 'remove secret'], { cwd: f.workspaceDir });
+  await expect(createBackup({
+    ...f, recipient: 'git-key', identityFile: 'git-key', ageRunner: f.age,
+    secretCanaries: ['REACHABLE-HISTORY-CANARY'],
+    now: () => new Date('2026-08-25T00:00:00.000Z'),
+  })).rejects.toMatchObject({ code: 'secret_material_detected' });
+  f.outbox.close(); f.health.close();
+}, 30_000);
+
+it('records deterministic daily sample and monthly full restore evidence', async () => {
+  const f = await fixture();
+  const backup = await createBackup({ ...f, recipient: 'schedule-key', identityFile: 'schedule-key', ageRunner: f.age,
+    now: () => new Date('2026-08-25T00:00:00.000Z') });
+  const restoreRoot = join(f.root, 'scheduled-restores'); await mkdir(restoreRoot);
+  for (const kind of ['daily-sample', 'monthly-full'] as const) {
+    await verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
+      identityFile: 'schedule-key', ageRunner: f.age, kind,
+      now: () => new Date('2026-08-25T12:00:00.000Z') });
+  }
+  const records = (await readFile(join(f.stateDir, 'backup-restore-verifications.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(records.map(record => [record.kind, record.status, record.gitHead])).toEqual([
+    ['daily-sample', 'passed', backup.manifest.gitHead], ['monthly-full', 'passed', backup.manifest.gitHead],
+  ]);
+  f.outbox.close(); f.health.close();
+}, 30_000);

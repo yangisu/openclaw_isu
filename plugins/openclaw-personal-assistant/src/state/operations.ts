@@ -1,5 +1,6 @@
 /// <reference types="node" />
 
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -51,6 +52,38 @@ CREATE TABLE IF NOT EXISTS operations (
   updated_at TEXT NOT NULL
 ) STRICT;
 `;
+
+export const OPERATION_SCHEMA_VERSION = 0;
+export const OPERATION_SCHEMA_FINGERPRINT = createHash('sha256')
+  .update(normalizeSchemaSql(SCHEMA)).digest('hex');
+
+export function validateOperationBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    const rows = database.prepare(`
+      SELECT type, name, sql FROM sqlite_master
+      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all() as Array<{ type: string; name: string; sql: string }>;
+    const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+    if (version !== OPERATION_SCHEMA_VERSION || rows.length !== 1
+      || rows[0]?.type !== 'table' || rows[0]?.name !== 'operations'
+      || normalizeSchemaSql(rows[0].sql) !== normalizeSchemaSql(SCHEMA)
+      || integrity.integrity_check !== 'ok') {
+      throw new OperationLedgerError('operation_schema_mismatch', 'Operation backup schema is incompatible');
+    }
+    return { userVersion: version, schemaFingerprint: OPERATION_SCHEMA_FINGERPRINT };
+  } finally { database.close(); }
+}
+
+function normalizeSchemaSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').replace(/;\s*$/, '').trim().toLowerCase()
+    .replace(/^create table if not exists /, 'create table ');
+}
 
 function parseRow<TResult>(row: OperationRow | undefined): LedgerOperation<TResult> | undefined {
   if (!row) return undefined;

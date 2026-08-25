@@ -1,6 +1,6 @@
 /// <reference types="node" />
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -30,6 +30,26 @@ const ALERT_CLAIM_INDEX_SQL = `
   CREATE INDEX alert_claim_idx
   ON alert_fingerprints (active, delivered, lease_expires_at, claim_id)
 `;
+
+export const ALERT_BACKUP_SCHEMA_VERSION = ALERT_SCHEMA_VERSION;
+export const ALERT_BACKUP_SCHEMA_FINGERPRINT = createHash('sha256')
+  .update(`${normalizeSql(ALERT_TABLE_SQL)}\n${normalizeSql(ALERT_CLAIM_INDEX_SQL)}`)
+  .digest('hex');
+
+export function validateAlertBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    if (version !== ALERT_SCHEMA_VERSION) {
+      throw new AlertLedgerError('alert_schema_mismatch', 'Alert backup schema version is incompatible');
+    }
+    validateCurrentAlertSchema(database);
+    return { userVersion: version, schemaFingerprint: ALERT_BACKUP_SCHEMA_FINGERPRINT };
+  } finally { database.close(); }
+}
 
 const LEGACY_ALERT_TABLE_SQL = `
   CREATE TABLE alert_fingerprints (

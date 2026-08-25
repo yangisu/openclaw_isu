@@ -1,5 +1,6 @@
 /// <reference types="node" />
 
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -21,6 +22,26 @@ const HEALTH_TABLE_SQL = `
 const HEALTH_ACTIVE_INDEX_SQL = `
   CREATE INDEX health_active_idx ON subsystem_health (active, target)
 `;
+
+export const HEALTH_BACKUP_SCHEMA_VERSION = HEALTH_SCHEMA_VERSION;
+export const HEALTH_BACKUP_SCHEMA_FINGERPRINT = createHash('sha256')
+  .update(`${normalizeSql(HEALTH_TABLE_SQL)}\n${normalizeSql(HEALTH_ACTIVE_INDEX_SQL)}`)
+  .digest('hex');
+
+export function validateHealthBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    if (version !== HEALTH_SCHEMA_VERSION) {
+      throw new SubsystemHealthError('health_schema_mismatch', 'Health backup schema version is incompatible');
+    }
+    validateCurrentHealthSchema(database);
+    return { userVersion: version, schemaFingerprint: HEALTH_BACKUP_SCHEMA_FINGERPRINT };
+  } finally { database.close(); }
+}
 
 export class SubsystemHealthError extends Error {
   constructor(public readonly code: 'health_schema_mismatch', message: string) {

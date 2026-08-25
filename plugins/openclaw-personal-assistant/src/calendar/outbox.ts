@@ -300,7 +300,8 @@ CREATE TABLE calendar_outbox_audit (
 `;
 
 const EXPECTED_SCHEMA = schemaObjects(OUTBOX_SCHEMA);
-const OUTBOX_SCHEMA_FINGERPRINT = schemaFingerprint(EXPECTED_SCHEMA);
+export const OUTBOX_SCHEMA_FINGERPRINT = schemaFingerprint(EXPECTED_SCHEMA);
+export const OUTBOX_BACKUP_SCHEMA_VERSION = OUTBOX_SCHEMA_VERSION;
 const VERIFIED_EVIDENCE_TOKEN = Symbol('verified-outbox-backup-evidence');
 const VERIFIED_EVIDENCE = new WeakMap<object, {
   manifestId: string;
@@ -367,6 +368,21 @@ export class VerifiedOutboxBackupEvidence {
     }
   }
 
+}
+
+export function validateOutboxBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true, readBigInts: true });
+  try {
+    validateExistingSchema(database);
+    const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+    if (integrity.integrity_check !== 'ok') {
+      throw new CalendarOutboxError('outbox_schema_mismatch', 'Calendar outbox backup integrity failed');
+    }
+    return { userVersion: OUTBOX_SCHEMA_VERSION, schemaFingerprint: OUTBOX_SCHEMA_FINGERPRINT };
+  } finally { database.close(); }
 }
 
 export class CalendarOutbox {
