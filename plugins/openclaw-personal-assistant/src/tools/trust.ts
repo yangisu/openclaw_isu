@@ -2,6 +2,7 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from 'openclaw/plugin-sdk/plugin-entry';
+import { isCronSessionKey } from 'openclaw/plugin-sdk/routing';
 
 import { loadConfig, type AssistantConfig } from '../config.js';
 import { normalizeTelegramUserId } from '../telegram-user-id.js';
@@ -70,6 +71,30 @@ export function assertOwner(
     throw new AssistantToolError('sender_not_allowed', 'This tool is restricted to the configured owner');
   }
   return senderId;
+}
+
+export function assertOwnerOrTrustedBriefingCron(
+  toolContext: Pick<OpenClawPluginToolContext,
+    'requesterSenderId' | 'senderIsOwner' | 'sessionKey' | 'deliveryContext'>,
+  config: AssistantConfig,
+): string {
+  if (toolContext.requesterSenderId !== undefined) return assertOwner(toolContext, config);
+
+  let ownerId: string;
+  try {
+    ownerId = normalizeTelegramUserId(config.telegramUserId);
+  } catch {
+    throw new AssistantToolError('sender_not_allowed', 'This tool is restricted to the configured owner');
+  }
+  const delivery = toolContext.deliveryContext;
+  if (toolContext.senderIsOwner === false
+    || !isCronSessionKey(toolContext.sessionKey)
+    || delivery?.channel !== 'telegram'
+    || delivery.to !== ownerId
+    || delivery.threadId != null) {
+    throw new AssistantToolError('sender_not_allowed', 'This tool is restricted to the configured owner');
+  }
+  return ownerId;
 }
 
 export function requireCalendarReadConfig(config: AssistantToolConfig): {

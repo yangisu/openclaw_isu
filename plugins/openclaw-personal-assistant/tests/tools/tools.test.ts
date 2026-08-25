@@ -34,6 +34,11 @@ const briefingOwnerContext = {
   messageChannel: 'telegram',
   deliveryContext: { channel: 'telegram', to: config.telegramUserId },
 };
+const trustedBriefingCronContext = {
+  sessionKey: 'agent:main:cron:personal-assistant-hourly-briefing:run:0198dd83-1c00-7000-8000-000000000001',
+  messageChannel: 'telegram',
+  deliveryContext: { channel: 'telegram', to: config.telegramUserId },
+};
 const nonOwnerContext = { requesterSenderId: '999' };
 const temporaryStateDirs: string[] = [];
 
@@ -108,6 +113,100 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(prepareOpen).not.toHaveBeenCalled();
     expect(confirmOpen).not.toHaveBeenCalled();
     expect(briefingOpen).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['non-cron session', { ...trustedBriefingCronContext, sessionKey: 'agent:main:main' }],
+    ['missing delivery context', { ...trustedBriefingCronContext, deliveryContext: undefined }],
+    ['wrong channel', {
+      ...trustedBriefingCronContext,
+      deliveryContext: { channel: 'discord', to: config.telegramUserId },
+    }],
+    ['forged target', {
+      ...trustedBriefingCronContext,
+      deliveryContext: { channel: 'telegram', to: '999' },
+    }],
+    ['explicit non-owner bit', { ...trustedBriefingCronContext, senderIsOwner: false }],
+    ['unexpected thread target', {
+      ...trustedBriefingCronContext,
+      deliveryContext: { channel: 'telegram', to: config.telegramUserId, threadId: 'thread-1' },
+    }],
+    ['inbound non-owner on cron session', {
+      ...trustedBriefingCronContext,
+      requesterSenderId: '999',
+      senderIsOwner: true,
+    }],
+  ])('rejects briefing before local reads for a scheduled context with %s', async (_label, toolContext) => {
+    const openRepository = vi.fn();
+    const tool = createBriefingTool(api(), toolContext, { openRepository });
+
+    await expect(tool.execute('call-untrusted-cron', {})).rejects.toMatchObject({
+      code: 'sender_not_allowed',
+    });
+    expect(openRepository).not.toHaveBeenCalled();
+  });
+
+  it('keeps every non-briefing tool owner-only in a trusted isolated cron context', async () => {
+    const queryOpen = vi.fn();
+    const mutateOpen = vi.fn();
+    const prepareOpen = vi.fn();
+    const confirmOpen = vi.fn();
+    const query = createQueryTool(api(), trustedBriefingCronContext, { openRepository: queryOpen });
+    const mutate = createMutationTool(api(), trustedBriefingCronContext, { openRepository: mutateOpen });
+    const prepare = createCalendarPrepareTool(api(), trustedBriefingCronContext, { openOutbox: prepareOpen });
+    const confirm = createCalendarConfirmTool(api(), trustedBriefingCronContext, { openOutbox: confirmOpen });
+
+    await expect(query.execute('call-query', { kind: 'records', recordType: 'task' }))
+      .rejects.toMatchObject({ code: 'sender_not_allowed' });
+    await expect(mutate.execute('call-mutate', {
+      operationId: 'operation-1', action: 'add', recordType: 'task',
+      title: 'Write report', source: 'telegram',
+    })).rejects.toMatchObject({ code: 'sender_not_allowed' });
+    await expect(prepare.execute('call-prepare', {
+      calendarId: 'default', uid: 'event-1@example.test',
+      dtstart: '2026-08-25T10:00:00+09:00', dtend: '2026-08-25T11:00:00+09:00',
+      summary: 'Appointment',
+    })).rejects.toMatchObject({ code: 'sender_not_allowed' });
+    await expect(confirm.execute('call-confirm', {
+      requestId: randomUUID(), payloadHash: 'a'.repeat(64),
+    })).rejects.toMatchObject({ code: 'sender_not_allowed' });
+    expect([queryOpen, mutateOpen, prepareOpen, confirmOpen].every(open => open.mock.calls.length === 0)).toBe(true);
+  });
+
+  it('directly delivers a briefing for the trusted isolated cron context with no inbound sender', async () => {
+    const send = vi.fn(async params => ({
+      status: 'sent' as const,
+      payloadOutcomes: params.payloads.map((_payload, index) => ({ index, status: 'sent' as const })),
+    }));
+    const tool = createBriefingTool(api(), trustedBriefingCronContext, {
+      now: () => new Date('2026-08-25T09:00:00+09:00'),
+      openRepository: () => ({
+        async query({ kind }) {
+          return kind === 'task' ? [{
+            id: 'T-20260825-001', title: 'Cron-owned report', orderedFields: [], body: '',
+            fields: {
+              type: 'task', status: 'open', priority: 'high', due_at: '2026-08-25T12:00:00+09:00',
+            },
+          }] : [];
+        },
+        close() {},
+      }),
+      openCalendar: () => ({ async listEvents() { return []; } }),
+      openHealth: () => ({ report() {}, recover() {}, listActive: () => [], close() {} }),
+      openAlerts: () => ({
+        claimAndRender: (errors, renderer) => ({ result: renderer(errors) }),
+        acknowledgePayloads: () => 0,
+        close() {},
+      }),
+      send,
+    });
+
+    const result = await tool.execute('call-trusted-cron', {});
+
+    expect(result.details).toMatchObject({ send: false, delivered: true, deliveryStatus: 'sent' });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      channel: 'telegram', to: config.telegramUserId, durability: 'required',
+    }));
   });
 
   it('keeps local briefing output and reports a CalDAV failure instead of an empty calendar', async () => {

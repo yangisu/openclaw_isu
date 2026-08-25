@@ -20,7 +20,7 @@ import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/heal
 import { WorkspaceRepository } from '../workspace/repository.js';
 import {
   AssistantToolError,
-  assertOwner,
+  assertOwnerOrTrustedBriefingCron,
   loadConfigFromApi,
   requireCalendarReadConfig,
   type AssistantToolConfig,
@@ -48,7 +48,8 @@ export interface BriefingToolDependencies {
 
 export function createBriefingTool(
   api: OpenClawPluginApi,
-  toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
+  toolContext: Pick<OpenClawPluginToolContext,
+    'requesterSenderId' | 'senderIsOwner' | 'sessionKey' | 'deliveryContext'>,
   dependencies: BriefingToolDependencies = {},
 ): AgentTool<typeof briefingParameters> {
   return {
@@ -58,7 +59,7 @@ export function createBriefingTool(
     parameters: briefingParameters,
     async execute(_toolCallId, params, signal) {
       const config = loadConfigFromApi(api);
-      assertOwner(toolContext, config);
+      const deliveryTarget = assertOwnerOrTrustedBriefingCron(toolContext, config);
       if (!Value.Check(briefingParameters, params)) {
         throw new AssistantToolError('invalid_parameters', 'Briefing parameters do not match the tool schema');
       }
@@ -104,7 +105,7 @@ export function createBriefingTool(
         });
         const result = await deliverClaimedBriefing({
           cfg: api.config,
-          target: config.telegramUserId,
+          target: deliveryTarget,
           claim,
           alerts,
           ...(signal ? { signal } : {}),
