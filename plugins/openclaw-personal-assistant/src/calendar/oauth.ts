@@ -126,18 +126,17 @@ export class NaverOAuth {
   }
 
   async handleCallback(callback: NaverOAuthCallback): Promise<NaverTokenSet> {
-    await this.#acceptState(callback.state);
-    if (callback.error || !callback.code) {
-      throw new NaverOAuthError('oauth_callback_error', 'Naver authorization was not completed');
-    }
-    const code = callback.code;
     return this.#trackHealth(async () => {
+      await this.#acceptState(callback.state);
+      if (callback.error || !callback.code) {
+        throw new NaverOAuthError('oauth_callback_error', 'Naver authorization was not completed');
+      }
       const response = await this.#requestToken(new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: this.#clientId,
         client_secret: this.#clientSecret,
         redirect_uri: this.#redirectUri,
-        code,
+        code: callback.code,
         state: callback.state,
       }));
       const tokens = parseTokenResponse(response, undefined, this.#now());

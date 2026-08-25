@@ -6,7 +6,21 @@ import { DatabaseSync } from 'node:sqlite';
 
 import type { ActiveSubsystemError } from '../briefing/build.js';
 
-const HEALTH_SCHEMA_VERSION = 1;
+const HEALTH_SCHEMA_VERSION = 2;
+
+const HEALTH_TABLE_SQL = `
+  CREATE TABLE subsystem_health (
+    target TEXT PRIMARY KEY CHECK(length(target) > 0),
+    error_code TEXT NOT NULL CHECK(length(error_code) > 0),
+    message TEXT NOT NULL CHECK(length(message) > 0),
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    updated_at INTEGER NOT NULL
+  ) STRICT
+`;
+
+const HEALTH_ACTIVE_INDEX_SQL = `
+  CREATE INDEX health_active_idx ON subsystem_health (active, target)
+`;
 
 export class SubsystemHealthError extends Error {
   constructor(public readonly code: 'health_schema_mismatch', message: string) {
@@ -15,6 +29,7 @@ export class SubsystemHealthError extends Error {
   }
 }
 
+/** Task 9 backup code must call report on failure and recover only after verified success. */
 export interface SubsystemHealthJournal {
   report(error: ActiveSubsystemError): void;
   recover(target: string): void;
@@ -39,24 +54,7 @@ export class SubsystemHealthStore implements SubsystemHealthJournal {
     this.#database = new DatabaseSync(path);
     try {
       this.#database.exec('PRAGMA busy_timeout = 5000;');
-      const version = Number((this.#database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
-      if (version === 0 && !tableExists(this.#database, 'subsystem_health')) {
-        this.#database.exec(`
-          BEGIN IMMEDIATE;
-          CREATE TABLE subsystem_health (
-            target TEXT PRIMARY KEY CHECK(length(target) > 0),
-            error_code TEXT NOT NULL CHECK(length(error_code) > 0),
-            message TEXT NOT NULL CHECK(length(message) > 0),
-            active INTEGER NOT NULL CHECK(active IN (0, 1)),
-            updated_at INTEGER NOT NULL
-          ) STRICT;
-          PRAGMA user_version = ${HEALTH_SCHEMA_VERSION};
-          COMMIT;
-        `);
-      } else if (version !== HEALTH_SCHEMA_VERSION) {
-        throw new SubsystemHealthError('health_schema_mismatch', `Unsupported subsystem health schema version ${version}`);
-      }
-      validateTableShape(this.#database);
+      ensureHealthSchema(this.#database);
       chmodSync(stateDir, 0o700);
       chmodSync(path, 0o600);
     } catch (error) {
@@ -98,8 +96,54 @@ export class SubsystemHealthStore implements SubsystemHealthJournal {
     }));
   }
 
-  close(): void {
-    this.#database.close();
+  close(): void { this.#database.close(); }
+}
+
+function ensureHealthSchema(database: DatabaseSync): void {
+  const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+  const exists = schemaObject(database, 'table', 'subsystem_health') !== undefined;
+  if (version === 0 && !exists) createHealthSchema(database);
+  else if (version === 1) migrateV1HealthSchema(database);
+  else if (version !== HEALTH_SCHEMA_VERSION) {
+    throw new SubsystemHealthError('health_schema_mismatch', `Unsupported subsystem health schema version ${version}`);
+  }
+  validateCurrentHealthSchema(database);
+}
+
+function createHealthSchema(database: DatabaseSync): void {
+  database.exec(`
+    BEGIN IMMEDIATE;
+    ${HEALTH_TABLE_SQL};
+    ${HEALTH_ACTIVE_INDEX_SQL};
+    PRAGMA user_version = ${HEALTH_SCHEMA_VERSION};
+    COMMIT;
+  `);
+}
+
+function migrateV1HealthSchema(database: DatabaseSync): void {
+  requireSchemaSql(database, 'table', 'subsystem_health', HEALTH_TABLE_SQL);
+  database.exec(`
+    BEGIN IMMEDIATE;
+    ${HEALTH_ACTIVE_INDEX_SQL};
+    PRAGMA user_version = ${HEALTH_SCHEMA_VERSION};
+    COMMIT;
+  `);
+}
+
+function validateCurrentHealthSchema(database: DatabaseSync): void {
+  requireSchemaSql(database, 'table', 'subsystem_health', HEALTH_TABLE_SQL);
+  requireSchemaSql(database, 'index', 'health_active_idx', HEALTH_ACTIVE_INDEX_SQL);
+  const unexpected = database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+      AND name NOT IN ('subsystem_health', 'health_active_idx')
+  `).all();
+  if (unexpected.length > 0) {
+    throw new SubsystemHealthError('health_schema_mismatch', 'Subsystem health has unexpected schema objects');
+  }
+  const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+  if (integrity.integrity_check !== 'ok') {
+    throw new SubsystemHealthError('health_schema_mismatch', 'Subsystem health integrity check failed');
   }
 }
 
@@ -109,24 +153,24 @@ function validateError(error: ActiveSubsystemError): void {
   }
 }
 
-function tableExists(database: DatabaseSync, table: string): boolean {
-  return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .get(table) !== undefined;
+function requireSchemaSql(
+  database: DatabaseSync,
+  type: 'table' | 'index',
+  name: string,
+  expected: string,
+): void {
+  const actual = schemaObject(database, type, name);
+  if (!actual || normalizeSql(actual) !== normalizeSql(expected)) {
+    throw new SubsystemHealthError('health_schema_mismatch', `Subsystem health ${type} ${name} is incompatible`);
+  }
 }
 
-function validateTableShape(database: DatabaseSync): void {
-  const actual = database.prepare('PRAGMA table_info(subsystem_health)').all() as unknown as Array<{
-    name: string; type: string; notnull: number; pk: number;
-  }>;
-  const expected = [
-    ['target', 'TEXT', 1, 1],
-    ['error_code', 'TEXT', 1, 0],
-    ['message', 'TEXT', 1, 0],
-    ['active', 'INTEGER', 1, 0],
-    ['updated_at', 'INTEGER', 1, 0],
-  ];
-  const normalized = actual.map(column => [column.name, column.type, column.notnull, column.pk]);
-  if (JSON.stringify(normalized) !== JSON.stringify(expected)) {
-    throw new SubsystemHealthError('health_schema_mismatch', 'Subsystem health table shape is incompatible');
-  }
+function schemaObject(database: DatabaseSync, type: 'table' | 'index', name: string): string | undefined {
+  const row = database.prepare('SELECT sql FROM sqlite_master WHERE type = ? AND name = ?')
+    .get(type, name) as { sql?: unknown } | undefined;
+  return typeof row?.sql === 'string' ? row.sql : undefined;
+}
+
+function normalizeSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').replace(/;\s*$/, '').trim().toLowerCase();
 }

@@ -10,9 +10,7 @@ import {
 } from './calendar.js';
 import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
-import {
-  briefingParameters, createBriefingTool, registerBriefingDeliveryHook,
-} from './briefing.js';
+import { briefingParameters, createBriefingTool } from './briefing.js';
 
 const absoluteWslPath = Type.String({ pattern: '^/(?!.*(?:^|/)\\.\\.(?:/|$)).+' });
 
@@ -29,7 +27,7 @@ export const configSchema = Type.Object({
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
-const plugin = defineToolPlugin({
+export default defineToolPlugin({
   id: 'openclaw-personal-assistant',
   name: 'OpenClaw Personal Assistant',
   description: 'Owner-scoped local records, Naver calendar, and briefings.',
@@ -87,11 +85,3 @@ const plugin = defineToolPlugin({
     }),
   ],
 });
-
-const registerTools = plugin.register;
-plugin.register = api => {
-  registerTools(api);
-  registerBriefingDeliveryHook(api);
-};
-
-export default plugin;

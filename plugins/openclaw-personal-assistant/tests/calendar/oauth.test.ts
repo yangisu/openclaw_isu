@@ -40,6 +40,40 @@ afterEach(async () => {
 });
 
 describe('NaverOAuth one-time callback state', () => {
+  it('durably reports invalid or expired callback state without exposing state data', async () => {
+    const files = await fixture();
+    const report = vi.fn();
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn(), health: { report, recover: vi.fn() },
+    });
+
+    await expect(oauth.handleCallback({ code: 'code', state: 'private-invalid-state' }))
+      .rejects.toMatchObject({ code: 'oauth_state_invalid' });
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_state_invalid', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
+    expect(JSON.stringify(report.mock.calls)).not.toContain('private-invalid-state');
+  });
+
+  it.each([
+    ['authorization denial', { error: 'access_denied', errorDescription: 'private denial' }],
+    ['missing code', {}],
+  ])('durably reports %s after consuming valid state', async (_label, callback) => {
+    const files = await fixture();
+    const report = vi.fn();
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn(), health: { report, recover: vi.fn() },
+    });
+    const { state } = oauth.authorize();
+
+    await expect(oauth.handleCallback({ state, ...callback })).rejects.toMatchObject({ code: 'oauth_callback_error' });
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_callback_error', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
+  });
+
   it('stores only the SHA-256 of 32 random state bytes and omits scope', async () => {
     const { stateDbPath, tokenStore } = await fixture();
     const oauth = new NaverOAuth({
@@ -97,14 +131,20 @@ describe('NaverOAuth one-time callback state', () => {
   it('consumes accepted state exactly once, even if it is replayed', async () => {
     const files = await fixture();
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(tokenResponse());
+    const report = vi.fn();
+    const recover = vi.fn();
     const oauth = new NaverOAuth({
       clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
-      ...files, fetch,
+      ...files, fetch, health: { report, recover },
     });
     const { state } = oauth.authorize();
     await expect(oauth.handleCallback({ code: 'one-time-code', state })).resolves.toMatchObject({ accessToken: 'access-new' });
     await expect(oauth.handleCallback({ code: 'one-time-code', state })).rejects.toMatchObject({ code: 'oauth_state_invalid' });
     expect(fetch).toHaveBeenCalledTimes(1);
+    expect(recover).toHaveBeenCalledWith('naver-oauth');
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_state_invalid', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
   });
 
   it('allows only one callback to win a concurrent state race', async () => {

@@ -23,7 +23,8 @@ const config = {
 } as const;
 
 function api(overrides: Record<string, unknown> = {}) {
-  return { pluginConfig: { ...config, ...overrides } } as never;
+  const runtimeConfig = { channels: { telegram: { enabled: true } } };
+  return { config: runtimeConfig, pluginConfig: { ...config, ...overrides } } as never;
 }
 
 const ownerContext = { requesterSenderId: config.telegramUserId };
@@ -57,14 +58,13 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     ]);
   });
 
-  it('registers the official message_sent delivery hook without adding a sixth tool', () => {
+  it('registers five tools without a model-controlled message_sent correlation hook', () => {
     const registerTool = vi.fn();
     const on = vi.fn();
-    plugin.register({ pluginConfig: config, registerTool, on } as never);
+    plugin.register({ config: {}, pluginConfig: config, registerTool, on } as never);
 
     expect(registerTool).toHaveBeenCalledTimes(5);
-    expect(on).toHaveBeenCalledTimes(1);
-    expect(on).toHaveBeenCalledWith('message_sent', expect.any(Function));
+    expect(on).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -110,19 +110,6 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(briefingOpen).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['missing canonical session', { ...briefingOwnerContext, sessionKey: undefined }],
-    ['wrong channel', { ...briefingOwnerContext, messageChannel: 'discord', deliveryContext: { channel: 'discord', to: config.telegramUserId } }],
-    ['wrong target', { ...briefingOwnerContext, deliveryContext: { channel: 'telegram', to: '999' } }],
-  ])('rejects briefing with %s before reading local data', async (_label, context) => {
-    const openRepository = vi.fn();
-    const tool = createBriefingTool(api(), context, { openRepository });
-    await expect(tool.execute('call-invalid-delivery', {})).rejects.toMatchObject({
-      code: 'invalid_delivery_context',
-    });
-    expect(openRepository).not.toHaveBeenCalled();
-  });
-
   it('keeps local briefing output and reports a CalDAV failure instead of an empty calendar', async () => {
     const query = vi.fn(async ({ kind }: { kind: string }) => kind === 'task' ? [{
       id: 'T-20260825-001', title: 'Local report', orderedFields: [], body: '',
@@ -131,6 +118,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     const closeRepository = vi.fn();
     const closeAlerts = vi.fn();
     const active: Array<{ errorCode: string; target: string; message: string }> = [];
+    let sentText = '';
     const tool = createBriefingTool(api({ calendar: {
       caldavBaseUrl: 'https://caldav.example.test',
       caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
@@ -147,20 +135,28 @@ describe('OpenClaw personal-assistant tool boundary', () => {
         close: vi.fn(),
       }),
       openAlerts: () => ({
-        claimAndRender: (errors, _delivery, renderer) => renderer(errors),
-        acknowledgeMessage: vi.fn(),
+        claimAndRender: (errors, renderer) => ({ result: renderer(errors) }),
+        acknowledgePayloads: vi.fn(),
         close: closeAlerts,
       }),
+      send: async params => {
+        sentText = params.payloads.map(payload => payload.text ?? '').join('\n');
+        return {
+          status: 'sent',
+          payloadOutcomes: params.payloads.map((_payload, index) => ({ index, status: 'sent' as const })),
+        };
+      },
     });
 
     const result = await tool.execute('call-briefing-caldav-failure', {});
 
     expect(result.details).toMatchObject({
-      send: true, allowed: true, trust: 'quoted_untrusted_data',
+      send: false, delivered: true, deliveryStatus: 'sent',
+      allowed: true, trust: 'quoted_untrusted_data',
     });
-    expect((result.details as any).messages.join('\n')).toContain('Local report');
-    expect((result.details as any).messages.join('\n')).toContain('CALDAV_TIMEOUT (naver-caldav)');
-    expect((result.details as any).messages.join('\n')).not.toContain('private network detail');
+    expect(sentText).toContain('Local report');
+    expect(sentText).toContain('CALDAV_TIMEOUT (naver-caldav)');
+    expect(sentText).not.toContain('private network detail');
     expect(closeRepository).toHaveBeenCalledTimes(1);
     expect(closeAlerts).toHaveBeenCalledTimes(1);
   });
@@ -168,6 +164,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
   it('reads durable subsystem errors and clears CalDAV health only after a successful read', async () => {
     const stateDir = `/tmp/openclaw-tool-health-${randomUUID()}`;
     temporaryStateDirs.push(stateDir);
+    let deliveredPayloads: string[] = [];
     const health = new SubsystemHealthStore(stateDir);
     health.report({
       errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',
@@ -184,12 +181,20 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       now: () => new Date('2026-08-25T09:00:00+09:00'),
       openRepository: () => ({ async query() { return []; }, close() {} }),
       openCalendar: () => ({ async listEvents() { return []; } }),
+      send: async params => {
+        deliveredPayloads = params.payloads.map(payload => payload.text ?? '');
+        return {
+          status: 'sent',
+          payloadOutcomes: params.payloads.map((_payload, index) => ({ index, status: 'sent' as const })),
+        };
+      },
     });
 
     const result = await tool.execute('call-briefing-health', {});
 
-    expect((result.details as any).messages.join('\n')).toContain('BACKUP_STALE (backup)');
-    expect((result.details as any).messages.join('\n')).not.toContain('CALDAV_TIMEOUT');
+    expect(result.details).toMatchObject({ send: false, delivered: true, deliveryStatus: 'sent' });
+    expect(deliveredPayloads.join('\n')).toContain('BACKUP_STALE (backup)');
+    expect(deliveredPayloads.join('\n')).not.toContain('CALDAV_TIMEOUT');
     const reopened = new SubsystemHealthStore(stateDir);
     expect(reopened.listActive()).toEqual([{
       errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',

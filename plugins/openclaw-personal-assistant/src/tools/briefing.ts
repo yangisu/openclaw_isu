@@ -3,19 +3,15 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from 'openclaw/plugin-sdk/plugin-entry';
-import type {
-  PluginHookMessageContext,
-  PluginHookMessageSentEvent,
-} from 'openclaw/plugin-sdk/plugin-runtime';
 import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
 import { Type } from 'typebox';
 import { Value } from 'typebox/value';
 
 import type {
-  ActiveSubsystemError,
   BriefingStudy,
   BriefingTask,
 } from '../briefing/build.js';
+import { deliverClaimedBriefing, type BriefingDurableSender } from '../briefing/delivery.js';
 import { CalDavClient } from '../calendar/caldav.js';
 import type { CalendarEvent } from '../calendar/ical.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
@@ -47,16 +43,12 @@ export interface BriefingToolDependencies {
   openCalendar?: (config: AssistantToolConfig) => BriefingCalendar;
   openAlerts?: (config: AssistantToolConfig) => AlertJournal;
   openHealth?: (config: AssistantToolConfig) => SubsystemHealthJournal;
-}
-
-export interface BriefingHookDependencies {
-  openAlerts?: (config: AssistantToolConfig) => AlertJournal;
+  send?: BriefingDurableSender;
 }
 
 export function createBriefingTool(
   api: OpenClawPluginApi,
-  toolContext: Pick<OpenClawPluginToolContext,
-    'requesterSenderId' | 'sessionKey' | 'messageChannel' | 'deliveryContext'>,
+  toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: BriefingToolDependencies = {},
 ): AgentTool<typeof briefingParameters> {
   return {
@@ -72,7 +64,6 @@ export function createBriefingTool(
       }
       signal?.throwIfAborted();
 
-      const delivery = deliveryBinding(toolContext, config);
       const now = (dependencies.now ?? (() => new Date()))();
       const repository = (dependencies.openRepository ?? openRepository)(config);
       let alerts: AlertJournal | undefined;
@@ -102,7 +93,7 @@ export function createBriefingTool(
         const activeErrors = health.listActive();
         alerts = (dependencies.openAlerts ?? (scoped => new AlertLedger(scoped.stateDir)))(config);
         const service = new BriefingService(alerts);
-        const result = await service.run({
+        const claim = service.run({
           now: now.toISOString(),
           events: events.map(event => ({
             start: event.dtstart, title: event.summary, kind: event.kind, status: event.status,
@@ -110,7 +101,15 @@ export function createBriefingTool(
           tasks: taskRecords.flatMap(taskFromRecord),
           studies: studyRecords.flatMap(studyFromRecord),
           activeErrors,
-        }, delivery);
+        });
+        const result = await deliverClaimedBriefing({
+          cfg: api.config,
+          target: config.telegramUserId,
+          claim,
+          alerts,
+          ...(signal ? { signal } : {}),
+          ...(dependencies.send ? { send: dependencies.send } : {}),
+        });
         return jsonResult(result);
       } finally {
         alerts?.close();
@@ -119,49 +118,6 @@ export function createBriefingTool(
       }
     },
   };
-}
-
-export function createBriefingMessageSentHandler(
-  api: OpenClawPluginApi,
-  dependencies: BriefingHookDependencies = {},
-): (event: PluginHookMessageSentEvent, context: PluginHookMessageContext) => Promise<void> {
-  return async (event, context) => {
-    if (!event.sessionKey || !context.sessionKey || event.sessionKey !== context.sessionKey) return;
-    if (!event.content || !event.to || !context.channelId) return;
-    const config = loadConfigFromApi(api);
-    if (context.channelId !== 'telegram' || event.to !== config.telegramUserId) return;
-    const alerts = (dependencies.openAlerts ?? (scoped => new AlertLedger(scoped.stateDir)))(config);
-    try {
-      alerts.acknowledgeMessage({
-        sessionKey: event.sessionKey,
-        channelId: context.channelId,
-        target: event.to,
-        content: event.content,
-        success: event.success,
-      });
-    } finally {
-      alerts.close();
-    }
-  };
-}
-
-export function registerBriefingDeliveryHook(api: OpenClawPluginApi): void {
-  api.on('message_sent', createBriefingMessageSentHandler(api));
-}
-
-function deliveryBinding(
-  context: Pick<OpenClawPluginToolContext, 'sessionKey' | 'messageChannel' | 'deliveryContext'>,
-  config: AssistantToolConfig,
-) {
-  const channelId = context.deliveryContext?.channel ?? context.messageChannel;
-  const target = context.deliveryContext?.to;
-  if (!context.sessionKey || channelId !== 'telegram' || target !== config.telegramUserId) {
-    throw new AssistantToolError(
-      'invalid_delivery_context',
-      'Briefing requires a canonical Telegram owner delivery context',
-    );
-  }
-  return { sessionKey: context.sessionKey, channelId, target };
 }
 
 function openRepository(config: AssistantToolConfig): BriefingRepository {

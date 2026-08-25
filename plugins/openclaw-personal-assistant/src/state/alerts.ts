@@ -1,6 +1,6 @@
 /// <reference types="node" />
 
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -10,8 +10,69 @@ import {
   type ActiveSubsystemError, type BriefingInput, type BriefingResult,
 } from '../briefing/build.js';
 
-const ALERT_SCHEMA_VERSION = 2;
+const ALERT_SCHEMA_VERSION = 3;
 const DEFAULT_LEASE_MS = 10 * 60_000;
+
+const ALERT_TABLE_SQL = `
+  CREATE TABLE alert_fingerprints (
+    fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint) = 64),
+    error_code TEXT NOT NULL CHECK(length(error_code) > 0),
+    target TEXT NOT NULL CHECK(length(target) > 0),
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    delivered INTEGER NOT NULL CHECK(delivered IN (0, 1)),
+    claim_id TEXT,
+    lease_expires_at INTEGER,
+    updated_at TEXT NOT NULL
+  ) STRICT
+`;
+
+const ALERT_CLAIM_INDEX_SQL = `
+  CREATE INDEX alert_claim_idx
+  ON alert_fingerprints (active, delivered, lease_expires_at, claim_id)
+`;
+
+const LEGACY_ALERT_TABLE_SQL = `
+  CREATE TABLE alert_fingerprints (
+    fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint) = 64),
+    error_code TEXT NOT NULL CHECK(length(error_code) > 0),
+    target TEXT NOT NULL CHECK(length(target) > 0),
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    delivered INTEGER NOT NULL CHECK(delivered IN (0, 1)),
+    updated_at TEXT NOT NULL
+  ) STRICT
+`;
+
+const V2_DELIVERY_CLAIMS_SQL = `
+  CREATE TABLE delivery_claims (
+    claim_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  ) STRICT
+`;
+
+const V2_DELIVERY_CHUNKS_SQL = `
+  CREATE TABLE delivery_claim_chunks (
+    claim_id TEXT NOT NULL REFERENCES delivery_claims(claim_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+    content TEXT NOT NULL,
+    acknowledged INTEGER NOT NULL CHECK(acknowledged IN (0, 1)),
+    PRIMARY KEY (claim_id, chunk_index)
+  ) STRICT
+`;
+
+const V2_DELIVERY_FINGERPRINTS_SQL = `
+  CREATE TABLE delivery_chunk_fingerprints (
+    claim_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL REFERENCES alert_fingerprints(fingerprint) ON DELETE CASCADE,
+    PRIMARY KEY (claim_id, chunk_index, fingerprint),
+    FOREIGN KEY (claim_id, chunk_index)
+      REFERENCES delivery_claim_chunks(claim_id, chunk_index) ON DELETE CASCADE
+  ) STRICT
+`;
 
 interface AlertRow {
   fingerprint: string;
@@ -23,8 +84,6 @@ interface AlertRow {
   lease_expires_at: number | null;
 }
 
-interface ChunkRow { claim_id: string; chunk_index: number }
-
 export interface AlertState {
   fingerprint: string;
   errorCode: string;
@@ -34,22 +93,16 @@ export interface AlertState {
   claimed: boolean;
 }
 
-export interface BriefingDeliveryBinding {
-  sessionKey: string;
-  channelId: string;
-  target: string;
-}
-
-export interface SentBriefingMessage extends BriefingDeliveryBinding {
-  content: string;
-  success: boolean;
+export interface AlertClaim {
+  claimId?: string;
+  result: BriefingResult;
 }
 
 export type BriefingRenderer = (errors: ActiveSubsystemError[]) => BriefingResult;
 
 export interface AlertJournal {
-  claimAndRender(errors: ActiveSubsystemError[], delivery: BriefingDeliveryBinding, renderer: BriefingRenderer): BriefingResult;
-  acknowledgeMessage(message: SentBriefingMessage): boolean;
+  claimAndRender(errors: ActiveSubsystemError[], renderer: BriefingRenderer): AlertClaim;
+  acknowledgePayloads(claim: AlertClaim, sentPayloadIndices: readonly number[]): number;
   close(): void;
 }
 
@@ -77,7 +130,7 @@ export class AlertLedger implements AlertJournal {
     const databasePath = join(stateDir, 'alerts.sqlite3');
     this.#database = new DatabaseSync(databasePath);
     try {
-      this.#database.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+      this.#database.exec('PRAGMA busy_timeout = 5000;');
       ensureAlertSchema(this.#database);
       this.#database.exec('PRAGMA journal_mode = WAL;');
       chmodSync(stateDir, 0o700);
@@ -89,12 +142,7 @@ export class AlertLedger implements AlertJournal {
     }
   }
 
-  claimAndRender(
-    errors: ActiveSubsystemError[],
-    delivery: BriefingDeliveryBinding,
-    renderer: BriefingRenderer,
-  ): BriefingResult {
-    validateDelivery(delivery);
+  claimAndRender(errors: ActiveSubsystemError[], renderer: BriefingRenderer): AlertClaim {
     const unique = normalizedErrors(errors);
     const now = this.#now();
     const expiresAt = now + this.#leaseMs;
@@ -108,83 +156,47 @@ export class AlertLedger implements AlertJournal {
       this.#synchronizeActive(unique, now);
       const claimable = this.#claimableErrors(unique, now);
       const claimId = claimable.length > 0 ? randomUUID() : undefined;
-      if (claimId) {
-        const claim = this.#database.prepare(`
-          UPDATE alert_fingerprints
-          SET claim_id = ?, lease_expires_at = ?, updated_at = ?
-          WHERE fingerprint = ? AND active = 1 AND delivered = 0
-            AND (claim_id IS NULL OR lease_expires_at <= ?)
-        `);
-        for (const error of claimable) {
-          const result = claim.run(claimId, expiresAt, timestamp(now), error.fingerprint!, now);
-          if (result.changes !== 1) throw new Error('alert claim race');
-        }
-      }
+      if (claimId) this.#claim(claimId, claimable, expiresAt, now);
 
       const result = renderer(claimable);
       validateRenderedResult(result);
-      if (claimId) this.#bindClaim(claimId, expiresAt, delivery, claimable, result, now);
+      const bound = claimId ? this.#validateAndReleaseOmitted(claimId, claimable, result, now) : false;
       this.#database.exec('COMMIT');
-      return result;
+      return { ...(bound ? { claimId } : {}), result };
     } catch (error) {
       if (this.#database.isTransaction) this.#database.exec('ROLLBACK');
       throw error;
     }
   }
 
-  acknowledgeMessage(message: SentBriefingMessage): boolean {
-    validateDelivery(message);
-    if (!message.content) return false;
+  acknowledgePayloads(claim: AlertClaim, sentPayloadIndices: readonly number[]): number {
+    if (!claim.claimId) return 0;
+    const indices = new Set(sentPayloadIndices);
+    for (const index of indices) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= claim.result.messages.length) {
+        throw new RangeError('sent briefing payload index is invalid');
+      }
+    }
+    const fingerprints = new Set(
+      [...indices].flatMap(index => claim.result.messageErrorFingerprints[index] ?? []),
+    );
+    if (fingerprints.size === 0) return 0;
+
     const now = this.#now();
     this.#database.exec('BEGIN IMMEDIATE');
     try {
       this.#releaseExpired(now);
-      const chunk = this.#database.prepare(`
-        SELECT c.claim_id, c.chunk_index
-        FROM delivery_claim_chunks c
-        JOIN delivery_claims d ON d.claim_id = c.claim_id
-        WHERE d.session_key = ? AND d.channel_id = ? AND d.target = ?
-          AND d.expires_at > ? AND c.acknowledged = 0
-          AND c.content_hash = ? AND c.content = ?
-        ORDER BY d.expires_at, c.chunk_index LIMIT 1
-      `).get(
-        message.sessionKey, message.channelId, message.target, now,
-        contentHash(message.content), message.content,
-      ) as unknown as ChunkRow | undefined;
-      if (!chunk) {
-        this.#database.exec('COMMIT');
-        return false;
+      const acknowledge = this.#database.prepare(`
+        UPDATE alert_fingerprints
+        SET delivered = 1, claim_id = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE fingerprint = ? AND claim_id = ? AND active = 1 AND delivered = 0
+      `);
+      let count = 0;
+      for (const fingerprint of fingerprints) {
+        count += Number(acknowledge.run(timestamp(now), fingerprint, claim.claimId).changes);
       }
-
-      const fingerprints = this.#database.prepare(`
-        SELECT fingerprint FROM delivery_chunk_fingerprints
-        WHERE claim_id = ? AND chunk_index = ? ORDER BY fingerprint
-      `).all(chunk.claim_id, chunk.chunk_index) as unknown as Array<{ fingerprint: string }>;
-      if (message.success) {
-        this.#database.prepare(`
-          UPDATE delivery_claim_chunks SET acknowledged = 1
-          WHERE claim_id = ? AND chunk_index = ? AND acknowledged = 0
-        `).run(chunk.claim_id, chunk.chunk_index);
-        const acknowledge = this.#database.prepare(`
-          UPDATE alert_fingerprints
-          SET delivered = 1, claim_id = NULL, lease_expires_at = NULL, updated_at = ?
-          WHERE fingerprint = ? AND claim_id = ? AND active = 1
-        `);
-        for (const row of fingerprints) acknowledge.run(timestamp(now), row.fingerprint, chunk.claim_id);
-      } else {
-        const release = this.#database.prepare(`
-          UPDATE alert_fingerprints
-          SET claim_id = NULL, lease_expires_at = NULL, updated_at = ?
-          WHERE fingerprint = ? AND claim_id = ? AND delivered = 0
-        `);
-        for (const row of fingerprints) release.run(timestamp(now), row.fingerprint, chunk.claim_id);
-        this.#database.prepare(
-          'DELETE FROM delivery_claim_chunks WHERE claim_id = ? AND chunk_index = ?',
-        ).run(chunk.claim_id, chunk.chunk_index);
-      }
-      this.#deleteCompletedClaim(chunk.claim_id);
       this.#database.exec('COMMIT');
-      return true;
+      return count;
     } catch (error) {
       if (this.#database.isTransaction) this.#database.exec('ROLLBACK');
       throw error;
@@ -214,7 +226,6 @@ export class AlertLedger implements AlertJournal {
       SET claim_id = NULL, lease_expires_at = NULL, updated_at = ?
       WHERE delivered = 0 AND claim_id IS NOT NULL AND lease_expires_at <= ?
     `).run(timestamp(now), now);
-    this.#database.prepare('DELETE FROM delivery_claims WHERE expires_at <= ?').run(now);
   }
 
   #synchronizeActive(unique: Map<string, ActiveSubsystemError>, now: number): void {
@@ -277,16 +288,43 @@ export class AlertLedger implements AlertJournal {
         || left.target.localeCompare(right.target));
   }
 
-  #bindClaim(
+  #claim(claimId: string, errors: ActiveSubsystemError[], expiresAt: number, now: number): void {
+    const claim = this.#database.prepare(`
+      UPDATE alert_fingerprints
+      SET claim_id = ?, lease_expires_at = ?, updated_at = ?
+      WHERE fingerprint = ? AND active = 1 AND delivered = 0
+        AND (claim_id IS NULL OR lease_expires_at <= ?)
+    `);
+    for (const error of errors) {
+      const result = claim.run(claimId, expiresAt, timestamp(now), error.fingerprint!, now);
+      if (result.changes !== 1) throw new Error('alert claim race');
+    }
+  }
+
+  #validateAndReleaseOmitted(
     claimId: string,
-    expiresAt: number,
-    delivery: BriefingDeliveryBinding,
     claimed: ActiveSubsystemError[],
     result: BriefingResult,
     now: number,
-  ): void {
+  ): boolean {
     const claimedFingerprints = new Set(claimed.map(error => error.fingerprint!));
     const included = new Set(result.includedErrorFingerprints);
+    for (const fingerprint of included) {
+      if (!claimedFingerprints.has(fingerprint)) throw new Error('renderer included an unclaimed fingerprint');
+    }
+    const occurrences = new Map<string, number>();
+    for (const fingerprints of result.messageErrorFingerprints) {
+      for (const fingerprint of fingerprints) {
+        if (!included.has(fingerprint)) throw new Error('payload contains an unincluded fingerprint');
+        occurrences.set(fingerprint, (occurrences.get(fingerprint) ?? 0) + 1);
+      }
+    }
+    for (const fingerprint of included) {
+      if (occurrences.get(fingerprint) !== 1) {
+        throw new Error('renderer must bind each included fingerprint to exactly one payload');
+      }
+    }
+
     const release = this.#database.prepare(`
       UPDATE alert_fingerprints
       SET claim_id = NULL, lease_expires_at = NULL, updated_at = ?
@@ -295,54 +333,15 @@ export class AlertLedger implements AlertJournal {
     for (const fingerprint of claimedFingerprints) {
       if (!included.has(fingerprint)) release.run(timestamp(now), fingerprint, claimId);
     }
-    if (included.size === 0) return;
-    for (const fingerprint of included) {
-      if (!claimedFingerprints.has(fingerprint)) throw new Error('renderer included an unclaimed fingerprint');
-    }
-
-    this.#database.prepare(`
-      INSERT INTO delivery_claims (claim_id, session_key, channel_id, target, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(claimId, delivery.sessionKey, delivery.channelId, delivery.target, expiresAt);
-    const insertChunk = this.#database.prepare(`
-      INSERT INTO delivery_claim_chunks (
-        claim_id, chunk_index, content_hash, content, acknowledged
-      ) VALUES (?, ?, ?, ?, 0)
-    `);
-    const insertFingerprint = this.#database.prepare(`
-      INSERT INTO delivery_chunk_fingerprints (claim_id, chunk_index, fingerprint)
-      VALUES (?, ?, ?)
-    `);
-    for (let index = 0; index < result.messages.length; index += 1) {
-      const fingerprints = result.messageErrorFingerprints[index] ?? [];
-      if (fingerprints.length === 0) continue;
-      const content = result.messages[index]!;
-      insertChunk.run(claimId, index, contentHash(content), content);
-      for (const fingerprint of fingerprints) {
-        if (!included.has(fingerprint)) throw new Error('chunk contains an unincluded fingerprint');
-        insertFingerprint.run(claimId, index, fingerprint);
-      }
-    }
-    const covered = new Set(result.messageErrorFingerprints.flat());
-    if ([...included].some(fingerprint => !covered.has(fingerprint))) {
-      throw new Error('renderer did not bind every included fingerprint to an outbound chunk');
-    }
-  }
-
-  #deleteCompletedClaim(claimId: string): void {
-    const remaining = this.#database.prepare(`
-      SELECT count(*) AS count FROM delivery_claim_chunks
-      WHERE claim_id = ? AND acknowledged = 0
-    `).get(claimId) as { count: number };
-    if (remaining.count === 0) this.#database.prepare('DELETE FROM delivery_claims WHERE claim_id = ?').run(claimId);
+    return included.size > 0;
   }
 }
 
 export class BriefingService {
   constructor(private readonly alerts: AlertJournal) {}
 
-  async run(input: BriefingInput, delivery: BriefingDeliveryBinding): Promise<BriefingResult> {
-    return this.alerts.claimAndRender(input.activeErrors, delivery, activeErrors => (
+  run(input: BriefingInput): AlertClaim {
+    return this.alerts.claimAndRender(input.activeErrors, activeErrors => (
       buildBriefing({ ...input, activeErrors })
     ));
   }
@@ -358,12 +357,6 @@ function normalizedErrors(errors: ActiveSubsystemError[]): Map<string, ActiveSub
   return unique;
 }
 
-function validateDelivery(delivery: BriefingDeliveryBinding): void {
-  if (!delivery.sessionKey || !delivery.channelId || !delivery.target) {
-    throw new TypeError('briefing delivery session, channel, and target are required');
-  }
-}
-
 function validateRenderedResult(result: BriefingResult): void {
   if (result.messages.length !== result.messageErrorFingerprints.length) {
     throw new Error('briefing message fingerprint mapping is incomplete');
@@ -373,141 +366,98 @@ function validateRenderedResult(result: BriefingResult): void {
   }
 }
 
-function contentHash(content: string): string {
-  return createHash('sha256').update(content, 'utf8').digest('hex');
-}
-
 function timestamp(now: number): string { return new Date(now).toISOString(); }
 
 function ensureAlertSchema(database: DatabaseSync): void {
   const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
-  const exists = tableExists(database, 'alert_fingerprints');
+  const exists = schemaObject(database, 'table', 'alert_fingerprints') !== undefined;
   if (version === 0 && !exists) createAlertSchema(database);
   else if (version === 0 && exists) migrateLegacyAlertSchema(database);
+  else if (version === 2) migrateV2AlertSchema(database);
   else if (version !== ALERT_SCHEMA_VERSION) {
     throw new AlertLedgerError('alert_schema_mismatch', `Unsupported alert schema version ${version}`);
   }
-  validateAlertSchema(database);
+  validateCurrentAlertSchema(database);
 }
 
 function createAlertSchema(database: DatabaseSync): void {
   database.exec(`
     BEGIN IMMEDIATE;
-    CREATE TABLE alert_fingerprints (
-      fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint) = 64),
-      error_code TEXT NOT NULL CHECK(length(error_code) > 0),
-      target TEXT NOT NULL CHECK(length(target) > 0),
-      active INTEGER NOT NULL CHECK(active IN (0, 1)),
-      delivered INTEGER NOT NULL CHECK(delivered IN (0, 1)),
-      claim_id TEXT,
-      lease_expires_at INTEGER,
-      updated_at TEXT NOT NULL
-    ) STRICT;
-    ${deliverySchemaSql()}
+    ${ALERT_TABLE_SQL};
+    ${ALERT_CLAIM_INDEX_SQL};
     PRAGMA user_version = ${ALERT_SCHEMA_VERSION};
     COMMIT;
   `);
 }
 
 function migrateLegacyAlertSchema(database: DatabaseSync): void {
-  const expectedLegacy = [
-    ['fingerprint', 'TEXT', 1, 1], ['error_code', 'TEXT', 1, 0],
-    ['target', 'TEXT', 1, 0], ['active', 'INTEGER', 1, 0],
-    ['delivered', 'INTEGER', 1, 0], ['updated_at', 'TEXT', 1, 0],
-  ];
-  if (JSON.stringify(tableShape(database, 'alert_fingerprints')) !== JSON.stringify(expectedLegacy)) {
-    throw new AlertLedgerError('alert_schema_mismatch', 'Legacy alert table shape is incompatible');
-  }
+  requireSchemaSql(database, 'table', 'alert_fingerprints', LEGACY_ALERT_TABLE_SQL);
   database.exec(`
     BEGIN IMMEDIATE;
     ALTER TABLE alert_fingerprints RENAME TO alert_fingerprints_legacy;
-    CREATE TABLE alert_fingerprints (
-      fingerprint TEXT PRIMARY KEY CHECK(length(fingerprint) = 64),
-      error_code TEXT NOT NULL CHECK(length(error_code) > 0),
-      target TEXT NOT NULL CHECK(length(target) > 0),
-      active INTEGER NOT NULL CHECK(active IN (0, 1)),
-      delivered INTEGER NOT NULL CHECK(delivered IN (0, 1)),
-      claim_id TEXT,
-      lease_expires_at INTEGER,
-      updated_at TEXT NOT NULL
-    ) STRICT;
+    ${ALERT_TABLE_SQL};
     INSERT INTO alert_fingerprints (
       fingerprint, error_code, target, active, delivered, claim_id, lease_expires_at, updated_at
     ) SELECT fingerprint, error_code, target, active, delivered, NULL, NULL, updated_at
       FROM alert_fingerprints_legacy;
     DROP TABLE alert_fingerprints_legacy;
-    ${deliverySchemaSql()}
+    ${ALERT_CLAIM_INDEX_SQL};
     PRAGMA user_version = ${ALERT_SCHEMA_VERSION};
     COMMIT;
   `);
 }
 
-function deliverySchemaSql(): string {
-  return `
-    CREATE TABLE delivery_claims (
-      claim_id TEXT PRIMARY KEY,
-      session_key TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      target TEXT NOT NULL,
-      expires_at INTEGER NOT NULL
-    ) STRICT;
-    CREATE TABLE delivery_claim_chunks (
-      claim_id TEXT NOT NULL REFERENCES delivery_claims(claim_id) ON DELETE CASCADE,
-      chunk_index INTEGER NOT NULL,
-      content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
-      content TEXT NOT NULL,
-      acknowledged INTEGER NOT NULL CHECK(acknowledged IN (0, 1)),
-      PRIMARY KEY (claim_id, chunk_index)
-    ) STRICT;
-    CREATE TABLE delivery_chunk_fingerprints (
-      claim_id TEXT NOT NULL,
-      chunk_index INTEGER NOT NULL,
-      fingerprint TEXT NOT NULL REFERENCES alert_fingerprints(fingerprint) ON DELETE CASCADE,
-      PRIMARY KEY (claim_id, chunk_index, fingerprint),
-      FOREIGN KEY (claim_id, chunk_index)
-        REFERENCES delivery_claim_chunks(claim_id, chunk_index) ON DELETE CASCADE
-    ) STRICT;
-  `;
+function migrateV2AlertSchema(database: DatabaseSync): void {
+  requireSchemaSql(database, 'table', 'alert_fingerprints', ALERT_TABLE_SQL);
+  requireSchemaSql(database, 'table', 'delivery_claims', V2_DELIVERY_CLAIMS_SQL);
+  requireSchemaSql(database, 'table', 'delivery_claim_chunks', V2_DELIVERY_CHUNKS_SQL);
+  requireSchemaSql(database, 'table', 'delivery_chunk_fingerprints', V2_DELIVERY_FINGERPRINTS_SQL);
+  database.exec(`
+    BEGIN IMMEDIATE;
+    DROP TABLE delivery_chunk_fingerprints;
+    DROP TABLE delivery_claim_chunks;
+    DROP TABLE delivery_claims;
+    ${ALERT_CLAIM_INDEX_SQL};
+    PRAGMA user_version = ${ALERT_SCHEMA_VERSION};
+    COMMIT;
+  `);
 }
 
-function validateAlertSchema(database: DatabaseSync): void {
-  const expected = new Map<string, unknown>([
-    ['alert_fingerprints', [
-      ['fingerprint', 'TEXT', 1, 1], ['error_code', 'TEXT', 1, 0],
-      ['target', 'TEXT', 1, 0], ['active', 'INTEGER', 1, 0],
-      ['delivered', 'INTEGER', 1, 0], ['claim_id', 'TEXT', 0, 0],
-      ['lease_expires_at', 'INTEGER', 0, 0], ['updated_at', 'TEXT', 1, 0],
-    ]],
-    ['delivery_claims', [
-      ['claim_id', 'TEXT', 1, 1], ['session_key', 'TEXT', 1, 0],
-      ['channel_id', 'TEXT', 1, 0], ['target', 'TEXT', 1, 0],
-      ['expires_at', 'INTEGER', 1, 0],
-    ]],
-    ['delivery_claim_chunks', [
-      ['claim_id', 'TEXT', 1, 1], ['chunk_index', 'INTEGER', 1, 2],
-      ['content_hash', 'TEXT', 1, 0], ['content', 'TEXT', 1, 0],
-      ['acknowledged', 'INTEGER', 1, 0],
-    ]],
-    ['delivery_chunk_fingerprints', [
-      ['claim_id', 'TEXT', 1, 1], ['chunk_index', 'INTEGER', 1, 2],
-      ['fingerprint', 'TEXT', 1, 3],
-    ]],
-  ]);
-  for (const [table, shape] of expected) {
-    if (JSON.stringify(tableShape(database, table)) !== JSON.stringify(shape)) {
-      throw new AlertLedgerError('alert_schema_mismatch', `Alert table ${table} is incompatible`);
-    }
+function validateCurrentAlertSchema(database: DatabaseSync): void {
+  requireSchemaSql(database, 'table', 'alert_fingerprints', ALERT_TABLE_SQL);
+  requireSchemaSql(database, 'index', 'alert_claim_idx', ALERT_CLAIM_INDEX_SQL);
+  const unexpected = database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+      AND name NOT IN ('alert_fingerprints', 'alert_claim_idx')
+  `).all();
+  if (unexpected.length > 0) {
+    throw new AlertLedgerError('alert_schema_mismatch', 'Alert database contains unexpected schema objects');
+  }
+  const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+  if (integrity.integrity_check !== 'ok') {
+    throw new AlertLedgerError('alert_schema_mismatch', 'Alert database integrity check failed');
   }
 }
 
-function tableShape(database: DatabaseSync, table: string): unknown[] {
-  const safe = ['alert_fingerprints', 'delivery_claims', 'delivery_claim_chunks', 'delivery_chunk_fingerprints'];
-  if (!safe.includes(table)) throw new TypeError('unknown alert table');
-  return (database.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{
-    name: string; type: string; notnull: number; pk: number;
-  }>).map(column => [column.name, column.type, column.notnull, column.pk]);
+function requireSchemaSql(
+  database: DatabaseSync,
+  type: 'table' | 'index',
+  name: string,
+  expected: string,
+): void {
+  const actual = schemaObject(database, type, name);
+  if (!actual || normalizeSql(actual) !== normalizeSql(expected)) {
+    throw new AlertLedgerError('alert_schema_mismatch', `Alert ${type} ${name} is incompatible`);
+  }
 }
 
-function tableExists(database: DatabaseSync, table: string): boolean {
-  return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+function schemaObject(database: DatabaseSync, type: 'table' | 'index', name: string): string | undefined {
+  const row = database.prepare('SELECT sql FROM sqlite_master WHERE type = ? AND name = ?')
+    .get(type, name) as { sql?: unknown } | undefined;
+  return typeof row?.sql === 'string' ? row.sql : undefined;
+}
+
+function normalizeSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').replace(/;\s*$/, '').trim().toLowerCase();
 }
