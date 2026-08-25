@@ -32,6 +32,7 @@ const OPTIONAL_DATABASES = ['subsystem-health.sqlite3'] as const;
 const ARCHIVE_NAME = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\.age$/;
 const TEMP_PREFIX = 'openclaw-backup-';
 const MARKDOWN_MAX_BYTES = 8 * 1024 * 1024;
+export const RESTORE_EVIDENCE_MAX_BYTES = 8 * 1024 * 1024;
 
 export class BackupError extends Error {
   constructor(public readonly code: string, message: string) {
@@ -117,6 +118,15 @@ export interface BackupPublicationOps {
   unlink(path: string): Promise<void>;
 }
 
+export function classifyDirectorySyncFailure(
+  path: string, code: string | undefined, platform = process.platform,
+): 'unsupported' | 'non-target-fallback' | 'fatal' {
+  if (!['EINVAL', 'EPERM', 'EISDIR'].includes(code ?? '')) return 'fatal';
+  if (platform === 'linux' && /^\/mnt\/d\//i.test(path)) return 'unsupported';
+  if (platform !== 'win32') return 'fatal';
+  return /^d:\\/i.test(path) ? 'unsupported' : 'non-target-fallback';
+}
+
 export interface CreateBackupInput extends BackupBase {
   repository: Pick<WorkspaceRepository, 'quiesce'>;
   workspaceDir: string;
@@ -126,6 +136,7 @@ export interface CreateBackupInput extends BackupBase {
   now?: () => Date;
   snapshotCheckpoint?: (phase: 'locked' | 'staged') => void | Promise<void>;
   sourceReadCheckpoint?: (path: string) => void | Promise<void>;
+  destinationWriteCheckpoint?: (path: string) => void | Promise<void>;
 }
 
 export interface VerifyBackupInput extends BackupBase { archivePath: string }
@@ -201,7 +212,7 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     const verified = await verifyArchiveToFreshDirectory({
       archivePath: temporaryArchive, identityFile: input.identityFile, ageRunner: age,
       ...(input.signal ? { signal: input.signal } : {}), secretCanaries: input.secretCanaries,
-    });
+    }, false);
     await cleanupPrivateRoot(verified.root);
     if (JSON.stringify(verified.manifest) !== JSON.stringify(manifest)) {
       throw new BackupError('manifest_changed', 'Verified manifest differs from staged manifest');
@@ -211,26 +222,25 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       throw new BackupError('archive_changed', 'Encrypted archive changed before publication');
     }
     await durability.syncFile(temporaryArchive);
-    await writeFile(incompleteMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
-    await durability.syncFile(incompleteMarker);
+    const publicationMarker = incompleteMarker;
+    await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
+    await durability.syncFile(publicationMarker);
     await publication.rename(temporaryArchive, finalArchive);
     temporaryArchive = undefined;
     try {
-      const result = await durability.syncDirectory(backupRoot);
-      input.durabilityDiagnostic?.(result === 'unsupported' ? 'directory-sync-unsupported' : 'directory-synced', backupRoot);
+      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
+      await publication.unlink(publicationMarker);
+      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
+      incompleteMarker = undefined;
     } catch (error) {
-      try {
-        await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
-        await durability.syncDirectory(backupRoot).catch(() => undefined);
-      } catch {
-        try { await publication.unlink(finalArchive); }
-        catch { throw new BackupError('archive_rollback_failed', `Backup publication rollback failed; remove ${basename(finalArchive)} only after confirming ${basename(incompleteMarker)} exists`); }
+      if (!(await exists(publicationMarker))) {
+        await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
+        await durability.syncFile(publicationMarker);
       }
-      throw new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
+      await rollbackPublishedArchive(finalArchive, publicationMarker, backupRoot, durability, publication);
+      incompleteMarker = undefined;
+      throw error instanceof BackupError ? error : new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
     }
-    await publication.unlink(incompleteMarker);
-    incompleteMarker = undefined;
-    await durability.syncDirectory(backupRoot);
     await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety });
     input.health?.recover('backup');
     return { archivePath: finalArchive, manifest, outboxEvidence };
@@ -292,7 +302,7 @@ export async function restoreBackup(input: RestoreBackupInput): Promise<{ restor
 
 /** Runs an isolated restore and records machine-readable evidence for the scheduler. */
 export async function verifyScheduledRestore(input: ScheduledRestoreInput): Promise<{
-  restorePath: string; evidencePath: string; manifest: BackupManifest;
+  evidencePath: string; manifest: BackupManifest; restoreRetained: false;
 }> {
   const stateRoot = await canonicalDirectoryRoot(input.stateDir, input.pathSafety);
   const evidencePath = join(stateRoot, 'backup-restore-verifications.jsonl');
@@ -306,10 +316,9 @@ export async function verifyScheduledRestore(input: ScheduledRestoreInput): Prom
       version: 1, kind: input.kind, status: 'passed', archive: basename(input.archivePath),
       gitHead: restored.manifest.gitHead, verifiedAt: (input.now ?? (() => new Date()))().toISOString(), ...detail,
     }, input);
-    const result = { ...restored, evidencePath };
     await removeScheduledRestore(input.restoreRoot, restored.restorePath, input.pathSafety);
     await (input.durability ?? defaultDurability).syncDirectory(await realpath(input.restoreRoot));
-    return result;
+    return { evidencePath, manifest: restored.manifest, restoreRetained: false };
   } catch (error) {
     if (restored) await removeScheduledRestore(input.restoreRoot, restored.restorePath, input.pathSafety).catch(() => undefined);
     await recordRestoreEvidence(evidencePath, stateRoot, {
@@ -352,15 +361,27 @@ async function recordRestoreEvidence(
     throw new BackupError('restore_evidence_unsafe', 'Restore evidence path is unsafe');
   }
   const identity = existing ? await canonicalRegularFile(evidencePath, stateRoot, pathSafety) : undefined;
-  const prior = identity ? await readTextBounded(identity.path, MARKDOWN_MAX_BYTES) : '';
+  let prior = identity ? await readTextBounded(identity.path, RESTORE_EVIDENCE_MAX_BYTES) : '';
   if (identity) await assertPathIdentity(identity, pathSafety);
   const temporary = join(stateRoot, `.backup-restore-evidence-${crypto.randomUUID()}.tmp`);
-  await writeFile(temporary, `${prior}${JSON.stringify(record)}\n`, { flag: 'wx', mode: 0o600 });
+  const line = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(prior) + Buffer.byteLength(line) > RESTORE_EVIDENCE_MAX_BYTES * 3 / 4) {
+    const retained: string[] = []; let bytes = Buffer.byteLength(line);
+    for (const candidate of prior.trimEnd().split('\n').reverse()) {
+      const size = Buffer.byteLength(candidate) + 1;
+      if (bytes + size > RESTORE_EVIDENCE_MAX_BYTES / 2) break;
+      retained.unshift(candidate); bytes += size;
+    }
+    prior = retained.length ? `${retained.join('\n')}\n` : '';
+  }
   const durability = input.durability ?? defaultDurability;
-  await durability.syncFile(temporary);
-  if (identity) await assertPathIdentity(identity, pathSafety);
-  await rename(temporary, evidencePath);
-  await durability.syncDirectory(stateRoot);
+  try {
+    await writeFile(temporary, `${prior}${line}`, { flag: 'wx', mode: 0o600 });
+    await durability.syncFile(temporary);
+    if (identity) await assertPathIdentity(identity, pathSafety);
+    await rename(temporary, evidencePath);
+    await durability.syncDirectory(stateRoot);
+  } finally { await unlink(temporary).catch(() => undefined); }
 }
 
 export async function applyRetention(input: RetentionInput): Promise<{ deleted: string[]; retained: string[] }> {
@@ -369,6 +390,8 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     if (!Number.isSafeInteger(keep)) throw new BackupError('retention_invalid', 'Retention count is invalid');
     const pathSafety = input.pathSafety ?? DEFAULT_PATH_SAFETY;
     const root = await canonicalDirectoryRoot(input.backupDir, pathSafety, 'retention_root_unsafe');
+    const publication = input.publicationOps ?? defaultPublicationOps;
+    await recoverRetentionTombstones(root, pathSafety, publication, input.durability ?? defaultDurability);
     const paths = input.candidatePaths
       ? [...input.candidatePaths]
       : (await readdir(root)).map(name => join(root, name));
@@ -376,7 +399,6 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     for (const path of paths) {
       const name = basename(path);
       if (!ARCHIVE_NAME.test(name) || !validArchiveDate(name)) continue;
-      if (await exists(`${resolve(path)}.uncommitted`)) continue;
       const resolvedPath = resolve(path);
       if (!within(root, resolvedPath)) continue;
       let before: BigIntStats;
@@ -386,6 +408,7 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
       try { real = await realpath(resolvedPath); } catch { continue; }
       if (!within(root, real) || real !== resolvedPath) continue;
       try {
+        await assertArchiveEligible(real, pathSafety);
         await verifyBackup({ ...input, archivePath: real });
         verified.push({ path: real, identity: before });
       } catch { /* An unverified candidate is never eligible for deletion. */ }
@@ -393,12 +416,34 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     verified.sort((left, right) => basename(right.path).localeCompare(basename(left.path)));
     const deleted: string[] = [];
     for (const candidate of verified.slice(keep)) {
+      await assertArchiveEligible(candidate.path, pathSafety);
       const current = await lstat(candidate.path, { bigint: true });
       if (!sameStableFile(candidate.identity, current) || current.isSymbolicLink() || !current.isFile()
         || await pathSafety.isReparsePoint(candidate.path)) continue;
       const real = await realpath(candidate.path);
       if (!within(root, real) || real !== candidate.path) continue;
-      await unlink(candidate.path);
+      const tombstone = `${candidate.path}.tombstone-${crypto.randomUUID()}`;
+      await publication.rename(candidate.path, tombstone);
+      try {
+        if (await exists(`${candidate.path}.uncommitted`)) throw new BackupError('retention_marker_race', 'Archive publication marker appeared during retention');
+        const moved = await lstat(tombstone, { bigint: true });
+        if (!sameMovedFile(candidate.identity, moved) || !moved.isFile() || moved.isSymbolicLink()
+          || await pathSafety.isReparsePoint(tombstone) || await realpath(tombstone) !== tombstone || !within(root, tombstone)) {
+          throw new BackupError('retention_identity_changed', 'Retention tombstone identity does not match verified archive');
+        }
+        await publication.unlink(tombstone);
+        await (input.durability ?? defaultDurability).syncDirectory(root);
+      } catch (error) {
+        if (!(await exists(candidate.path)) && await exists(tombstone)) {
+          const tombstoneInfo = await lstat(tombstone, { bigint: true }).catch(() => undefined);
+          if (tombstoneInfo && sameMovedFile(candidate.identity, tombstoneInfo)) {
+            await publication.rename(tombstone, candidate.path).catch(() => undefined);
+          } else {
+            await publication.rename(tombstone, `${tombstone}.suspicious`).catch(() => undefined);
+          }
+        }
+        throw error;
+      }
       deleted.push(candidate.path);
     }
     return { deleted, retained: verified.slice(0, Math.max(keep, 2)).map(item => item.path) };
@@ -406,6 +451,36 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     reportFailure(input.health);
     throw asBackupError(error);
   }
+}
+
+async function recoverRetentionTombstones(
+  root: string, pathSafety: PathSafety, publication: BackupPublicationOps, durability: BackupDurability,
+): Promise<void> {
+  for (const name of await readdir(root)) {
+    const match = /^(\d{4}-\d{2}-\d{2}\.age)\.tombstone-[0-9a-f-]+$/.exec(name);
+    if (!match) continue;
+    if (!validArchiveDate(match[1]!)) continue;
+    const tombstone = join(root, name); const original = join(root, match[1]!);
+    const info = await lstat(tombstone, { bigint: true }).catch(() => undefined);
+    if (!info || !info.isFile() || info.isSymbolicLink() || await pathSafety.isReparsePoint(tombstone)
+      || await realpath(tombstone) !== tombstone || await exists(original) || await exists(`${original}.uncommitted`)) continue;
+    await publication.rename(tombstone, original);
+    await durability.syncDirectory(root);
+  }
+}
+
+async function assertArchiveEligible(path: string, pathSafety?: PathSafety): Promise<void> {
+  const absolute = resolve(path);
+  const name = basename(absolute);
+  if (!ARCHIVE_NAME.test(name) || !validArchiveDate(name)) {
+    throw new BackupError('archive_ineligible', 'Backup archive name is not an eligible recovery point');
+  }
+  if (await exists(`${absolute}.uncommitted`)) {
+    throw new BackupError('archive_uncommitted', 'Backup archive publication is incomplete');
+  }
+  const info = await lstat(absolute, { bigint: true });
+  if (!info.isFile() || info.isSymbolicLink() || await (pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(absolute)
+    || await realpath(absolute) !== absolute) throw new BackupError('archive_ineligible', 'Backup archive path is unsafe');
 }
 
 async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Promise<BackupManifest> {
@@ -421,6 +496,7 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
     const source = join(workspaceRoot, name);
     if (await exists(source)) await copyStable(
       source, join(snapshotRoot, 'workspace', name), input.secretCanaries ?? [], pathSafety, input.sourceReadCheckpoint,
+      input.destinationWriteCheckpoint,
     );
   }
   for (const directory of ['memory', 'archive']) {
@@ -428,6 +504,7 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
     if (await exists(source)) await copyAllowedMarkdownTree(
       workspaceRoot, source, join(snapshotRoot, 'workspace', directory),
       input.secretCanaries ?? [], pathSafety, input.sourceReadCheckpoint,
+      input.destinationWriteCheckpoint,
     );
   }
   const gitDirectory = join(workspaceRoot, '.git');
@@ -495,9 +572,10 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
   return manifest;
 }
 
-async function verifyArchiveToFreshDirectory(input: VerifyBackupInput) {
+async function verifyArchiveToFreshDirectory(input: VerifyBackupInput, requireEligible = true) {
   const age = input.ageRunner ?? new AgeExecRunner();
   const archivePath = resolve(input.archivePath);
+  if (requireEligible) await assertArchiveEligible(archivePath, input.pathSafety);
   const archiveStat = await lstat(archivePath, { bigint: true });
   if (!archiveStat.isFile() || archiveStat.isSymbolicLink()
     || await (input.pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(archivePath)) throw new BackupError('archive_unsafe', 'Backup archive is not a regular file');
@@ -553,7 +631,13 @@ async function validateMarkdown(snapshotRoot: string): Promise<void> {
   for (const path of await listFiles(workspace)) {
     if (!path.endsWith('.md')) continue;
     const name = basename(path);
-    const kind = path.startsWith('memory/') || path.startsWith('archive/') ? 'daily' : ROOT_MARKDOWN.get(name);
+    const kind = path.startsWith('memory/')
+      ? 'daily'
+      : path.startsWith('archive/')
+        ? (/^archive\/\d{4}-\d{2}-\d{2}\.md$/.test(path)
+            ? 'daily'
+            : path === `archive/${name}` ? ROOT_MARKDOWN.get(name) : undefined)
+        : ROOT_MARKDOWN.get(name);
     if (!kind) throw new BackupError('markdown_path_invalid', `Unexpected Markdown path: ${path}`);
     const ids = seen.get(kind) ?? new Set<string>();
     const document = parseDocument(kind, await readTextBounded(join(workspace, ...path.split('/')), MARKDOWN_MAX_BYTES), ids);
@@ -666,27 +750,43 @@ async function unpackBundle(bundlePath: string, destination: string): Promise<vo
       const output = await open(outputPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
       const hash = createHash('sha256');
       let remaining = size;
+      let outputPosition = 0;
+      let streamedHash: string;
       try {
         while (remaining > 0) {
           const bytes = await readExactly(input, Math.min(64 * 1024, remaining), position);
           position += bytes.byteLength;
           remaining -= bytes.byteLength;
           hash.update(bytes);
-          await output.write(bytes);
+          outputPosition = await writeAll(output, bytes, outputPosition);
         }
         await output.sync();
+        streamedHash = hash.digest('hex');
       } finally { await output.close(); }
-      if (hash.digest('hex') !== item.sha256) throw new BackupError('archive_hash_mismatch', 'Archive entry hash mismatch');
+      const destinationEvidence = await hashFileBounded(outputPath, BACKUP_ARCHIVE_LIMITS.maxFileBytes);
+      if (streamedHash! !== item.sha256 || destinationEvidence.size !== size || destinationEvidence.sha256 !== item.sha256) {
+        throw new BackupError('archive_hash_mismatch', 'Archive entry destination hash mismatch');
+      }
     }
     if (position !== Number(bundleStat.size)) throw new BackupError('archive_trailing_bytes', 'Archive contains trailing bytes');
   } finally { await input.close(); }
 }
 
 async function writeAt(handle: Awaited<ReturnType<typeof open>>, bytes: Uint8Array, position: number): Promise<number> {
+  return writeAll(handle, bytes, position);
+}
+
+export async function writeAll(
+  handle: Pick<Awaited<ReturnType<typeof open>>, 'write'>,
+  bytes: Uint8Array,
+  position: number,
+): Promise<number> {
   let offset = 0;
   while (offset < bytes.byteLength) {
     const result = await handle.write(bytes, offset, bytes.byteLength - offset, position + offset);
-    if (result.bytesWritten <= 0) throw new BackupError('archive_write_failed', 'Archive write made no progress');
+    if (result.bytesWritten <= 0 || result.bytesWritten > bytes.byteLength - offset) {
+      throw new BackupError('archive_write_failed', 'Archive write made invalid progress');
+    }
     offset += result.bytesWritten;
   }
   return position + bytes.byteLength;
@@ -753,6 +853,10 @@ async function copyStableStreaming(source: string, destination: string, maximum:
     await copyFileBytesIntoHandle(source, output, 0, evidence);
     await output.sync();
   } finally { await output.close(); }
+  const destinationEvidence = await hashFileBounded(destination, maximum);
+  if (destinationEvidence.size !== evidence.size || destinationEvidence.sha256 !== evidence.sha256) {
+    throw new BackupError('destination_mismatch', 'Stable copy destination differs from source');
+  }
 }
 
 async function copyAllowedMarkdownTree(
@@ -762,6 +866,7 @@ async function copyAllowedMarkdownTree(
   canaries: readonly string[],
   pathSafety: PathSafety,
   checkpoint?: (path: string) => void | Promise<void>,
+  destinationCheckpoint?: (path: string) => void | Promise<void>,
 ): Promise<void> {
   const root = await canonicalDirectoryUnder(source, workspaceRoot, pathSafety);
   for (const path of await listSourceFiles(root, '', pathSafety)) {
@@ -769,6 +874,7 @@ async function copyAllowedMarkdownTree(
     await copyStable(
       join(root, ...path.split('/')), join(destination, ...path.split('/')), canaries, pathSafety,
       checkpoint,
+      destinationCheckpoint,
     );
   }
 }
@@ -805,6 +911,7 @@ async function copyStable(
   canaries: readonly string[] = [],
   pathSafety: PathSafety = DEFAULT_PATH_SAFETY,
   checkpoint?: (path: string) => void | Promise<void>,
+  destinationCheckpoint?: (path: string) => void | Promise<void>,
 ): Promise<void> {
   const noFollow = (fsConstants as Partial<Record<'O_NOFOLLOW', number>>).O_NOFOLLOW ?? 0;
   const before = await lstat(source, { bigint: true });
@@ -822,7 +929,14 @@ async function copyStable(
     assertLogicalPathSecretFree(destination);
     await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
     output = await open(destination, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
-    await streamHandleWithSecretScan(handle, output, destination, canaries, Number(opened.size));
+    const copied = await streamHandleWithSecretScan(handle, output, destination, canaries, Number(opened.size));
+    await output.sync();
+    await output.close(); output = undefined;
+    await destinationCheckpoint?.(destination);
+    const destinationEvidence = await hashFileBounded(destination, BACKUP_ARCHIVE_LIMITS.maxFileBytes);
+    if (destinationEvidence.size !== copied.size || destinationEvidence.sha256 !== copied.sha256) {
+      throw new BackupError('destination_mismatch', 'Snapshot destination differs from streamed source');
+    }
     await checkpoint?.(source);
     const after = await handle.stat({ bigint: true });
     const pathAfter = await lstat(source, { bigint: true });
@@ -987,7 +1101,7 @@ async function streamHandleWithSecretScan(
     const window = Buffer.concat([carry, bytes]);
     assertBytesSecretFree(logicalPath, window, canaries);
     hash.update(bytes);
-    if (output) await output.write(bytes, 0, bytes.length, position);
+    if (output) await writeAll(output, bytes, position);
     carry = Buffer.from(window.subarray(Math.max(0, window.length - overlap)));
     position += bytesRead;
   }
@@ -1167,13 +1281,52 @@ const defaultDurability: BackupDurability = {
       const code = (error as NodeJS.ErrnoException).code;
       // Windows does not expose directory handles through Node; the atomic rename
       // is the strongest available fallback on these documented error codes.
-      if (!(process.platform === 'win32' && (code === 'EINVAL' || code === 'EPERM' || code === 'EISDIR'))) throw error;
-      return 'unsupported';
+      const classification = classifyDirectorySyncFailure(path, code);
+      if (classification === 'fatal') throw error;
+      if (classification === 'unsupported') return 'unsupported';
+      return;
     } finally { await handle?.close(); }
   },
 };
 
 const defaultPublicationOps: BackupPublicationOps = { rename, unlink };
+
+async function requirePublicationDirectorySync(
+  durability: BackupDurability,
+  root: string,
+  diagnostic?: BackupBase['durabilityDiagnostic'],
+): Promise<void> {
+  const result = await durability.syncDirectory(root);
+  const event = result === 'unsupported' ? 'directory-sync-unsupported' : 'directory-synced';
+  diagnostic?.(event, root);
+  if (result === 'unsupported') {
+    throw new BackupError('archive_directory_sync_unsupported', 'Platform cannot durably publish the backup directory; archive remains uncommitted');
+  }
+}
+
+async function rollbackPublishedArchive(
+  finalArchive: string,
+  marker: string,
+  root: string,
+  durability: BackupDurability,
+  publication: BackupPublicationOps,
+): Promise<void> {
+  try {
+    await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
+    await durability.syncDirectory(root).catch(() => undefined);
+    await publication.unlink(marker).catch(() => undefined);
+    return;
+  } catch {
+    try {
+      await publication.unlink(finalArchive);
+      await durability.syncDirectory(root).catch(() => undefined);
+      await publication.unlink(marker).catch(() => undefined);
+      return;
+    } catch {
+      throw new BackupError('archive_rollback_failed', `Backup publication rollback failed; ${basename(finalArchive)} remains explicitly ineligible while ${basename(marker)} exists`);
+    }
+  }
+}
 
 async function quarantinePrivateRoot(stateDir: string, workRoot: string, acl: BackupAclVerifier, pathSafety?: PathSafety): Promise<string> {
   const stateRoot = await canonicalDirectoryRoot(stateDir, pathSafety);
@@ -1254,6 +1407,11 @@ function assertDirectory(info: BigIntStats, description: string): void {
 function sameStableFile(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function sameMovedFile(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+    && left.size === right.size && left.mtimeNs === right.mtimeNs;
 }
 
 function within(root: string, path: string): boolean {

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8,7 +8,7 @@ import { afterEach, expect, it } from 'vitest';
 import { SubsystemHealthStore } from '../../src/state/health.js';
 import { AlertLedger } from '../../src/state/alerts.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
-import { createBackup, restoreBackup, verifyScheduledRestore, type AgeRunner } from '../../src/ops/backup.js';
+import { createBackup, RESTORE_EVIDENCE_MAX_BYTES, restoreBackup, verifyScheduledRestore, type AgeRunner } from '../../src/ops/backup.js';
 import { runExecFile } from '../../src/ops/process.js';
 import { openRepository, type WorkspaceRepository } from '../../src/workspace/repository.js';
 
@@ -159,9 +159,10 @@ it('records deterministic daily sample and monthly full restore evidence', async
     now: () => new Date('2026-08-25T00:00:00.000Z') });
   const restoreRoot = join(f.root, 'scheduled-restores'); await mkdir(restoreRoot);
   for (const kind of ['daily-sample', 'monthly-full'] as const) {
-    await verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
+    const result = await verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
       identityFile: 'schedule-key', ageRunner: f.age, kind,
       now: () => new Date('2026-08-25T12:00:00.000Z') });
+    expect(result).toMatchObject({ restoreRetained: false }); expect(result).not.toHaveProperty('restorePath');
   }
   const records = (await readFile(join(f.stateDir, 'backup-restore-verifications.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   expect(records.map(record => [record.kind, record.status, record.gitHead])).toEqual([
@@ -181,11 +182,15 @@ it('validates and restores nonempty archived daily Markdown', async () => {
     '- entry_at: 2026-08-24T08:00:00+09:00', '- created_at: 2026-08-24T08:00:00+09:00',
     '- updated_at: 2026-08-24T08:00:00+09:00', '- source: "telegram"', '', 'Archived body', '',
   ].join('\n'));
+  for (const name of ['TASKS.md', 'STUDY.md', 'NOTES.md', 'USER.md', 'MEMORY.md', 'INBOX.md']) {
+    await writeFile(join(f.workspaceDir, 'archive', name), await readFile(join(f.workspaceDir, name)));
+  }
   const backup = await createBackup({ ...f, recipient: 'archive-key', identityFile: 'archive-key', ageRunner: f.age,
     now: () => new Date('2026-08-25T00:00:00.000Z') });
   const restoreRoot = join(f.root, 'archive-restore'); await mkdir(restoreRoot);
   const restored = await restoreBackup({ archivePath: backup.archivePath, restoreRoot, identityFile: 'archive-key', ageRunner: f.age });
   expect(await readFile(join(restored.restorePath, 'workspace', 'archive', '2026-08-24.md'), 'utf8')).toContain('D-080000-001');
+  expect(await readFile(join(restored.restorePath, 'workspace', 'archive', 'TASKS.md'), 'utf8')).toContain('# TASKS');
   f.outbox.close(); f.health.close();
 }, 30_000);
 
@@ -200,5 +205,25 @@ it('records failed daily sampling and cleans its temporary restore', async () =>
   const records = (await readFile(join(f.stateDir, 'backup-restore-verifications.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   expect(records).toEqual([expect.objectContaining({ kind: 'daily-sample', status: 'failed', errorCode: 'restore_sample_missing' })]);
   expect((await readdir(restoreRoot)).filter(name => name.startsWith('restore-'))).toEqual([]);
+  f.outbox.close(); f.health.close();
+}, 30_000);
+
+it('atomically compacts bounded restore evidence and cleans evidence temps on failure', async () => {
+  const f = await fixture();
+  const backup = await createBackup({ ...f, recipient: 'rotation-key', identityFile: 'rotation-key', ageRunner: f.age,
+    now: () => new Date('2026-08-25T00:00:00.000Z') });
+  const evidence = join(f.stateDir, 'backup-restore-verifications.jsonl');
+  const line = `${JSON.stringify({ version: 1, status: 'passed', padding: 'x'.repeat(1024) })}\n`;
+  await writeFile(evidence, line.repeat(Math.floor((RESTORE_EVIDENCE_MAX_BYTES - 4096) / Buffer.byteLength(line))), { mode: 0o600 });
+  const restoreRoot = join(f.root, 'rotated-evidence'); await mkdir(restoreRoot);
+  await verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
+    identityFile: 'rotation-key', ageRunner: f.age, kind: 'monthly-full' });
+  expect((await stat(evidence)).size).toBeLessThanOrEqual(RESTORE_EVIDENCE_MAX_BYTES / 2 + 4096);
+
+  await expect(verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
+    identityFile: 'rotation-key', ageRunner: f.age, kind: 'monthly-full',
+    durability: { async syncFile() { throw Object.assign(new Error('disk'), { code: 'EIO' }); }, async syncDirectory() {} } }))
+    .rejects.toBeDefined();
+  expect((await readdir(f.stateDir)).filter(name => name.startsWith('.backup-restore-evidence-'))).toEqual([]);
   f.outbox.close(); f.health.close();
 }, 30_000);
