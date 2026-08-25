@@ -1,8 +1,8 @@
 /// <reference types="node" />
 
-import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseIcal, semanticEventHash, type CalendarEvent } from './ical.js';
 import type { CreateScheduleRequest } from './naver-api.js';
@@ -48,11 +48,7 @@ export interface PrepareCalendarRequest {
 export interface CalendarOutboxWarning {
   requestId: string;
   reason: 'reconcile_unavailable' | 'reconcile_not_found' | 'confirmation_required';
-}
-
-export interface BackupManifestEvidence {
-  manifestId: string;
-  includedRequestIds: readonly string[];
+  idempotencyKey: string;
 }
 
 export interface CalendarOutboxAuditEntry {
@@ -61,6 +57,7 @@ export interface CalendarOutboxAuditEntry {
   completedAt: string;
   deletedAt: string;
   backupManifestId: string;
+  backupManifestHash: string;
 }
 
 interface CalendarApiLike {
@@ -123,6 +120,30 @@ interface AuditRow {
   completed_at: string;
   deleted_at: string;
   backup_manifest_id: string;
+  backup_manifest_hash: string;
+}
+
+interface WarningRow {
+  request_id: string;
+  warning_kind: 'pending' | 'confirmation_required';
+  version: number | bigint;
+  idempotency_key: string;
+  reason: CalendarOutboxWarning['reason'];
+  delivery_status: 'pending' | 'delivered';
+  attempt_count: number | bigint;
+  last_attempt_at: string | null;
+  delivered_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BackupManifest {
+  version: 1;
+  createdAt: string;
+  gitHead: string;
+  schemaVersion: string;
+  exclusionsVersion: string;
+  files: Array<{ path: string; size: number; sha256: string }>;
 }
 
 const CONFIRMATION_LIFETIME_MS = 10 * 60 * 1_000;
@@ -130,6 +151,9 @@ const DEFAULT_STALE_AFTER_MS = 15_000;
 const SUCCEEDED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RETRY_DELAYS_MS = [100, 200] as const;
 const MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807n;
+const MAX_SAFE_VERSION = Number.MAX_SAFE_INTEGER;
+const OUTBOX_SCHEMA_VERSION = 1;
+const OUTBOX_SNAPSHOT_PATH = 'state/calendar-outbox.sqlite3';
 const REQUEST_COLUMNS = `
   request_id, version, status, uid, calendar_id, payload_ical, payload_hash,
   confirmed_by, confirmed_at, confirmation_expires_at, confirmation_consumed_at,
@@ -140,7 +164,7 @@ const REQUEST_COLUMNS = `
 // Keep this in lock-step with outbox-schema.sql. It is embedded so compiled output
 // remains self-contained when package assets are not copied beside dist/*.js.
 const OUTBOX_SCHEMA = `
-CREATE TABLE IF NOT EXISTS calendar_requests (
+CREATE TABLE calendar_requests (
   request_id TEXT PRIMARY KEY
     CHECK (
       length(request_id) = 36
@@ -152,7 +176,7 @@ CREATE TABLE IF NOT EXISTS calendar_requests (
       AND lower(request_id) = request_id
       AND replace(request_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
-  version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+  version INTEGER NOT NULL DEFAULT 0 CHECK (version BETWEEN 0 AND 9007199254740991),
   status TEXT NOT NULL
     CHECK (status IN ('draft','confirmed','submitting','pending_reconcile','succeeded','failed')),
   uid TEXT NOT NULL CHECK (length(uid) > 0),
@@ -199,19 +223,50 @@ CREATE TABLE IF NOT EXISTS calendar_requests (
   )
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS calendar_requests_status_updated_idx
+CREATE INDEX calendar_requests_status_updated_idx
   ON calendar_requests (status, updated_at, request_id);
 
-CREATE TABLE IF NOT EXISTS calendar_reconcile_warnings (
-  request_id TEXT NOT NULL,
-  warning_kind TEXT NOT NULL CHECK (warning_kind IN ('pending','confirmation_required')),
-  warned_at TEXT NOT NULL
-    CHECK (length(warned_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', warned_at) = warned_at),
-  PRIMARY KEY (request_id, warning_kind),
-  FOREIGN KEY (request_id) REFERENCES calendar_requests(request_id) ON DELETE CASCADE
+CREATE TABLE calendar_outbox_metadata (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  schema_version INTEGER NOT NULL CHECK (schema_version BETWEEN 1 AND 9007199254740991),
+  schema_fingerprint TEXT NOT NULL
+    CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint NOT GLOB '*[^0-9a-f]*')
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS calendar_outbox_audit (
+CREATE TABLE calendar_reconcile_warnings (
+  request_id TEXT NOT NULL,
+  warning_kind TEXT NOT NULL CHECK (warning_kind IN ('pending','confirmation_required')),
+  version INTEGER NOT NULL DEFAULT 0 CHECK (version BETWEEN 0 AND 9007199254740991),
+  idempotency_key TEXT NOT NULL UNIQUE
+    CHECK (length(idempotency_key) = 64 AND idempotency_key NOT GLOB '*[^0-9a-f]*'),
+  reason TEXT NOT NULL
+    CHECK (reason IN ('reconcile_unavailable','reconcile_not_found','confirmation_required')),
+  delivery_status TEXT NOT NULL CHECK (delivery_status IN ('pending','delivered')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 9007199254740991),
+  last_attempt_at TEXT CHECK (
+    last_attempt_at IS NULL OR
+    (length(last_attempt_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', last_attempt_at) = last_attempt_at)
+  ),
+  delivered_at TEXT CHECK (
+    delivered_at IS NULL OR
+    (length(delivered_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', delivered_at) = delivered_at)
+  ),
+  created_at TEXT NOT NULL
+    CHECK (length(created_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = created_at),
+  updated_at TEXT NOT NULL
+    CHECK (length(updated_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) = updated_at),
+  PRIMARY KEY (request_id, warning_kind),
+  FOREIGN KEY (request_id) REFERENCES calendar_requests(request_id) ON DELETE CASCADE,
+  CHECK (
+    (delivery_status = 'pending' AND delivered_at IS NULL)
+    OR (delivery_status = 'delivered' AND delivered_at IS NOT NULL)
+  )
+) STRICT;
+
+CREATE INDEX calendar_reconcile_warnings_delivery_idx
+  ON calendar_reconcile_warnings (delivery_status, created_at, request_id, warning_kind);
+
+CREATE TABLE calendar_outbox_audit (
   request_id TEXT PRIMARY KEY,
   payload_hash TEXT NOT NULL
     CHECK (length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'),
@@ -219,9 +274,91 @@ CREATE TABLE IF NOT EXISTS calendar_outbox_audit (
     CHECK (length(completed_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', completed_at) = completed_at),
   deleted_at TEXT NOT NULL
     CHECK (length(deleted_at) = 20 AND strftime('%Y-%m-%dT%H:%M:%SZ', deleted_at) = deleted_at),
-  backup_manifest_id TEXT NOT NULL CHECK (length(backup_manifest_id) > 0)
+  backup_manifest_id TEXT NOT NULL CHECK (length(backup_manifest_id) > 0),
+  backup_manifest_hash TEXT NOT NULL
+    CHECK (length(backup_manifest_hash) = 64 AND backup_manifest_hash NOT GLOB '*[^0-9a-f]*')
 ) STRICT;
 `;
+
+const EXPECTED_SCHEMA = schemaObjects(OUTBOX_SCHEMA);
+const OUTBOX_SCHEMA_FINGERPRINT = schemaFingerprint(EXPECTED_SCHEMA);
+const VERIFIED_EVIDENCE_TOKEN = Symbol('verified-outbox-backup-evidence');
+const VERIFIED_EVIDENCE = new WeakMap<object, {
+  manifestId: string;
+  manifestHash: string;
+  coveredRequests: ReadonlyMap<string, string>;
+}>();
+
+export class VerifiedOutboxBackupEvidence {
+  private constructor(
+    token: symbol,
+    public readonly manifestId: string,
+    public readonly manifestHash: string,
+    coveredRequests: ReadonlyMap<string, string>,
+  ) {
+    if (token !== VERIFIED_EVIDENCE_TOKEN) {
+      throw new CalendarOutboxError('invalid_backup_evidence', 'Backup evidence was not minted by the verifier');
+    }
+    VERIFIED_EVIDENCE.set(this, {
+      manifestId,
+      manifestHash,
+      coveredRequests: new Map(coveredRequests),
+    });
+    Object.freeze(this);
+  }
+
+  static verifySnapshot(snapshotRoot: string): VerifiedOutboxBackupEvidence {
+    try {
+      const rootPath = resolve(snapshotRoot);
+      const rootStat = lstatSync(rootPath);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error('snapshot root is not a real directory');
+      const realRoot = realpathSync(rootPath);
+      const manifestPath = join(realRoot, 'manifest.json');
+      const manifestStat = lstatSync(manifestPath);
+      if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) throw new Error('manifest is not a regular file');
+      const manifestBytes = readFileSync(manifestPath);
+      const manifestHash = sha256(manifestBytes);
+      const manifest = parseBackupManifest(manifestBytes.toString('utf8'));
+      const entry = manifest.files.find(file => file.path === OUTBOX_SNAPSHOT_PATH);
+      if (!entry) throw new Error('calendar outbox snapshot is not listed');
+
+      const snapshotPath = join(realRoot, ...OUTBOX_SNAPSHOT_PATH.split('/'));
+      const snapshotStat = lstatSync(snapshotPath);
+      if (!snapshotStat.isFile() || snapshotStat.isSymbolicLink()) throw new Error('snapshot is not a regular file');
+      const realSnapshot = realpathSync(snapshotPath);
+      const relativeSnapshot = relative(realRoot, realSnapshot);
+      if (!relativeSnapshot || relativeSnapshot.startsWith('..') || isAbsolute(relativeSnapshot)) {
+        throw new Error('snapshot escapes its verified root');
+      }
+      const snapshotBytes = readFileSync(realSnapshot);
+      if (entry.size !== snapshotBytes.byteLength || entry.sha256 !== sha256(snapshotBytes)) {
+        throw new Error('snapshot coverage hash mismatch');
+      }
+
+      const database = new DatabaseSync(realSnapshot, { readOnly: true, readBigInts: true });
+      try {
+        validateExistingSchema(database);
+        const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+        if (integrity.integrity_check !== 'ok') throw new Error('snapshot integrity check failed');
+        const rows = database.prepare('SELECT request_id, payload_hash FROM calendar_requests')
+          .all() as Array<{ request_id: string; payload_hash: string }>;
+        const coverage = new Map(rows.map(row => [row.request_id, row.payload_hash]));
+        return new VerifiedOutboxBackupEvidence(
+          VERIFIED_EVIDENCE_TOKEN,
+          `${manifest.createdAt}:${manifest.gitHead}`,
+          manifestHash,
+          coverage,
+        );
+      } finally {
+        database.close();
+      }
+    } catch (error) {
+      if (error instanceof CalendarOutboxError && error.code === 'invalid_backup_evidence') throw error;
+      throw new CalendarOutboxError('invalid_backup_evidence', 'Backup manifest coverage could not be verified');
+    }
+  }
+
+}
 
 export class CalendarOutbox {
   readonly #database: DatabaseSync;
@@ -246,10 +383,16 @@ export class CalendarOutbox {
     chmodSync(options.stateDir, 0o700);
     this.#databasePath = join(options.stateDir, 'calendar-outbox.sqlite3');
     this.#database = new DatabaseSync(this.#databasePath, { readBigInts: true });
-    this.#database.exec('PRAGMA busy_timeout = 10000;');
-    this.#database.exec('PRAGMA foreign_keys = ON;');
-    this.#database.exec('PRAGMA journal_mode = WAL;');
-    this.#database.exec(OUTBOX_SCHEMA);
+    try {
+      this.#database.exec('PRAGMA busy_timeout = 10000;');
+      this.#database.exec('PRAGMA foreign_keys = ON;');
+      this.#database.exec('PRAGMA journal_mode = WAL;');
+      initializeOrValidateSchema(this.#database);
+    } catch (error) {
+      this.#database.close();
+      if (error instanceof CalendarOutboxError && error.code === 'outbox_schema_mismatch') throw error;
+      throw new CalendarOutboxError('outbox_schema_mismatch', 'Calendar outbox schema validation failed');
+    }
     this.#secureDatabaseFiles();
     this.#api = options.api;
     this.#caldav = options.caldav;
@@ -309,6 +452,7 @@ export class CalendarOutbox {
       if (current.status === 'confirmed' && current.confirmationConsumedAt !== undefined) {
         throw new CalendarOutboxError('confirmation_consumed', 'Calendar confirmation was already consumed');
       }
+      assertVersionCanIncrement(current.version);
       const expiresAt = formatTimestamp(new Date(nowDate.valueOf() + CONFIRMATION_LIFETIME_MS));
       const result = this.#database.prepare(`
         UPDATE calendar_requests
@@ -374,9 +518,9 @@ export class CalendarOutbox {
     return this.#finish(current, 'failed', { errorCode: 'request_pre_send' });
   }
 
-  recover(): CalendarRequest[] {
+  async recover(): Promise<CalendarRequest[]> {
     this.#assertOpen();
-    const now = this.#nowDate().valueOf();
+    const now = Date.parse(this.#timestamp());
     const candidates = this.#database.prepare(`
       SELECT ${REQUEST_COLUMNS} FROM calendar_requests
       WHERE status = 'submitting'
@@ -388,6 +532,7 @@ export class CalendarOutbox {
       if (now - Date.parse(current.updatedAt) <= this.#submittingStaleAfterMs) continue;
       recovered.push(this.#finish(current, 'pending_reconcile', { errorCode: 'stale_submitting' }));
     }
+    await this.#deliverPendingWarnings();
     return recovered;
   }
 
@@ -413,12 +558,12 @@ export class CalendarOutbox {
     return reconciled;
   }
 
-  pruneSucceeded(evidence: BackupManifestEvidence): string[] {
+  pruneSucceeded(evidence: VerifiedOutboxBackupEvidence): string[] {
     this.#assertOpen();
-    if (!evidence.manifestId) {
-      throw new CalendarOutboxError('invalid_backup_evidence', 'Backup manifest ID is required');
+    const verified = evidence && typeof evidence === 'object' ? VERIFIED_EVIDENCE.get(evidence) : undefined;
+    if (!verified) {
+      throw new CalendarOutboxError('invalid_backup_evidence', 'Verified backup evidence is required');
     }
-    const included = new Set(evidence.includedRequestIds);
     const nowDate = this.#nowDate();
     const now = formatTimestamp(nowDate);
     const cutoff = formatTimestamp(new Date(nowDate.valueOf() - SUCCEEDED_RETENTION_MS));
@@ -430,8 +575,9 @@ export class CalendarOutbox {
     const deleted: string[] = [];
     for (const row of candidates) {
       const current = mapRequest(row);
-      if (!included.has(current.requestId)) continue;
+      if (verified.coveredRequests.get(current.requestId) !== current.payloadHash) continue;
       this.#transaction(() => {
+        assertVersionCanIncrement(current.version);
         const versioned = this.#database.prepare(`
           UPDATE calendar_requests SET version = version + 1
           WHERE request_id = ? AND version = ? AND status = 'succeeded'
@@ -439,9 +585,12 @@ export class CalendarOutbox {
         assertOneChange(versioned.changes, current.requestId);
         const audit = this.#database.prepare(`
           INSERT INTO calendar_outbox_audit (
-            request_id, payload_hash, completed_at, deleted_at, backup_manifest_id
-          ) VALUES (?, ?, ?, ?, ?)
-        `).run(current.requestId, current.payloadHash, current.updatedAt, now, evidence.manifestId);
+            request_id, payload_hash, completed_at, deleted_at, backup_manifest_id, backup_manifest_hash
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          current.requestId, current.payloadHash, current.updatedAt, now,
+          verified.manifestId, verified.manifestHash,
+        );
         assertOneChange(audit.changes, current.requestId);
         const removed = this.#database.prepare(`
           DELETE FROM calendar_requests
@@ -457,7 +606,7 @@ export class CalendarOutbox {
   auditEntries(): CalendarOutboxAuditEntry[] {
     this.#assertOpen();
     const rows = this.#database.prepare(`
-      SELECT request_id, payload_hash, completed_at, deleted_at, backup_manifest_id
+      SELECT request_id, payload_hash, completed_at, deleted_at, backup_manifest_id, backup_manifest_hash
       FROM calendar_outbox_audit ORDER BY deleted_at, request_id
     `).all() as unknown as AuditRow[];
     return rows.map(row => ({
@@ -466,6 +615,7 @@ export class CalendarOutbox {
       completedAt: row.completed_at,
       deletedAt: row.deleted_at,
       backupManifestId: row.backup_manifest_id,
+      backupManifestHash: row.backup_manifest_hash,
     }));
   }
 
@@ -499,6 +649,7 @@ export class CalendarOutbox {
       if (Date.parse(current.confirmationExpiresAt!) <= nowDate.valueOf()) {
         throw new CalendarOutboxError('confirmation_expired', 'Calendar confirmation expired');
       }
+      assertVersionCanIncrement(current.version);
       const result = this.#database.prepare(`
         UPDATE calendar_requests
         SET status = 'submitting', confirmation_consumed_at = ?, updated_at = ?, version = version + 1
@@ -512,6 +663,7 @@ export class CalendarOutbox {
 
   #beginAttempt(current: CalendarRequest): CalendarRequest {
     return this.#transaction(() => {
+      assertVersionCanIncrement(current.version);
       const now = this.#timestamp();
       const result = this.#database.prepare(`
         UPDATE calendar_requests
@@ -534,6 +686,7 @@ export class CalendarOutbox {
     },
   ): CalendarRequest {
     return this.#transaction(() => {
+      assertVersionCanIncrement(current.version);
       const now = this.#timestamp();
       const result = this.#database.prepare(`
         UPDATE calendar_requests
@@ -557,9 +710,10 @@ export class CalendarOutbox {
   }
 
   async #reconcileOne(current: CalendarRequest): Promise<CalendarRequest> {
+    const target = storedEvent(current);
     let events: CalendarEvent[];
     try {
-      events = await this.#caldav.listEvents(eventRange(current));
+      events = await this.#caldav.listEvents(eventRange(target));
     } catch (error) {
       if (errorCode(error) === 'CALDAV_DUPLICATE_UID') {
         const failed = this.#finish(current, 'failed', { errorCode: 'reconcile_multiple_matches' });
@@ -571,7 +725,9 @@ export class CalendarOutbox {
       return pending;
     }
 
-    const matches = events.filter(event => event.calendarId === current.calendarId && event.uid === current.uid);
+    const recurrenceId = target.recurrenceId ?? null;
+    const matches = events.filter(event => event.calendarId === current.calendarId && event.uid === current.uid &&
+      (event.recurrenceId ?? null) === recurrenceId);
     if (matches.length === 0) {
       const pending = this.#setPendingError(current, 'reconcile_not_found');
       await this.#notifyOnce(pending, 'pending', 'reconcile_not_found');
@@ -615,11 +771,73 @@ export class CalendarOutbox {
     kind: 'pending' | 'confirmation_required',
     reason: CalendarOutboxWarning['reason'],
   ): Promise<void> {
-    const inserted = this.#transaction(() => this.#database.prepare(`
-      INSERT OR IGNORE INTO calendar_reconcile_warnings (request_id, warning_kind, warned_at)
-      VALUES (?, ?, ?)
-    `).run(current.requestId, kind, this.#timestamp()).changes);
-    if (Number(inserted) === 1) await this.#warn?.({ requestId: current.requestId, reason });
+    const idempotencyKey = sha256(`calendar-outbox-warning:v1\0${current.requestId}\0${kind}`);
+    this.#transaction(() => {
+      const now = this.#timestamp();
+      this.#database.prepare(`
+        INSERT OR IGNORE INTO calendar_reconcile_warnings (
+          request_id, warning_kind, version, idempotency_key, reason, delivery_status,
+          attempt_count, last_attempt_at, delivered_at, created_at, updated_at
+        ) VALUES (?, ?, 0, ?, ?, 'pending', 0, NULL, NULL, ?, ?)
+      `).run(current.requestId, kind, idempotencyKey, reason, now, now);
+    });
+    await this.#deliverWarning(idempotencyKey);
+  }
+
+  async #deliverPendingWarnings(): Promise<void> {
+    const rows = this.#database.prepare(`
+      SELECT idempotency_key FROM calendar_reconcile_warnings
+      WHERE delivery_status = 'pending'
+      ORDER BY created_at, request_id, warning_kind
+    `).all() as Array<{ idempotency_key: string }>;
+    for (const row of rows) await this.#deliverWarning(row.idempotency_key);
+  }
+
+  async #deliverWarning(idempotencyKey: string): Promise<void> {
+    if (!this.#warn) return;
+    let warning = this.#warning(idempotencyKey);
+    if (!warning || warning.delivery_status === 'delivered') return;
+    warning = this.#transaction(() => {
+      assertVersionCanIncrement(Number(warning!.version));
+      if (Number(warning!.attempt_count) >= MAX_SAFE_VERSION) {
+        throw new CalendarOutboxError('outbox_version_overflow', 'Warning attempt counter cannot be incremented safely');
+      }
+      const now = this.#timestamp();
+      const result = this.#database.prepare(`
+        UPDATE calendar_reconcile_warnings
+        SET version = version + 1, attempt_count = attempt_count + 1,
+            last_attempt_at = ?, updated_at = ?
+        WHERE idempotency_key = ? AND version = ? AND delivery_status = 'pending'
+      `).run(now, now, idempotencyKey, warning!.version);
+      assertOneChange(result.changes, warning!.request_id);
+      return this.#warning(idempotencyKey)!;
+    });
+
+    await this.#warn({
+      requestId: warning.request_id,
+      reason: warning.reason,
+      idempotencyKey: warning.idempotency_key,
+    });
+
+    this.#transaction(() => {
+      assertVersionCanIncrement(Number(warning!.version));
+      const now = this.#timestamp();
+      const result = this.#database.prepare(`
+        UPDATE calendar_reconcile_warnings
+        SET version = version + 1, delivery_status = 'delivered', delivered_at = ?, updated_at = ?
+        WHERE idempotency_key = ? AND version = ? AND delivery_status = 'pending'
+      `).run(now, now, idempotencyKey, warning!.version);
+      if (Number(result.changes) === 0 && this.#warning(idempotencyKey)?.delivery_status === 'delivered') return;
+      assertOneChange(result.changes, warning!.request_id);
+    });
+  }
+
+  #warning(idempotencyKey: string): WarningRow | undefined {
+    return this.#database.prepare(`
+      SELECT request_id, warning_kind, version, idempotency_key, reason, delivery_status,
+             attempt_count, last_attempt_at, delivered_at, created_at, updated_at
+      FROM calendar_reconcile_warnings WHERE idempotency_key = ?
+    `).get(idempotencyKey) as unknown as WarningRow | undefined;
   }
 
   #require(requestId: string): CalendarRequest {
@@ -730,12 +948,16 @@ function mapRequest(row: CalendarRequestRow): CalendarRequest {
   };
 }
 
-function eventRange(request: CalendarRequest): { start: string; end: string } {
+function storedEvent(request: CalendarRequest): CalendarEvent {
   const events = parseIcal(request.payloadIcal, request.calendarId);
   if (events.length !== 1) throw new CalendarOutboxError('invalid_payload', 'Stored calendar payload is invalid');
+  return events[0];
+}
+
+function eventRange(event: CalendarEvent): { start: string; end: string } {
   return {
-    start: rangeTimestamp(events[0].dtstart),
-    end: rangeTimestamp(events[0].dtend),
+    start: rangeTimestamp(event.dtstart),
+    end: rangeTimestamp(event.dtend),
   };
 }
 
@@ -759,4 +981,148 @@ function assertOneChange(changes: number | bigint, requestId: string): void {
   if (Number(changes) !== 1) {
     throw new CalendarOutboxError('cas_conflict', `Calendar request ${requestId} changed concurrently`);
   }
+}
+
+function assertVersionCanIncrement(version: number): void {
+  if (!Number.isSafeInteger(version) || version < 0 || version >= MAX_SAFE_VERSION) {
+    throw new CalendarOutboxError('outbox_version_overflow', 'Calendar request version cannot be incremented safely');
+  }
+}
+
+interface SchemaObject {
+  type: 'table' | 'index';
+  name: string;
+  sql: string;
+}
+
+function schemaObjects(source: string): SchemaObject[] {
+  const objects: SchemaObject[] = [];
+  for (const part of source.trim().split(/;\s*(?=CREATE|$)/i)) {
+    const sql = part.trim();
+    if (!sql) continue;
+    const match = /^CREATE\s+(TABLE|INDEX)\s+([a-z_][a-z0-9_]*)/i.exec(sql);
+    if (!match) throw new Error('invalid embedded outbox schema');
+    objects.push({ type: match[1].toLowerCase() as 'table' | 'index', name: match[2], sql });
+  }
+  return objects.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+}
+
+function schemaFingerprint(objects: readonly SchemaObject[]): string {
+  return sha256(JSON.stringify(objects.map(object => ({
+    type: object.type,
+    name: object.name,
+    sql: canonicalSql(object.sql),
+  }))));
+}
+
+function canonicalSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function initializeOrValidateSchema(database: DatabaseSync): void {
+  let inTransaction = false;
+  try {
+    database.exec('BEGIN IMMEDIATE;');
+    inTransaction = true;
+    const row = database.prepare(`
+      SELECT count(*) AS count FROM sqlite_master
+      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+    `).get() as { count: number | bigint };
+    if (Number(row.count) === 0) {
+      database.exec(OUTBOX_SCHEMA);
+      database.prepare(`
+        INSERT INTO calendar_outbox_metadata (singleton, schema_version, schema_fingerprint)
+        VALUES (1, ?, ?)
+      `).run(OUTBOX_SCHEMA_VERSION, OUTBOX_SCHEMA_FINGERPRINT);
+      database.exec(`PRAGMA user_version = ${OUTBOX_SCHEMA_VERSION};`);
+    }
+    validateExistingSchema(database);
+    database.exec('COMMIT;');
+    inTransaction = false;
+  } catch (error) {
+    if (inTransaction) database.exec('ROLLBACK;');
+    if (error instanceof CalendarOutboxError && error.code === 'outbox_schema_mismatch') throw error;
+    throw new CalendarOutboxError('outbox_schema_mismatch', 'Calendar outbox schema does not match the required schema');
+  }
+}
+
+function validateExistingSchema(database: DatabaseSync): void {
+  try {
+    const actual = (database.prepare(`
+      SELECT type, name, sql FROM sqlite_master
+      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all() as Array<{ type: string; name: string; sql: string }>).map(row => ({
+      type: row.type as 'table' | 'index', name: row.name, sql: row.sql,
+    }));
+    if (actual.length !== EXPECTED_SCHEMA.length) throw new Error('schema object count differs');
+    for (let index = 0; index < EXPECTED_SCHEMA.length; index += 1) {
+      const expected = EXPECTED_SCHEMA[index];
+      const found = actual[index];
+      if (found.type !== expected.type || found.name !== expected.name ||
+          canonicalSql(found.sql) !== canonicalSql(expected.sql)) {
+        throw new Error(`schema object ${expected.name} differs`);
+      }
+    }
+
+    const tableRows = database.prepare(`
+      SELECT name, strict FROM pragma_table_list
+      WHERE name IN ('calendar_requests','calendar_outbox_metadata','calendar_reconcile_warnings','calendar_outbox_audit')
+    `).all() as Array<{ name: string; strict: number | bigint }>;
+    if (tableRows.length !== 4 || tableRows.some(row => Number(row.strict) !== 1)) {
+      throw new Error('outbox tables are not STRICT');
+    }
+
+    const version = database.prepare('PRAGMA user_version').get() as { user_version: number | bigint };
+    const metadata = database.prepare(`
+      SELECT singleton, schema_version, schema_fingerprint FROM calendar_outbox_metadata
+    `).get() as { singleton: number | bigint; schema_version: number | bigint; schema_fingerprint: string } | undefined;
+    if (Number(version.user_version) !== OUTBOX_SCHEMA_VERSION || !metadata ||
+        Number(metadata.singleton) !== 1 || Number(metadata.schema_version) !== OUTBOX_SCHEMA_VERSION ||
+        metadata.schema_fingerprint !== OUTBOX_SCHEMA_FINGERPRINT ||
+        schemaFingerprint(actual) !== OUTBOX_SCHEMA_FINGERPRINT) {
+      throw new Error('outbox schema version or fingerprint differs');
+    }
+  } catch (error) {
+    throw new CalendarOutboxError('outbox_schema_mismatch', 'Calendar outbox schema does not match the required schema');
+  }
+}
+
+function parseBackupManifest(source: string): BackupManifest {
+  const value = JSON.parse(source) as unknown;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('manifest is not an object');
+  const manifest = value as Record<string, unknown>;
+  if (manifest.version !== 1 || typeof manifest.createdAt !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(manifest.createdAt) ||
+      Number.isNaN(Date.parse(manifest.createdAt)) || formatTimestamp(new Date(manifest.createdAt)) !== manifest.createdAt ||
+      !/^[0-9a-f]{40}$/.test(String(manifest.gitHead)) ||
+      typeof manifest.schemaVersion !== 'string' || !manifest.schemaVersion ||
+      typeof manifest.exclusionsVersion !== 'string' || !manifest.exclusionsVersion ||
+      !Array.isArray(manifest.files)) {
+    throw new Error('manifest header is invalid');
+  }
+  const files = manifest.files.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('manifest file is invalid');
+    const file = item as Record<string, unknown>;
+    if (typeof file.path !== 'string' || !file.path || file.path.startsWith('/') || file.path.includes('\\') ||
+        file.path.split('/').some(part => !part || part === '.' || part === '..') ||
+        !Number.isSafeInteger(file.size) || Number(file.size) < 0 ||
+        typeof file.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(file.sha256)) {
+      throw new Error('manifest file entry is invalid');
+    }
+    return { path: file.path, size: Number(file.size), sha256: file.sha256 };
+  });
+  if (new Set(files.map(file => file.path)).size !== files.length) throw new Error('manifest paths are duplicated');
+  return {
+    version: 1,
+    createdAt: manifest.createdAt,
+    gitHead: String(manifest.gitHead),
+    schemaVersion: manifest.schemaVersion,
+    exclusionsVersion: manifest.exclusionsVersion,
+    files,
+  };
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash('sha256').update(value).digest('hex');
 }

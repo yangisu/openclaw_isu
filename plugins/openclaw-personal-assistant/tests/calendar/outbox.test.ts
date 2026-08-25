@@ -1,10 +1,16 @@
-import { stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CalendarOutbox, CalendarOutboxError } from '../../src/calendar/outbox.js';
+import {
+  CalendarOutbox,
+  CalendarOutboxError,
+  VerifiedOutboxBackupEvidence,
+  type CalendarOutboxWarning,
+} from '../../src/calendar/outbox.js';
 import { NaverCalendarError, type CreateScheduleRequest } from '../../src/calendar/naver-api.js';
 import {
   buildIcal,
@@ -67,7 +73,8 @@ async function fixture(overrides: {
   api?: FakeCalendarApi;
   caldav?: FakeCalDav;
   now?: Date;
-  warnings?: Array<{ requestId: string; reason: string }>;
+  warnings?: CalendarOutboxWarning[];
+  warn?: (warning: CalendarOutboxWarning) => void | Promise<void>;
   checkpoint?: (phase: 'afterAcquire' | 'beforeAttempt') => void;
 } = {}) {
   const stateDir = await mkdtemp(join(tmpdir(), 'calendar-outbox-'));
@@ -86,7 +93,7 @@ async function fixture(overrides: {
       now: () => new Date(current),
       sleep: async delay => { delays.push(delay); },
       requestId: () => `00000000-0000-4000-8000-${String(nextId++).padStart(12, '0')}`,
-      warn: warning => { warnings.push({ requestId: warning.requestId, reason: warning.reason }); },
+      warn: overrides.warn ?? (warning => { warnings.push(warning); }),
       checkpoint: overrides.checkpoint,
     });
     openOutboxes.push(outbox);
@@ -103,6 +110,23 @@ async function fixture(overrides: {
     setNow(value: string | Date) { current = new Date(value); },
     advance(milliseconds: number) { current = new Date(current.valueOf() + milliseconds); },
   };
+}
+
+async function stateDirectory(): Promise<string> {
+  const stateDir = await mkdtemp(join(tmpdir(), 'calendar-outbox-schema-'));
+  directories.push(stateDir);
+  return stateDir;
+}
+
+function openAt(stateDir: string): CalendarOutbox {
+  const outbox = new CalendarOutbox({
+    stateDir,
+    api: new FakeCalendarApi(),
+    caldav: new FakeCalDav(),
+    now: () => new Date(START),
+  });
+  openOutboxes.push(outbox);
+  return outbox;
 }
 
 function draft(overrides: Partial<CalendarEventDraft> = {}) {
@@ -134,6 +158,30 @@ async function makePending(f: Awaited<ReturnType<typeof fixture>>) {
   return f.outbox.get(prepared.requestId)!;
 }
 
+async function backupSnapshotFixture(stateDir: string): Promise<string> {
+  const backupRoot = await mkdtemp(join(tmpdir(), 'calendar-outbox-backup-'));
+  directories.push(backupRoot);
+  const snapshotDirectory = join(backupRoot, 'state');
+  const snapshotPath = join(snapshotDirectory, 'calendar-outbox.sqlite3');
+  await mkdir(snapshotDirectory, { recursive: true });
+  await copyFile(join(stateDir, 'calendar-outbox.sqlite3'), snapshotPath);
+  const contents = await readFile(snapshotPath);
+  const manifest = {
+    version: 1,
+    createdAt: '2026-09-25T00:00:01Z',
+    gitHead: '0'.repeat(40),
+    schemaVersion: 'calendar-outbox:1',
+    exclusionsVersion: '1',
+    files: [{
+      path: 'state/calendar-outbox.sqlite3',
+      size: contents.byteLength,
+      sha256: createHash('sha256').update(contents).digest('hex'),
+    }],
+  };
+  await writeFile(join(backupRoot, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+  return backupRoot;
+}
+
 describe('CalendarOutbox schema and confirmation state machine', () => {
   it('creates the exact request columns in a STRICT SQLite table', async () => {
     const f = await fixture();
@@ -153,6 +201,53 @@ describe('CalendarOutbox schema and confirmation state machine', () => {
     expect(() => database.prepare('UPDATE calendar_requests SET attempt_count = 4').run()).toThrow();
     database.close();
     f.outbox.close();
+  });
+
+  it('reopens an existing exact schema and preserves its rows', async () => {
+    const f = await fixture();
+    const prepared = f.outbox.prepare(draft());
+    f.outbox.close();
+    const reopened = f.create();
+    expect(reopened.get(prepared.requestId)).toEqual(prepared);
+    reopened.close();
+  });
+
+  it('fails closed on a precreated non-STRICT request table', async () => {
+    const stateDir = await stateDirectory();
+    const database = new DatabaseSync(join(stateDir, 'calendar-outbox.sqlite3'));
+    database.exec('CREATE TABLE calendar_requests (request_id TEXT PRIMARY KEY)');
+    database.close();
+    expect(() => openAt(stateDir)).toThrowError(expect.objectContaining({ code: 'outbox_schema_mismatch' }));
+  });
+
+  it('rejects weaker request constraints even when valid metadata is retained', async () => {
+    const f = await fixture();
+    f.outbox.close();
+    const database = new DatabaseSync(join(f.stateDir, 'calendar-outbox.sqlite3'));
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TABLE calendar_requests;
+      CREATE TABLE calendar_requests (
+        request_id TEXT PRIMARY KEY, version INTEGER NOT NULL, status TEXT NOT NULL,
+        uid TEXT NOT NULL, calendar_id TEXT NOT NULL, payload_ical TEXT NOT NULL, payload_hash TEXT NOT NULL,
+        confirmed_by INTEGER, confirmed_at TEXT, confirmation_expires_at TEXT,
+        confirmation_consumed_at TEXT, attempt_count INTEGER NOT NULL, last_attempt_at TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, http_status INTEGER,
+        process_type TEXT, returned_ical_uid TEXT, error_code TEXT
+      ) STRICT;
+    `);
+    database.close();
+    expect(() => f.create()).toThrowError(expect.objectContaining({ code: 'outbox_schema_mismatch' }));
+  });
+
+  it('rejects an existing schema with the wrong version', async () => {
+    const f = await fixture();
+    f.outbox.close();
+    const database = new DatabaseSync(join(f.stateDir, 'calendar-outbox.sqlite3'));
+    database.exec('PRAGMA user_version = 999;');
+    database.prepare('UPDATE calendar_outbox_metadata SET schema_version = 999').run();
+    database.close();
+    expect(() => f.create()).toThrowError(expect.objectContaining({ code: 'outbox_schema_mismatch' }));
   });
 
   it('stores owner-only state and UTC whole-second timestamps', async () => {
@@ -213,15 +308,30 @@ describe('CalendarOutbox schema and confirmation state machine', () => {
     f.outbox.close();
   });
 
-  it('preserves the full signed SQLite range of numeric sender IDs', async () => {
+  it('preserves numeric sender IDs through the JavaScript safe integer range', async () => {
     const f = await fixture();
-    const senderId = '9007199254740993';
+    const senderId = String(Number.MAX_SAFE_INTEGER);
     const prepared = f.outbox.prepare(draft());
     expect(f.outbox.confirm(prepared.requestId, senderId, prepared.payloadHash)).toMatchObject({
       confirmedBy: senderId,
     });
     await expect(f.outbox.submit(prepared.requestId, senderId)).resolves.toMatchObject({ status: 'succeeded' });
     f.outbox.close();
+  });
+
+  it('fails with a stable error instead of overflowing the CAS version', async () => {
+    const f = await fixture();
+    const prepared = f.outbox.prepare(draft());
+    f.outbox.close();
+    const database = new DatabaseSync(join(f.stateDir, 'calendar-outbox.sqlite3'));
+    database.prepare('UPDATE calendar_requests SET version = ? WHERE request_id = ?')
+      .run(BigInt(Number.MAX_SAFE_INTEGER), prepared.requestId);
+    database.close();
+    const reopened = f.create();
+    expect(() => reopened.confirm(prepared.requestId, SENDER_ID, prepared.payloadHash)).toThrowError(
+      expect.objectContaining({ code: 'outbox_version_overflow' }),
+    );
+    reopened.close();
   });
 
   it('expires confirmation at the exact ten-minute boundary and permits renewal', async () => {
@@ -306,6 +416,31 @@ describe('CalendarOutbox submission recovery', () => {
     },
   );
 
+  it.each(['naver_auth', 'naver_rate_limited', 'naver_http', 'naver_invalid_request'])(
+    'maps proven %s rejection to failed without retry',
+    async code => {
+      const f = await fixture();
+      f.api.outcomes.push({ type: 'error', code });
+      const prepared = f.outbox.prepare(draft());
+      await expect(f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash)).resolves
+        .toMatchObject({ status: 'failed', attemptCount: 1, errorCode: code });
+      expect(f.api.calls).toHaveLength(1);
+      expect(f.delays).toEqual([]);
+      f.outbox.close();
+    },
+  );
+
+  it('maps a server response to uncertain reconciliation without retry', async () => {
+    const f = await fixture();
+    f.api.outcomes.push({ type: 'error', code: 'naver_server' });
+    const prepared = f.outbox.prepare(draft());
+    await expect(f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash)).resolves
+      .toMatchObject({ status: 'pending_reconcile', attemptCount: 1, errorCode: 'naver_server' });
+    expect(f.api.calls).toHaveLength(1);
+    expect(f.delays).toEqual([]);
+    f.outbox.close();
+  });
+
   it('moves a modify response directly to reconciliation', async () => {
     const f = await fixture();
     f.api.outcomes.push({ type: 'success', processType: 'modify' });
@@ -334,7 +469,9 @@ describe('CalendarOutbox submission recovery', () => {
     crash = false;
     f.advance(15_001);
     const reopened = f.create();
-    expect(reopened.recover()).toEqual([expect.objectContaining({
+    await expect(reopened.recover()).resolves.toEqual([]);
+    f.advance(999);
+    await expect(reopened.recover()).resolves.toEqual([expect.objectContaining({
       requestId: prepared.requestId, status: 'pending_reconcile', errorCode: 'stale_submitting',
     })]);
     expect(f.api.calls).toHaveLength(0);
@@ -361,6 +498,54 @@ describe('CalendarOutbox reconciliation and retention', () => {
     f.outbox.close();
   });
 
+  it('reconciles a recurring master without counting its exceptions as duplicate matches', async () => {
+    const f = await fixture();
+    const input = draft({ rrule: { freq: 'WEEKLY', interval: 1 } });
+    f.api.outcomes.push({ type: 'error', code: 'request_maybe_sent' });
+    const prepared = f.outbox.prepare(input);
+    await f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash);
+    const master = parseIcal(prepared.payloadIcal, prepared.calendarId)[0];
+    const exception = (recurrenceId: string, summary: string) => parseIcal(buildIcal({
+      calendarId: prepared.calendarId,
+      uid: prepared.uid,
+      recurrenceId,
+      dtstart: recurrenceId,
+      dtend: new Date(Date.parse(recurrenceId) + 60 * 60 * 1_000).toISOString(),
+      summary,
+    }), prepared.calendarId)[0];
+    f.caldav.outcomes.push([
+      master,
+      exception('2026-09-01T00:00:00Z', 'First exception'),
+      exception('2026-09-08T00:00:00Z', 'Second exception'),
+    ]);
+    await expect(f.outbox.reconcile(prepared.requestId)).resolves.toEqual([
+      expect.objectContaining({ status: 'succeeded' }),
+    ]);
+    f.outbox.close();
+  });
+
+  it('reconciles only the exact recurrence exception identity', async () => {
+    const f = await fixture();
+    const recurrenceId = '2026-09-01T00:00:00Z';
+    const input = draft({
+      recurrenceId,
+      dtstart: recurrenceId,
+      dtend: '2026-09-01T01:00:00Z',
+      summary: 'Moved occurrence',
+    });
+    f.api.outcomes.push({ type: 'error', code: 'request_maybe_sent' });
+    const prepared = f.outbox.prepare(input);
+    await f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash);
+    const exact = parseIcal(prepared.payloadIcal, prepared.calendarId)[0];
+    const master = { ...exact, recurrenceId: undefined };
+    const otherException = { ...exact, recurrenceId: '2026-09-08T00:00:00.000Z', summary: 'Other occurrence' };
+    f.caldav.outcomes.push([master, otherException, exact]);
+    await expect(f.outbox.reconcile(prepared.requestId)).resolves.toEqual([
+      expect.objectContaining({ status: 'succeeded' }),
+    ]);
+    f.outbox.close();
+  });
+
   it('fails and requests confirmation when the one exact match has a semantic mismatch', async () => {
     const f = await fixture();
     const pending = await makePending(f);
@@ -368,7 +553,9 @@ describe('CalendarOutbox reconciliation and retention', () => {
     f.caldav.outcomes.push([{ ...local, summary: 'Changed on server' }]);
     const [result] = await f.outbox.reconcile(pending.requestId);
     expect(result).toMatchObject({ status: 'failed', errorCode: 'reconcile_payload_mismatch' });
-    expect(f.warnings).toEqual([{ requestId: pending.requestId, reason: 'confirmation_required' }]);
+    expect(f.warnings).toEqual([expect.objectContaining({
+      requestId: pending.requestId, reason: 'confirmation_required', idempotencyKey: expect.any(String),
+    })]);
     f.outbox.close();
   });
 
@@ -379,7 +566,9 @@ describe('CalendarOutbox reconciliation and retention', () => {
     f.caldav.outcomes.push([local, { ...local }]);
     const [result] = await f.outbox.reconcile(pending.requestId);
     expect(result).toMatchObject({ status: 'failed', errorCode: 'reconcile_multiple_matches' });
-    expect(f.warnings).toEqual([{ requestId: pending.requestId, reason: 'confirmation_required' }]);
+    expect(f.warnings).toEqual([expect.objectContaining({
+      requestId: pending.requestId, reason: 'confirmation_required', idempotencyKey: expect.any(String),
+    })]);
     f.outbox.close();
   });
 
@@ -391,30 +580,102 @@ describe('CalendarOutbox reconciliation and retention', () => {
     await f.outbox.reconcile(pending.requestId);
     const [result] = await f.outbox.reconcile(pending.requestId);
     expect(result).toMatchObject({ status: 'pending_reconcile', errorCode: 'reconcile_not_found' });
-    expect(f.warnings).toEqual([{ requestId: pending.requestId, reason: 'reconcile_unavailable' }]);
+    expect(f.warnings).toEqual([expect.objectContaining({
+      requestId: pending.requestId, reason: 'reconcile_unavailable', idempotencyKey: expect.any(String),
+    })]);
     f.outbox.close();
   });
 
-  it('deletes succeeded rows older than 30 days only with manifest inclusion evidence', async () => {
+  it('retries a failed warning after restart with the same idempotency key and stops after delivery', async () => {
+    const attempts: CalendarOutboxWarning[] = [];
+    let fail = true;
+    const f = await fixture({
+      warn: warning => {
+        attempts.push(warning);
+        if (fail) throw new Error('warning sink unavailable');
+      },
+    });
+    const pending = await makePending(f);
+    f.caldav.outcomes.push(new Error('CalDAV offline'));
+    await expect(f.outbox.reconcile(pending.requestId)).rejects.toThrow('warning sink unavailable');
+    f.outbox.close();
+
+    fail = false;
+    const reopened = f.create();
+    await reopened.recover();
+    await reopened.recover();
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]).toMatchObject({ reason: 'reconcile_unavailable' });
+    expect(attempts[1].idempotencyKey).toBe(attempts[0].idempotencyKey);
+    reopened.close();
+  });
+
+  it('rejects plain retention evidence and deletes only payload-covered rows from a verified snapshot', async () => {
     const f = await fixture();
     const prepared = f.outbox.prepare(draft());
     await f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash);
     const unresolved = f.outbox.prepare(draft({ uid: 'unresolved' }));
+    f.outbox.close();
+    const backupRoot = await backupSnapshotFixture(f.stateDir);
+    const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot);
+    const reopened = f.create();
     f.advance(30 * 24 * 60 * 60 * 1_000);
-    expect(f.outbox.pruneSucceeded({ manifestId: 'backup-1', includedRequestIds: [prepared.requestId] })).toEqual([]);
+    expect(() => reopened.pruneSucceeded({
+      manifestId: evidence.manifestId,
+      manifestHash: evidence.manifestHash,
+      coveredRequests: [[prepared.requestId, prepared.payloadHash]],
+    } as never)).toThrowError(expect.objectContaining({ code: 'invalid_backup_evidence' }));
+    expect(reopened.pruneSucceeded(evidence)).toEqual([]);
     f.advance(1_000);
-    expect(f.outbox.pruneSucceeded({ manifestId: 'backup-2', includedRequestIds: [] })).toEqual([]);
-    expect(f.outbox.pruneSucceeded({
-      manifestId: 'backup-3', includedRequestIds: [prepared.requestId, unresolved.requestId],
-    })).toEqual([prepared.requestId]);
-    expect(f.outbox.get(prepared.requestId)).toBeUndefined();
-    expect(f.outbox.get(unresolved.requestId)).toMatchObject({ status: 'draft' });
-    expect(f.outbox.auditEntries()).toEqual([expect.objectContaining({
+    expect(reopened.pruneSucceeded(evidence)).toEqual([prepared.requestId]);
+    expect(reopened.get(prepared.requestId)).toBeUndefined();
+    expect(reopened.get(unresolved.requestId)).toMatchObject({ status: 'draft' });
+    expect(reopened.auditEntries()).toEqual([expect.objectContaining({
       requestId: prepared.requestId,
       payloadHash: prepared.payloadHash,
-      backupManifestId: 'backup-3',
+      backupManifestId: evidence.manifestId,
+      backupManifestHash: evidence.manifestHash,
     })]);
+    reopened.close();
+  });
+
+  it('rechecks the live payload hash before pruning a covered request', async () => {
+    const f = await fixture();
+    const prepared = f.outbox.prepare(draft());
+    await f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash);
     f.outbox.close();
+    const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(await backupSnapshotFixture(f.stateDir));
+    const database = new DatabaseSync(join(f.stateDir, 'calendar-outbox.sqlite3'));
+    database.prepare('UPDATE calendar_requests SET payload_hash = ? WHERE request_id = ?')
+      .run('f'.repeat(64), prepared.requestId);
+    database.close();
+    const reopened = f.create();
+    f.advance(31 * 24 * 60 * 60 * 1_000);
+    const prototype = VerifiedOutboxBackupEvidence.prototype as unknown as { covers?: () => boolean };
+    const originalCovers = prototype.covers;
+    prototype.covers = () => true;
+    try {
+      expect(reopened.pruneSucceeded(evidence)).toEqual([]);
+    } finally {
+      if (originalCovers) prototype.covers = originalCovers;
+      else delete prototype.covers;
+    }
+    expect(reopened.get(prepared.requestId)).toBeDefined();
+    reopened.close();
+  });
+
+  it('rejects a manifest whose SQLite coverage hash does not match the actual snapshot', async () => {
+    const f = await fixture();
+    f.outbox.prepare(draft());
+    f.outbox.close();
+    const backupRoot = await backupSnapshotFixture(f.stateDir);
+    const manifestPath = join(backupRoot, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { files: Array<{ sha256: string }> };
+    manifest.files[0].sha256 = 'f'.repeat(64);
+    await writeFile(manifestPath, JSON.stringify(manifest), 'utf8');
+    expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot)).toThrowError(
+      expect.objectContaining({ code: 'invalid_backup_evidence' }),
+    );
   });
 });
 
