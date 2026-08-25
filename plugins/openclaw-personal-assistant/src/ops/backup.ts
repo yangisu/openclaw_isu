@@ -43,7 +43,10 @@ export class BackupError extends Error {
 
 export class BackupPublicationUnknownError extends BackupError {
   readonly outcome = 'unknown' as const;
-  constructor(message = 'Backup publication outcome is unknown and requires verified reconciliation') {
+  constructor(
+    public readonly target: string,
+    message = 'Backup publication outcome is unknown and requires verified reconciliation',
+  ) {
     super('publication_unknown', message);
     this.name = 'BackupPublicationUnknownError';
   }
@@ -210,6 +213,13 @@ export const BACKUP_ARCHIVE_LIMITS = Object.freeze({
 });
 
 export async function createBackup(input: CreateBackupInput): Promise<VerifiedBackup> {
+  assertNonSecretInputs(input);
+  await mkdir(input.backupDir, { recursive: true, mode: 0o700 });
+  const backupRoot = await canonicalDirectoryRoot(input.backupDir, input.pathSafety);
+  return withPublicationCoordination(backupRoot, () => createBackupCoordinated(input));
+}
+
+async function createBackupCoordinated(input: CreateBackupInput): Promise<VerifiedBackup> {
   const age = input.ageRunner ?? new AgeExecRunner();
   const acl = input.aclVerifier ?? defaultAclVerifier;
   const durability = input.durability ?? defaultDurability;
@@ -268,10 +278,11 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       throw new BackupError('archive_changed', 'Encrypted archive changed before publication');
     }
     await durability.syncFile(temporaryArchive);
-    await withPublicationCoordination(backupRoot, async () => {
+    await (async () => {
       const publicationMarker = incompleteMarker!;
       let finalPublished = false;
       let commitAttempted = false;
+      let commitRecord: ArchiveCommitRecord | undefined;
       try {
         await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
         await durability.syncFile(publicationMarker);
@@ -281,7 +292,7 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
         finalPublished = true;
         await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
         const archiveEvidence = await hashFileBounded(finalArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
-        const commitRecord: ArchiveCommitRecord = {
+        commitRecord = {
           version: COMMIT_RECORD_VERSION,
           archive: basename(finalArchive), size: archiveEvidence.size, sha256: archiveEvidence.sha256,
           manifestId: backupManifestId(manifest), manifestHash: backupManifestHash(manifest),
@@ -294,20 +305,22 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
         try {
           await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
         } catch {
-          throw new BackupPublicationUnknownError();
+          throw new BackupPublicationUnknownError(publicationUnknownTarget(finalArchive, commitRecord));
         }
         durablyCommitted = { archivePath: finalArchive, manifest, outboxEvidence };
       } catch (error) {
         if (commitAttempted) {
           if (error instanceof BackupPublicationUnknownError) throw error;
-          throw new BackupPublicationUnknownError();
+          throw new BackupPublicationUnknownError(publicationUnknownTarget(finalArchive, commitRecord!));
         }
         if (finalPublished) await rollbackPublishedArchive(finalArchive, publicationMarker, backupRoot, durability, publication);
         throw error;
       }
-    });
+    })();
     await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety }).catch(() => undefined);
-    try { input.health?.recover('backup'); }
+    try {
+      input.health?.recover('backup');
+    }
     catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup committed but health recovery could not be recorded'); }
     return durablyCommitted!;
   } catch (error) {
@@ -317,7 +330,7 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       return durablyCommitted;
     }
     if (error instanceof BackupPublicationUnknownError) {
-      try { reportPublicationUnknown(input.health); }
+      try { reportPublicationUnknown(input.health, error.target); }
       catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup publication is unknown but health reporting failed'); }
       throw error;
     }
@@ -338,14 +351,22 @@ export async function verifyBackup(input: VerifyBackupInput): Promise<VerifiedBa
     const verified = await verifyArchiveToFreshDirectory(input);
     const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(verified.snapshotRoot);
     await cleanupPrivateRoot(verified.root);
-    try { input.health?.recover('backup'); }
+    try {
+      if (verified.publicationTarget) input.health?.recover(verified.publicationTarget);
+      input.health?.recover('backup');
+    }
     catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup reconciled but health recovery could not be recorded'); }
     return { archivePath: input.archivePath, manifest: verified.manifest, outboxEvidence: evidence };
   } catch (error) {
-    const alreadyUnknown = healthHasPublicationUnknown(input.health);
-    if (error instanceof BackupPublicationUnknownError || alreadyUnknown) {
-      try { reportPublicationUnknown(input.health); }
+    const reconciliationTarget = await archivePublicationTarget(input.archivePath, input.pathSafety).catch(() => undefined);
+    const alreadyUnknown = healthHasPublicationUnknown(input.health, reconciliationTarget);
+    if (error instanceof BackupPublicationUnknownError) {
+      try { reportPublicationUnknown(input.health, error.target); }
       catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup reconciliation is unknown but health reporting failed'); }
+    }
+    else if (alreadyUnknown) {
+      // Preserve the existing archive-bound UNKNOWN. If the commit record is
+      // torn, no trustworthy identity can be derived for a replacement target.
     }
     else reportFailure(input.health);
     throw asBackupError(error);
@@ -466,7 +487,7 @@ async function recordRestoreEvidence(
 export async function applyRetention(input: RetentionInput): Promise<{ deleted: string[]; retained: string[] }> {
   try {
     if (healthHasPublicationUnknown(input.health)) {
-      throw new BackupPublicationUnknownError('Retention is disabled until the unknown backup publication is reconciled');
+      throw new BackupPublicationUnknownError('backup-publication:retention-gate', 'Retention is disabled until the unknown backup publication is reconciled');
     }
     const keep = Math.max(2, input.keep ?? 30);
     if (!Number.isSafeInteger(keep)) throw new BackupError('retention_invalid', 'Retention count is invalid');
@@ -514,23 +535,44 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     const deletionRoot = await canonicalDirectoryUnder(deletionRootPath, deletionParent, pathSafety);
     await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionParent, input.durabilityDiagnostic);
     for (const candidate of deletionCandidates) {
-      await assertArchiveEligible(candidate.path, pathSafety);
+      const didDelete = await withPublicationCoordination(root, async () => {
+      if (healthHasPublicationUnknown(input.health)) {
+        throw new BackupPublicationUnknownError(
+          'backup-publication:retention-gate',
+          'Retention is disabled until the unknown backup publication is reconciled',
+        );
+      }
+      const commitRecord = await assertArchiveEligible(candidate.path, pathSafety);
       const current = await lstat(candidate.path, { bigint: true });
       if (!sameStableFile(candidate.identity, current) || current.isSymbolicLink() || !current.isFile()
-        || await pathSafety.isReparsePoint(candidate.path)) continue;
+        || await pathSafety.isReparsePoint(candidate.path)) return false;
       const real = await realpath(candidate.path);
-      if (!within(root, real) || real !== candidate.path) continue;
+      if (!within(root, real) || real !== candidate.path) return false;
       const commitPath = `${candidate.path}.committed`;
+      const auditPath = `${candidate.path}.uncommitted`;
+      const hasAudit = await exists(auditPath);
       const archiveExpected = await identityDeleter.capture(candidate.path);
       const commitExpected = await identityDeleter.capture(commitPath);
+      const auditExpected = hasAudit ? await identityDeleter.capture(auditPath) : undefined;
       const deletionId = crypto.randomUUID();
       const tombstone = join(deletionRoot, `${basename(candidate.path)}.delete-${deletionId}`);
       const commitTombstone = join(deletionRoot, `${basename(candidate.path)}.committed.delete-${deletionId}`);
+      const auditTombstone = join(deletionRoot, `${basename(candidate.path)}.uncommitted.delete-${deletionId}`);
+      const journalPath = join(deletionRoot, `transaction-${deletionId}.json`);
+      await writeFile(journalPath, `${JSON.stringify({
+        version: 1,
+        archive: basename(candidate.path),
+        publicationTarget: publicationUnknownTarget(candidate.path, commitRecord),
+        hasAudit,
+        tombstones: [basename(tombstone), basename(commitTombstone), ...(hasAudit ? [basename(auditTombstone)] : [])],
+      })}\n`, { flag: 'wx', mode: 0o600 });
+      await (input.durability ?? defaultDurability).syncFile(journalPath);
+      const journalExpected = await identityDeleter.capture(journalPath);
       await publication.rename(candidate.path, tombstone);
       try {
-        if (await exists(`${candidate.path}.uncommitted`)) throw new BackupError('retention_marker_race', 'Archive publication marker appeared during retention');
         await publication.rename(commitPath, commitTombstone);
-        if (await exists(`${candidate.path}.uncommitted`)) throw new BackupError('retention_marker_race', 'Archive publication marker appeared during retention');
+        if (hasAudit) await publication.rename(auditPath, auditTombstone);
+        else if (await exists(auditPath)) throw new BackupError('retention_sidecar_changed', 'Retention audit sidecar appeared during deletion');
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionRoot, input.durabilityDiagnostic);
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, root, input.durabilityDiagnostic);
         const moved = await lstat(tombstone, { bigint: true });
@@ -545,6 +587,8 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
         }
         await identityDeleter.deleteOpened(tombstone, archiveExpected);
         await identityDeleter.deleteOpened(commitTombstone, commitExpected);
+        if (auditExpected) await identityDeleter.deleteOpened(auditTombstone, auditExpected);
+        await identityDeleter.deleteOpened(journalPath, journalExpected);
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionRoot, input.durabilityDiagnostic);
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, deletionParent, input.durabilityDiagnostic);
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, root, input.durabilityDiagnostic);
@@ -553,12 +597,16 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
         // namespace. No pathname-based unlink or unsafe restoration is allowed.
         throw error;
       }
-      deleted.push(candidate.path);
+      return true;
+      });
+      if (didDelete) deleted.push(candidate.path);
     }
     return { deleted, retained: verified.slice(0, Math.max(keep, 2)).map(item => item.path) };
   } catch (error) {
     if (error instanceof BackupPublicationUnknownError) {
-      try { reportPublicationUnknown(input.health); }
+      try {
+        if (error.target !== 'backup-publication:retention-gate') reportPublicationUnknown(input.health, error.target);
+      }
       catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup retention is blocked but health reporting failed'); }
     }
     else reportFailure(input.health);
@@ -588,6 +636,11 @@ function backupManifestId(manifest: BackupManifest): string {
 
 function backupManifestHash(manifest: BackupManifest): string {
   return sha256(Buffer.from(JSON.stringify(manifest), 'utf8'));
+}
+
+function publicationUnknownTarget(archivePath: string, record: ArchiveCommitRecord): string {
+  const identity = sha256(Buffer.from(`${resolve(archivePath).toLowerCase()}\0${record.sha256}\0${record.manifestHash}`, 'utf8'));
+  return `backup-publication:${identity}`;
 }
 
 async function readArchiveCommitRecord(
@@ -620,6 +673,12 @@ async function readArchiveCommitRecord(
     throw new BackupError('archive_commit_invalid', 'Backup commit evidence fields are invalid');
   }
   return record as unknown as ArchiveCommitRecord;
+}
+
+async function archivePublicationTarget(path: string, pathSafety?: PathSafety): Promise<string> {
+  const absolute = resolve(path);
+  const record = await readArchiveCommitRecord(absolute, pathSafety ?? DEFAULT_PATH_SAFETY);
+  return publicationUnknownTarget(absolute, record);
 }
 
 async function assertArchiveEligible(
@@ -750,7 +809,7 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
 
 async function verifyArchiveToFreshDirectory(
   input: VerifyBackupInput, requireEligible = true, coordinated = false,
-): Promise<{ root: string; snapshotRoot: string; manifest: BackupManifest }> {
+): Promise<{ root: string; snapshotRoot: string; manifest: BackupManifest; publicationTarget?: string }> {
   const age = input.ageRunner ?? new AgeExecRunner();
   const archivePath = resolve(input.archivePath);
   if (requireEligible && !coordinated) {
@@ -784,9 +843,17 @@ async function verifyArchiveToFreshDirectory(
     if (requireEligible) {
       try {
         await requirePublicationDirectorySync(input.durability ?? defaultDurability, dirname(archivePath), input.durabilityDiagnostic);
-      } catch { throw new BackupPublicationUnknownError('Backup reconciliation could not establish commit durability'); }
+      } catch {
+        throw new BackupPublicationUnknownError(
+          publicationUnknownTarget(archivePath, commitRecord!),
+          'Backup reconciliation could not establish commit durability',
+        );
+      }
     }
-    return { root, snapshotRoot, manifest };
+    return {
+      root, snapshotRoot, manifest,
+      ...(commitRecord ? { publicationTarget: publicationUnknownTarget(archivePath, commitRecord) } : {}),
+    };
   } catch (error) {
     await cleanupPrivateRoot(root).catch(() => undefined);
     throw error;
@@ -1690,17 +1757,17 @@ function reportFailure(health: SubsystemHealthJournal | undefined): void {
   health?.report({ errorCode: 'backup_failed', target: 'backup', message: 'Encrypted backup is unavailable' });
 }
 
-function reportPublicationUnknown(health: SubsystemHealthJournal | undefined): void {
+function reportPublicationUnknown(health: SubsystemHealthJournal | undefined, target?: string): void {
   health?.report({
-    errorCode: 'BACKUP_PUBLICATION_UNKNOWN', target: 'backup',
+    errorCode: 'BACKUP_PUBLICATION_UNKNOWN', target: target ?? 'backup-publication:unknown',
     message: 'Backup commit durability is unknown; run verified reconciliation before retention',
   });
 }
 
-function healthHasPublicationUnknown(health: SubsystemHealthJournal | undefined): boolean {
+function healthHasPublicationUnknown(health: SubsystemHealthJournal | undefined, target?: string): boolean {
   const listActive = (health as Partial<SubsystemHealthJournal> | undefined)?.listActive;
   return typeof listActive === 'function' && listActive.call(health).some(
-    error => error.target === 'backup' && error.errorCode === 'BACKUP_PUBLICATION_UNKNOWN',
+    error => error.errorCode === 'BACKUP_PUBLICATION_UNKNOWN' && (target === undefined || error.target === target),
   );
 }
 
