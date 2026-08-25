@@ -41,6 +41,14 @@ export class BackupError extends Error {
   }
 }
 
+export class BackupPublicationUnknownError extends BackupError {
+  readonly outcome = 'unknown' as const;
+  constructor(message = 'Backup publication outcome is unknown and requires verified reconciliation') {
+    super('publication_unknown', message);
+    this.name = 'BackupPublicationUnknownError';
+  }
+}
+
 export interface AgeRunner {
   encrypt(inputPath: string, outputPath: string, recipient: string, signal?: AbortSignal): Promise<void>;
   decrypt(inputPath: string, outputPath: string, identityFile: string, signal?: AbortSignal): Promise<void>;
@@ -67,6 +75,7 @@ interface BackupBase {
   durability?: BackupDurability;
   publicationOps?: BackupPublicationOps;
   durabilityDiagnostic?: (event: 'directory-synced' | 'directory-sync-unsupported', path: string) => void;
+  healthDiagnostic?: (event: 'health-recovery-failed', message: string) => void;
 }
 
 export interface PathSafety {
@@ -167,6 +176,7 @@ export interface VerifiedBackup {
 
 const ARCHIVE_MAGIC = Buffer.from('OCPABK01', 'ascii');
 const COMMIT_RECORD_VERSION = 1;
+const PUBLICATION_COORDINATORS = new Map<string, Promise<void>>();
 interface ArchiveCommitRecord {
   version: 1;
   archive: string;
@@ -174,6 +184,21 @@ interface ArchiveCommitRecord {
   sha256: string;
   manifestId: string;
   manifestHash: string;
+}
+
+async function withPublicationCoordination<T>(root: string, work: () => Promise<T>): Promise<T> {
+  const key = resolve(root).toLowerCase();
+  const previous = PUBLICATION_COORDINATORS.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+  const tail = previous.then(() => gate);
+  PUBLICATION_COORDINATORS.set(key, tail);
+  await previous;
+  try { return await work(); }
+  finally {
+    release();
+    if (PUBLICATION_COORDINATORS.get(key) === tail) PUBLICATION_COORDINATORS.delete(key);
+  }
 }
 export const BACKUP_ARCHIVE_LIMITS = Object.freeze({
   maxEntries: 1_000,
@@ -243,59 +268,58 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       throw new BackupError('archive_changed', 'Encrypted archive changed before publication');
     }
     await durability.syncFile(temporaryArchive);
-    const publicationMarker = incompleteMarker;
-    await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
-    await durability.syncFile(publicationMarker);
-    await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
-    await publication.rename(temporaryArchive, finalArchive);
-    temporaryArchive = undefined;
-    try {
-      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
-      const archiveEvidence = await hashFileBounded(finalArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
-      const commitRecord: ArchiveCommitRecord = {
-        version: COMMIT_RECORD_VERSION,
-        archive: basename(finalArchive),
-        size: archiveEvidence.size,
-        sha256: archiveEvidence.sha256,
-        manifestId: backupManifestId(manifest),
-        manifestHash: backupManifestHash(manifest),
-      };
-      await writeFile(temporaryCommit, `${JSON.stringify(commitRecord)}\n`, { flag: 'wx', mode: 0o600 });
-      await durability.syncFile(temporaryCommit);
-      const commitPath = `${finalArchive}.committed`;
-      await publication.rename(temporaryCommit, commitPath);
-      temporaryCommit = undefined;
-      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
-      await publication.unlink(publicationMarker);
-      await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
-      incompleteMarker = undefined;
-      await assertArchiveEligible(finalArchive, input.pathSafety, manifest);
-      durablyCommitted = { archivePath: finalArchive, manifest, outboxEvidence };
-    } catch (error) {
-      let markerRecoveryFailure: BackupError | undefined;
-      if (!(await exists(publicationMarker))) {
+    await withPublicationCoordination(backupRoot, async () => {
+      const publicationMarker = incompleteMarker!;
+      let finalPublished = false;
+      let commitAttempted = false;
+      try {
+        await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
+        await durability.syncFile(publicationMarker);
+        await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
+        await publication.rename(temporaryArchive!, finalArchive);
+        temporaryArchive = undefined;
+        finalPublished = true;
+        await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
+        const archiveEvidence = await hashFileBounded(finalArchive, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
+        const commitRecord: ArchiveCommitRecord = {
+          version: COMMIT_RECORD_VERSION,
+          archive: basename(finalArchive), size: archiveEvidence.size, sha256: archiveEvidence.sha256,
+          manifestId: backupManifestId(manifest), manifestHash: backupManifestHash(manifest),
+        };
+        await writeFile(temporaryCommit!, `${JSON.stringify(commitRecord)}\n`, { flag: 'wx', mode: 0o600 });
+        await durability.syncFile(temporaryCommit!);
+        commitAttempted = true;
+        await publication.rename(temporaryCommit!, `${finalArchive}.committed`);
+        temporaryCommit = undefined;
         try {
-          await writeFile(publicationMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
-          await durability.syncFile(publicationMarker);
+          await requirePublicationDirectorySync(durability, backupRoot, input.durabilityDiagnostic);
         } catch {
-          markerRecoveryFailure = new BackupError(
-            'archive_rollback_failed',
-            `Backup publication marker durability failed; retain ${basename(publicationMarker)} and reconcile the quarantined archive manually`,
-          );
+          throw new BackupPublicationUnknownError();
         }
+        durablyCommitted = { archivePath: finalArchive, manifest, outboxEvidence };
+      } catch (error) {
+        if (commitAttempted) {
+          if (error instanceof BackupPublicationUnknownError) throw error;
+          throw new BackupPublicationUnknownError();
+        }
+        if (finalPublished) await rollbackPublishedArchive(finalArchive, publicationMarker, backupRoot, durability, publication);
+        throw error;
       }
-      await rollbackPublishedArchive(finalArchive, publicationMarker, backupRoot, durability, publication);
-      if (markerRecoveryFailure) throw markerRecoveryFailure;
-      throw error instanceof BackupError ? error : new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
-    }
+    });
     await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety }).catch(() => undefined);
-    input.health?.recover('backup');
-    return durablyCommitted;
+    try { input.health?.recover('backup'); }
+    catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup committed but health recovery could not be recorded'); }
+    return durablyCommitted!;
   } catch (error) {
     if (durablyCommitted) {
       // The archive is already a durable recovery point. A later explicit
       // verification can reconcile a temporarily unavailable health journal.
       return durablyCommitted;
+    }
+    if (error instanceof BackupPublicationUnknownError) {
+      try { reportPublicationUnknown(input.health); }
+      catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup publication is unknown but health reporting failed'); }
+      throw error;
     }
     reportFailure(input.health);
     if (workRoot && plaintextStaged) {
@@ -314,10 +338,16 @@ export async function verifyBackup(input: VerifyBackupInput): Promise<VerifiedBa
     const verified = await verifyArchiveToFreshDirectory(input);
     const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(verified.snapshotRoot);
     await cleanupPrivateRoot(verified.root);
-    input.health?.recover('backup');
+    try { input.health?.recover('backup'); }
+    catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup reconciled but health recovery could not be recorded'); }
     return { archivePath: input.archivePath, manifest: verified.manifest, outboxEvidence: evidence };
   } catch (error) {
-    reportFailure(input.health);
+    const alreadyUnknown = healthHasPublicationUnknown(input.health);
+    if (error instanceof BackupPublicationUnknownError || alreadyUnknown) {
+      try { reportPublicationUnknown(input.health); }
+      catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup reconciliation is unknown but health reporting failed'); }
+    }
+    else reportFailure(input.health);
     throw asBackupError(error);
   }
 }
@@ -435,6 +465,9 @@ async function recordRestoreEvidence(
 
 export async function applyRetention(input: RetentionInput): Promise<{ deleted: string[]; retained: string[] }> {
   try {
+    if (healthHasPublicationUnknown(input.health)) {
+      throw new BackupPublicationUnknownError('Retention is disabled until the unknown backup publication is reconciled');
+    }
     const keep = Math.max(2, input.keep ?? 30);
     if (!Number.isSafeInteger(keep)) throw new BackupError('retention_invalid', 'Retention count is invalid');
     const pathSafety = input.pathSafety ?? DEFAULT_PATH_SAFETY;
@@ -524,7 +557,11 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     }
     return { deleted, retained: verified.slice(0, Math.max(keep, 2)).map(item => item.path) };
   } catch (error) {
-    reportFailure(input.health);
+    if (error instanceof BackupPublicationUnknownError) {
+      try { reportPublicationUnknown(input.health); }
+      catch { input.healthDiagnostic?.('health-recovery-failed', 'Backup retention is blocked but health reporting failed'); }
+    }
+    else reportFailure(input.health);
     throw asBackupError(error);
   }
 }
@@ -593,15 +630,23 @@ async function assertArchiveEligible(
   if (!ARCHIVE_NAME.test(name) || !validArchiveDate(name)) {
     throw new BackupError('archive_ineligible', 'Backup archive name is not an eligible recovery point');
   }
-  if (await exists(`${absolute}.uncommitted`)) {
-    throw new BackupError('archive_uncommitted', 'Backup archive publication is incomplete');
-  }
+  const hasUncommittedAudit = await exists(`${absolute}.uncommitted`);
   const info = await lstat(absolute, { bigint: true }).catch(() => undefined);
-  if (!info) throw new BackupError('archive_commit_missing', 'Backup archive is not a durable committed recovery point');
+  if (!info) {
+    if (hasUncommittedAudit) throw new BackupError('archive_uncommitted', 'Backup archive commit attempt is incomplete');
+    throw new BackupError('archive_commit_missing', 'Backup archive is not a durable committed recovery point');
+  }
   if (!info.isFile() || info.isSymbolicLink() || await (pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(absolute)
     || await realpath(absolute) !== absolute) throw new BackupError('archive_ineligible', 'Backup archive path is unsafe');
   const safety = pathSafety ?? DEFAULT_PATH_SAFETY;
-  const record = await readArchiveCommitRecord(absolute, safety);
+  let record: ArchiveCommitRecord;
+  try { record = await readArchiveCommitRecord(absolute, safety); }
+  catch (error) {
+    if (hasUncommittedAudit && error instanceof BackupError && error.code === 'archive_commit_missing') {
+      throw new BackupError('archive_uncommitted', 'Backup archive commit attempt is incomplete');
+    }
+    throw error;
+  }
   const evidence = await hashFileBounded(absolute, BACKUP_ARCHIVE_LIMITS.maxArchiveBytes);
   const after = await lstat(absolute, { bigint: true });
   if (!sameStableFile(info, after) || evidence.size !== record.size || evidence.sha256 !== record.sha256) {
@@ -703,9 +748,14 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
   return manifest;
 }
 
-async function verifyArchiveToFreshDirectory(input: VerifyBackupInput, requireEligible = true) {
+async function verifyArchiveToFreshDirectory(
+  input: VerifyBackupInput, requireEligible = true, coordinated = false,
+): Promise<{ root: string; snapshotRoot: string; manifest: BackupManifest }> {
   const age = input.ageRunner ?? new AgeExecRunner();
   const archivePath = resolve(input.archivePath);
+  if (requireEligible && !coordinated) {
+    return withPublicationCoordination(dirname(archivePath), () => verifyArchiveToFreshDirectory(input, true, true));
+  }
   const commitRecord = requireEligible ? await assertArchiveEligible(archivePath, input.pathSafety) : undefined;
   const archiveStat = await lstat(archivePath, { bigint: true });
   if (!archiveStat.isFile() || archiveStat.isSymbolicLink()
@@ -730,6 +780,11 @@ async function verifyArchiveToFreshDirectory(input: VerifyBackupInput, requireEl
     if (commitRecord && (commitRecord.manifestId !== backupManifestId(manifest)
       || commitRecord.manifestHash !== backupManifestHash(manifest))) {
       throw new BackupError('archive_commit_mismatch', 'Verified manifest does not match durable commit evidence');
+    }
+    if (requireEligible) {
+      try {
+        await requirePublicationDirectorySync(input.durability ?? defaultDurability, dirname(archivePath), input.durabilityDiagnostic);
+      } catch { throw new BackupPublicationUnknownError('Backup reconciliation could not establish commit durability'); }
     }
     return { root, snapshotRoot, manifest };
   } catch (error) {
@@ -1633,6 +1688,20 @@ function assertNonSecretInputs(input: CreateBackupInput): void {
 
 function reportFailure(health: SubsystemHealthJournal | undefined): void {
   health?.report({ errorCode: 'backup_failed', target: 'backup', message: 'Encrypted backup is unavailable' });
+}
+
+function reportPublicationUnknown(health: SubsystemHealthJournal | undefined): void {
+  health?.report({
+    errorCode: 'BACKUP_PUBLICATION_UNKNOWN', target: 'backup',
+    message: 'Backup commit durability is unknown; run verified reconciliation before retention',
+  });
+}
+
+function healthHasPublicationUnknown(health: SubsystemHealthJournal | undefined): boolean {
+  const listActive = (health as Partial<SubsystemHealthJournal> | undefined)?.listActive;
+  return typeof listActive === 'function' && listActive.call(health).some(
+    error => error.target === 'backup' && error.errorCode === 'BACKUP_PUBLICATION_UNKNOWN',
+  );
 }
 
 function asBackupError(error: unknown): BackupError {
