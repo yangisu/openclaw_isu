@@ -14,6 +14,11 @@ const configPath = resolve(process.cwd(), '../../config/openclaw.personal-assist
 const cronEvidencePath = resolve(process.cwd(), '../../config/personal-assistant-hourly-briefing.cron-evidence.json');
 
 describe('hardened OpenClaw example config', () => {
+  it('binds the Gateway explicitly to loopback', async () => {
+    const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
+    expect(config.gateway).toEqual({ bind: 'loopback' });
+  });
+
   it('allows only one numeric Telegram owner and disables groups and config writes', async () => {
     const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
     expect(config.channels.telegram).toMatchObject({

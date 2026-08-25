@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "openclaw-personal-assistant": "./dist/cli.js"
+  },
   "engines": {
     "node": ">=24.15.0 <25"
   },

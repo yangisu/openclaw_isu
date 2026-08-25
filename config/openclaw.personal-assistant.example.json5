@@ -1,4 +1,10 @@
 {
+  gateway: {
+    bind: 'loopback',
+  },
+  cron: {
+    triggers: { enabled: true },
+  },
   channels: {
     telegram: {
       enabled: true,

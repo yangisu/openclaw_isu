@@ -1,0 +1,16 @@
+{
+  "plugins": {
+    "entries": {
+      "openclaw-personal-assistant": {
+        "enabled": true,
+        "config": {
+          "workspaceDir": "/tmp/openclaw-personal-assistant/workspace",
+          "stateDir": "/tmp/openclaw-personal-assistant/state",
+          "backupDir": "/tmp/openclaw-personal-assistant/backup",
+          "telegramUserId": "123456789",
+          "timezone": "Asia/Seoul"
+        }
+      }
+    }
+  }
+}
