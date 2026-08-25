@@ -108,6 +108,57 @@ async function restart(
 }
 
 describe('WorkspaceRepository', () => {
+  it('AC-16 preserves uncommitted changes during ten concurrent adds and reads with parseable unique IDs', async () => {
+    const { repo, workspace } = await fixture();
+    await writeFile(join(workspace, 'staged-owner.txt'), 'staged owner change\n');
+    await writeFile(join(workspace, 'unstaged-owner.txt'), 'unstaged owner change\n');
+    git(workspace, 'add', '--', 'staged-owner.txt');
+    const additions = Array.from({ length: 10 }, (_, index) => repo.addTask(`ac16-${index}`, taskInput(index)));
+    const reads = Array.from({ length: 10 }, () => repo.query({ kind: 'task' }));
+
+    const [added, queried] = await Promise.all([Promise.all(additions), Promise.all(reads)]);
+
+    expect(new Set(added.map(item => item.id)).size).toBe(10);
+    expect(queried.every(records => Array.isArray(records))).toBe(true);
+    expect(parseDocument('task', await readFile(join(workspace, 'TASKS.md'), 'utf8')).records).toHaveLength(10);
+    expect(git(workspace, 'status', '--short')).toContain('A  staged-owner.txt');
+    expect(git(workspace, 'status', '--short')).toContain('?? unstaged-owner.txt');
+  }, 30_000);
+
+  it('AC-17 interruption immediately before replacement preserves original bytes and removes the temporary file', async () => {
+    const { repo, workspace } = await fixture(phase => {
+      if (phase === 'beforeRename') throw new Error('interrupt-before-replace');
+    });
+    const original = await readFile(join(workspace, 'TASKS.md'), 'utf8');
+
+    await expect(repo.addTask('ac17-before-replace', taskInput(1))).rejects.toThrow('interrupt-before-replace');
+
+    expect(await readFile(join(workspace, 'TASKS.md'), 'utf8')).toBe(original);
+    expect((await readdir(workspace)).filter(name => name.startsWith('TASKS.md.tmp-'))).toEqual([]);
+  });
+
+  it('AC-06 updates task completion and study progress then archives both records', async () => {
+    const { repo, workspace } = await fixture();
+    await writeFile(join(workspace, 'STUDY.md'), [
+      '# Study', '', '### S-20260825-001 Korean', '- type: "study"', '- status: in_progress',
+      '- subject: "Korean"', '- target_amount: 10', '- unit: "pages"', '- progress: 1',
+      '- recurrence: none', '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "telegram"', '', 'Study body', '',
+    ].join('\n'));
+    git(workspace, 'add', '--', 'STUDY.md');
+    git(workspace, 'commit', '--quiet', '-m', 'add study acceptance record');
+    const task = await repo.addTask('ac06-add-task', taskInput(1));
+    await repo.updateRecord('ac06-complete-task', task.id, { fields: { status: 'done', completed_at: '2026-08-25T09:03:00+09:00' } });
+    await repo.updateRecord('ac06-progress-study', 'S-20260825-001', { fields: { progress: 10, status: 'done' } });
+    await repo.archiveRecord('ac06-archive-task', task.id, 'completed');
+    await repo.archiveRecord('ac06-archive-study', 'S-20260825-001', 'completed');
+
+    expect(await repo.query({ kind: 'task' })).toEqual([]);
+    expect(await repo.query({ kind: 'study' })).toEqual([]);
+    expect((await repo.query({ includeArchived: true })).map(record => record.id).sort())
+      .toEqual(['S-20260825-001', task.id].sort());
+  });
+
   it('allocates ten unique IDs under concurrent adds', async () => {
     const { repo, workspace } = await fixture();
     const results = await Promise.all(

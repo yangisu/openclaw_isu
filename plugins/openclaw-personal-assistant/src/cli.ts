@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /// <reference types="node" />
 
-import { lstat, mkdir, open, readFile, realpath } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -10,6 +10,7 @@ import {
   BackupError, BackupPublicationUnknownError, createBackup, restoreBackup, verifyBackup,
 } from './ops/backup.js';
 import { openRepository } from './workspace/repository.js';
+import { SubsystemHealthStore } from './state/health.js';
 
 export interface CliIo {
   stdout(value: string): void;
@@ -55,7 +56,6 @@ async function init(args: readonly string[], io: CliIo): Promise<number> {
   await assertDirectPath(root, true);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await assertDirectPath(root, false);
-  setWindowsPrivateAcl(root);
   const directories = ['workspace', 'workspace/memory', 'workspace/archive', 'state', 'state/gates', 'secrets', 'config'];
   for (const name of directories) {
     const path = join(root, name);
@@ -63,6 +63,7 @@ async function init(args: readonly string[], io: CliIo): Promise<number> {
     await mkdir(path, { recursive: true, mode: 0o700 });
     await assertDirectPath(path, false, false);
   }
+  for (const path of [root, ...directories.map(name => join(root, name))]) await enforcePrivateDirectory(path);
   const templates = new Map([
     ['workspace/INBOX.md', '# Inbox\n'], ['workspace/TASKS.md', '# Tasks\n'],
     ['workspace/NOTES.md', '# Notes\n'], ['workspace/STUDY.md', '# Study\n'],
@@ -95,8 +96,7 @@ async function poc(args: readonly string[], io: CliIo): Promise<number> {
   const state = requiredAbsolute(options, 'state');
   const evidencePath = requiredAbsolute(options, 'evidence');
   await assertDirectPath(evidencePath, false);
-  const evidence = parseEvidence(await readFile(evidencePath, 'utf8'));
-  const safe = sanitizeEvidence(evidence);
+  const safe = parseEvidence(await readFile(evidencePath, 'utf8'), true);
   await assertDirectPath(state, true);
   await mkdir(join(state, 'gates'), { recursive: true, mode: 0o700 });
   await assertDirectPath(join(state, 'gates'), false);
@@ -116,7 +116,9 @@ async function doctor(args: readonly string[], io: CliIo): Promise<number> {
     let status: GateStatus = 'unknown';
     try {
       const evidence = parseEvidence(await readFile(join(state, 'gates', `${gate}.json`), 'utf8'));
-      status = Date.now() - new Date(evidence.timestamp).valueOf() > maxAgeHours * 3_600_000 ? 'expired' : evidence.status;
+      const age = Date.now() - new Date(evidence.timestamp).valueOf();
+      status = age < -5 * 60_000 ? 'unknown'
+        : age > maxAgeHours * 3_600_000 ? 'expired' : evidence.status;
     } catch { status = 'unknown'; }
     observed.push({ gate, status });
   }
@@ -131,12 +133,17 @@ async function doctor(args: readonly string[], io: CliIo): Promise<number> {
 async function backup(args: readonly string[], io: CliIo): Promise<number> {
   const reconcile = args[0] === 'reconcile';
   const optionArgs = reconcile ? args.slice(1) : args;
-  const allowed = reconcile ? ['archive', 'identity'] : ['workspace', 'state', 'backup-dir', 'identity', 'recipient'];
+  const allowed = reconcile ? ['archive', 'identity', 'state'] : ['workspace', 'state', 'backup-dir', 'identity', 'recipient'];
   const options = parseOptions(optionArgs, allowed);
   if (reconcile) {
-    const result = await verifyBackup({ archivePath: requiredAbsolute(options, 'archive'), identityFile: requiredAbsolute(options, 'identity') });
-    io.stdout(JSON.stringify({ status: 'open', observedChecks: ['exact archive publication reconciled'], archive: result.archivePath, redactedErrorCode: null, timestamp: now() }));
-    return EXIT.ok;
+    const health = new SubsystemHealthStore(requiredAbsolute(options, 'state'));
+    try {
+      const result = await verifyBackup({
+        archivePath: requiredAbsolute(options, 'archive'), identityFile: requiredAbsolute(options, 'identity'), health,
+      });
+      io.stdout(JSON.stringify({ status: 'open', observedChecks: ['exact archive publication reconciled'], archive: result.archivePath, redactedErrorCode: null, timestamp: now() }));
+      return EXIT.ok;
+    } finally { health.close(); }
   }
   const workspaceDir = requiredAbsolute(options, 'workspace');
   const stateDir = requiredAbsolute(options, 'state');
@@ -144,10 +151,14 @@ async function backup(args: readonly string[], io: CliIo): Promise<number> {
   const identityFile = requiredAbsolute(options, 'identity');
   const recipient = required(options, 'recipient');
   if (!/^age1[0-9a-z]{10,}$/.test(recipient)) throw usageError('invalid age recipient');
-  const repository = await openRepository({ workspaceDir, stateDir, backupDir, telegramUserId: '123456789', timezone: 'Asia/Seoul' });
-  const result = await createBackup({ repository, workspaceDir, stateDir, backupDir, identityFile, recipient });
-  io.stdout(JSON.stringify({ status: 'open', observedChecks: ['encrypted archive verified and durably committed'], archive: result.archivePath, redactedErrorCode: null, timestamp: now() }));
-  return EXIT.ok;
+  const health = new SubsystemHealthStore(stateDir);
+  let repository: Awaited<ReturnType<typeof openRepository>> | undefined;
+  try {
+    repository = await openRepository({ workspaceDir, stateDir, backupDir, telegramUserId: '123456789', timezone: 'Asia/Seoul' });
+    const result = await createBackup({ repository, workspaceDir, stateDir, backupDir, identityFile, recipient, health });
+    io.stdout(JSON.stringify({ status: 'open', observedChecks: ['encrypted archive verified and durably committed'], archive: result.archivePath, redactedErrorCode: null, timestamp: now() }));
+    return EXIT.ok;
+  } finally { repository?.close(); health.close(); }
 }
 
 async function restore(args: readonly string[], io: CliIo): Promise<number> {
@@ -245,6 +256,17 @@ function setWindowsPrivateAcl(path: string): void {
   } catch { throw pathError(); }
 }
 
+async function enforcePrivateDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') {
+    setWindowsPrivateAcl(path);
+    return;
+  }
+  await chmod(path, 0o700);
+  const info = await stat(path);
+  if (!info.isDirectory() || (info.mode & 0o777) !== 0o700
+    || (typeof process.getuid === 'function' && info.uid !== process.getuid())) throw pathError();
+}
+
 function windowsPowerShellEnv(name: string, value: string): NodeJS.ProcessEnv {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'psmodulepath'));
   env[name] = value;
@@ -259,26 +281,38 @@ async function writeExclusiveOrReplaceTemplate(path: string, content: string): P
   await rename(temporary, path);
 }
 
-function parseEvidence(source: string): GateEvidence {
+function parseEvidence(source: string, requireFresh = false): GateEvidence {
   let value: unknown;
   try { value = JSON.parse(source); } catch { throw usageError('invalid evidence'); }
-  const item = value as Partial<GateEvidence>;
-  if (!item || !['open', 'closed', 'unknown', 'expired'].includes(String(item.status))
-    || !Array.isArray(item.observedChecks) || item.observedChecks.some(check => typeof check !== 'string')
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw usageError('invalid evidence');
+  const item = value as Record<string, unknown>;
+  const exactKeys = ['observedChecks', 'redactedErrorCode', 'status', 'timestamp'];
+  if (Object.keys(item).sort().join('\0') !== exactKeys.join('\0')
+    || !['open', 'closed', 'unknown', 'expired'].includes(String(item.status))
+    || !Array.isArray(item.observedChecks) || item.observedChecks.length < 1 || item.observedChecks.length > 32
+    || item.observedChecks.some(check => typeof check !== 'string' || !safeObservedCheck(check))
     || !(item.redactedErrorCode === null || /^[A-Z][A-Z0-9_]{1,63}$/.test(String(item.redactedErrorCode)))
-    || typeof item.timestamp !== 'string' || !Number.isFinite(new Date(item.timestamp).valueOf())) throw usageError('invalid evidence');
-  return item as GateEvidence;
+    || typeof item.timestamp !== 'string') throw usageError('invalid evidence');
+  const observedAt = new Date(item.timestamp).valueOf();
+  if (!Number.isFinite(observedAt) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(item.timestamp)
+    || (requireFresh && (Date.now() - observedAt > 24 * 3_600_000 || observedAt - Date.now() > 5 * 60_000))) {
+    throw usageError('invalid evidence');
+  }
+  return {
+    status: item.status as GateStatus,
+    observedChecks: [...item.observedChecks] as string[],
+    redactedErrorCode: item.redactedErrorCode as string | null,
+    timestamp: item.timestamp,
+  };
 }
 
-function sanitizeEvidence(value: GateEvidence): GateEvidence {
-  return { ...value, observedChecks: value.observedChecks.map(redact), redactedErrorCode: value.redactedErrorCode };
-}
-
-function redact(value: string): string {
-  return value
-    .replace(/https?:\/\/[^\s/@]+:[^\s/@]+@/giu, 'https://[REDACTED]@')
-    .replace(/([?&](?:token|code|secret|key)=)[^&\s]+/giu, '$1[REDACTED]')
-    .replace(/\b(?:Bearer\s+)?[A-Za-z0-9_-]{32,}\b/gu, '[REDACTED]');
+function safeObservedCheck(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !/[\p{Cc}\p{Cf}]/u.test(value)
+    && !/https?:\/\//iu.test(value)
+    && !/(?:^|[?&])(?:token|code|secret|key|api[_-]?key|refresh[_-]?token)=/iu.test(value)
+    && !/\b(?:token|code|secret|key|api[_-]?key|apiKey|refresh[_-]?token|refreshToken)\s*[:=]\s*\S+/iu.test(value)
+    && !/\b(?:Bearer\s+|sk-)[A-Za-z0-9_.-]{16,}\b/iu.test(value)
+    && !/\b[A-Za-z0-9_-]{32,}\b/u.test(value);
 }
 
 function rejectSensitiveArguments(args: readonly string[]): void {

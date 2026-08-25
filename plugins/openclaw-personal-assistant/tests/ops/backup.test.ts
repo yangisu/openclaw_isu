@@ -763,23 +763,38 @@ describe('encrypted verified backup', () => {
     f.outbox.close(); f.alerts.close(); f.health.close();
   });
 
-  it('deletes only verified oldest archives while retaining at least two recovery points', async () => {
+  it('AC-31 deletes only backups older than 30 days while retaining at least two recovery points', async () => {
     const f = await fixture(); const identityDeleter = new PortableTestIdentityDeleter();
-    for (const day of ['23', '24', '25']) {
+    for (const date of ['2026-06-20', '2026-07-27', '2026-08-01', '2026-08-25']) {
       await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
-        now: () => new Date(`2026-08-${day}T00:00:00.000Z`) });
+        now: () => new Date(`${date}T00:00:00.000Z`) });
     }
     const result = await applyRetention({
       backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2, health: f.health, identityDeleter,
+      now: () => new Date('2026-08-25T00:00:00.000Z'),
     });
-    expect(result.deleted.map(path => path.split(/[\\/]/).at(-1))).toEqual(['2026-08-23.age']);
-    await expect(stat(join(f.backupDir, '2026-08-24.age'))).resolves.toMatchObject({ size: expect.any(Number) });
+    expect(result.deleted.map(path => path.split(/[\\/]/).at(-1))).toEqual(['2026-06-20.age']);
+    await expect(stat(join(f.backupDir, '2026-07-27.age'))).resolves.toMatchObject({ size: expect.any(Number) });
+    await expect(stat(join(f.backupDir, '2026-08-01.age'))).resolves.toMatchObject({ size: expect.any(Number) });
     await expect(stat(join(f.backupDir, '2026-08-25.age'))).resolves.toMatchObject({ size: expect.any(Number) });
     expect((await readdir(f.backupDir)).filter(name => name.endsWith('.age')).sort())
-      .toEqual(['2026-08-24.age', '2026-08-25.age']);
+      .toEqual(['2026-07-27.age', '2026-08-01.age', '2026-08-25.age']);
     expect(identityDeleter.deletes).toHaveLength(4);
     expect(identityDeleter.deletes.every(call => call.path.includes('.retention-delete'))).toBe(true);
     f.outbox.close(); f.alerts.close(); f.health.close();
+  }, 30_000);
+
+  it('AC-30 rejects an exact one-byte manifest corruption', async () => {
+    const f = await fixture();
+    const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age });
+    const oneByteCorruptingAge = new FakeAge('test-key', bundle => {
+      const manifest = bundle.files.find(entry => entry.path === 'manifest.json')!;
+      manifest.data[10] ^= 1;
+    });
+
+    await expect(verifyBackup({
+      archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: oneByteCorruptingAge, health: f.health,
+    })).rejects.toMatchObject({ code: 'archive_hash_mismatch' });
   }, 30_000);
 
   it('fails closed when identity-bound retention deletion is unavailable', async () => {
@@ -793,7 +808,8 @@ describe('encrypted verified backup', () => {
       async deleteOpened() { throw new Error('unreachable'); },
     };
     await expect(applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age,
-      keep: 2, identityDeleter: unavailable })).rejects.toMatchObject({ code: 'retention_identity_delete_unavailable' });
+      keep: 2, identityDeleter: unavailable, now: () => new Date('2026-09-30T00:00:00.000Z') }))
+      .rejects.toMatchObject({ code: 'retention_identity_delete_unavailable' });
     await expect(stat(join(f.backupDir, '2026-08-23.age'))).resolves.toBeDefined();
     await expect(stat(join(f.backupDir, '2026-08-23.age.committed'))).resolves.toBeDefined();
   }, 30_000);
@@ -806,6 +822,7 @@ describe('encrypted verified backup', () => {
     await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
     let oldestChecks = 0;
     const result = await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
+      now: () => new Date('2026-09-30T00:00:00.000Z'),
       pathSafety: { async isReparsePoint(path) { if (path.endsWith('2026-08-23.age')) { oldestChecks += 1; return oldestChecks >= 3; } return false; } } });
     expect(oldestChecks).toBe(3); expect(result.deleted).toEqual([]);
     await expect(stat(join(f.backupDir, '2026-08-23.age'))).resolves.toBeDefined();
@@ -827,7 +844,8 @@ describe('encrypted verified backup', () => {
       await PortableTestIdentityDeleter.prototype.deleteOpened.call(swapping, path, expected);
     };
     await expect(applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
-      identityDeleter: swapping, durability: { async syncFile() {}, async syncDirectory() {} } }))
+      identityDeleter: swapping, durability: { async syncFile() {}, async syncDirectory() {} },
+      now: () => new Date('2026-09-30T00:00:00.000Z') }))
       .rejects.toMatchObject({ code: 'retention_identity_changed' });
     const names = await readdir(join(f.backupDir, '.retention-delete'), { recursive: true });
     expect(names.some(name => name.includes('.delete-') && !name.endsWith('.verified-inode'))).toBe(true);
@@ -849,7 +867,8 @@ describe('encrypted verified backup', () => {
       async unlink(path) { await unlink(path); },
     };
     await expect(applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age,
-      keep: 2, identityDeleter, publicationOps })).rejects.toMatchObject({ code: 'EIO' });
+      keep: 2, identityDeleter, publicationOps, now: () => new Date('2026-09-30T00:00:00.000Z') }))
+      .rejects.toMatchObject({ code: 'EIO' });
     expect(identityDeleter.deletes).toEqual([]);
     await expect(stat(`${oldest}.committed`)).resolves.toBeDefined();
     await expect(stat(`${oldest}.uncommitted`)).resolves.toBeDefined();

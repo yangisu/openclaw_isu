@@ -167,6 +167,7 @@ export interface ScheduledRestoreInput extends RestoreBackupInput {
 export interface RetentionInput extends BackupBase {
   backupDir: string;
   keep?: number;
+  now?: () => Date;
   candidatePaths?: readonly string[];
   identityDeleter?: IdentityBoundDeleter;
 }
@@ -519,7 +520,10 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     }
     verified.sort((left, right) => basename(right.path).localeCompare(basename(left.path)));
     const deleted: string[] = [];
-    const deletionCandidates = verified.slice(keep);
+    const retentionNow = (input.now ?? (() => new Date()))();
+    if (!Number.isFinite(retentionNow.valueOf())) throw new BackupError('retention_invalid', 'Retention clock is invalid');
+    const deletionCandidates = verified.slice(keep)
+      .filter(candidate => archiveAgeDays(basename(candidate.path), retentionNow) > 30);
     if (deletionCandidates.length === 0) {
       return { deleted, retained: verified.slice(0, Math.max(keep, 2)).map(item => item.path) };
     }
@@ -1797,6 +1801,16 @@ function seoulDate(date: Date): string {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date);
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find(part => part.type === type)!.value;
   return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+function archiveAgeDays(archiveName: string, now: Date): number {
+  const archiveDate = archiveName.slice(0, 10);
+  const currentDate = seoulDate(now);
+  const ordinal = (value: string): number => {
+    const [year, month, day] = value.split('-').map(Number);
+    return Date.UTC(year!, month! - 1, day!) / 86_400_000;
+  };
+  return ordinal(currentDate) - ordinal(archiveDate);
 }
 
 function validArchiveDate(name: string): boolean {

@@ -93,7 +93,7 @@ Do not change the principal to `SYSTEM`. Do not add a firewall inbound rule or p
 
 ## 5. PoC gates
 
-Each PoC must produce a local JSON evidence file containing only `status`, `observedChecks`, `redactedErrorCode`, and `timestamp`. Allowed status values are `open`, `closed`, `unknown`, and `expired`. Remove credentials, credential-bearing URLs, OAuth codes, and tokens before importing evidence:
+Each PoC must produce a local JSON evidence file containing exactly `status`, `observedChecks`, `redactedErrorCode`, and `timestamp`, with no additional or nested fields. Allowed status values are `open`, `closed`, `unknown`, and `expired`. Evidence must be current within 24 hours and no more than five minutes in the future. Checks containing control/format characters, URLs, OAuth codes, keys, or token-like values are rejected rather than redacted or persisted:
 
 ```bash
 node plugins/openclaw-personal-assistant/dist/cli.js poc openai --state "$HOME/.openclaw/state/openclaw-personal-assistant" --evidence /absolute/path/openai-redacted.json
@@ -117,6 +117,7 @@ node plugins/openclaw-personal-assistant/dist/cli.js backup \
   --identity /absolute/offline/age-identity \
   --recipient age1REPLACE_WITH_PUBLIC_RECIPIENT
 
+install -d -m 700 /absolute/new/isolated-restore-root
 node plugins/openclaw-personal-assistant/dist/cli.js restore \
   --archive /absolute/path/YYYY-MM-DD.age \
   --restore-root /absolute/new/isolated-restore-root \
@@ -130,6 +131,7 @@ If backup exits with code 3 and `publication_unknown`, do not count it, alert on
 ```bash
 node plugins/openclaw-personal-assistant/dist/cli.js backup reconcile \
   --archive /absolute/path/YYYY-MM-DD.age \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant" \
   --identity /absolute/offline/age-identity
 ```
 

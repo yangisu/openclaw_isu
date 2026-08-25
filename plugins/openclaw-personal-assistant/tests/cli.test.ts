@@ -1,9 +1,12 @@
-import { lstat, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { runCli, type CliIo } from '../src/cli.js';
+import { buildBriefing } from '../src/briefing/build.js';
+import { applyRetention } from '../src/ops/backup.js';
+import { SubsystemHealthStore } from '../src/state/health.js';
 
 function capture(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -48,16 +51,64 @@ describe('operational CLI', () => {
     const evidence = join(root, 'evidence.json');
     await writeFile(evidence, JSON.stringify({
       status: 'closed',
-      observedChecks: ['authentication rejected for https://user:token@example.invalid/path'],
+      observedChecks: ['authentication rejected without credential disclosure'],
       redactedErrorCode: 'CALDAV_AUTH',
-      timestamp: '2026-08-25T00:00:00Z',
+      timestamp: new Date().toISOString(),
     }));
     const poc = capture();
     expect(await runCli(['poc', 'caldav', '--state', state, '--evidence', evidence], poc.io)).toBe(1);
-    expect(poc.stdout.join('')).not.toContain('token@');
+    expect(poc.stdout.join('')).toContain('authentication rejected without credential disclosure');
     const doctor = capture();
     expect(await runCli(['doctor', '--state', state], doctor.io)).toBe(1);
     expect(doctor.stdout.join('')).toContain('caldav: closed');
+  });
+
+  it('rejects extra PoC evidence fields before secrets can reach stdout or durable state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-gate-extra-'));
+    const state = join(root, 'state');
+    const evidence = join(root, 'evidence.json');
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    await writeFile(evidence, JSON.stringify({
+      status: 'open', observedChecks: ['model response observed'], redactedErrorCode: null,
+      timestamp: new Date().toISOString(), refreshToken: secret, nested: { apiKey: secret },
+    }));
+    const output = capture();
+
+    expect(await runCli(['poc', 'openai', '--state', state, '--evidence', evidence], output.io)).toBe(64);
+    expect(output.stdout.join('')).toBe('');
+    expect(output.stderr.join('')).not.toContain(secret);
+    await expect(lstat(join(state, 'gates', 'openai.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.each([
+    ['unsafe URL', ['callback https://example.invalid/?code=secret-value'], new Date().toISOString()],
+    ['control character', ['line\u0000break'], new Date().toISOString()],
+    ['format character', ['hidden\u202Evalue'], new Date().toISOString()],
+    ['expired timestamp', ['model response observed'], '2020-01-01T00:00:00Z'],
+    ['future timestamp', ['model response observed'], new Date(Date.now() + 60 * 60_000).toISOString()],
+  ])('rejects %s in PoC evidence', async (_label, observedChecks, timestamp) => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-gate-invalid-'));
+    const evidence = join(root, 'evidence.json');
+    await writeFile(evidence, JSON.stringify({ status: 'open', observedChecks, redactedErrorCode: null, timestamp }));
+    const output = capture();
+    expect(await runCli(['poc', 'openai', '--state', join(root, 'state'), '--evidence', evidence], output.io)).toBe(64);
+    expect(output.stdout).toEqual([]);
+  });
+
+  it('emits and persists only the exact four PoC evidence fields', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-gate-fields-'));
+    const state = join(root, 'state');
+    const evidence = join(root, 'evidence.json');
+    await writeFile(evidence, JSON.stringify({
+      status: 'open', observedChecks: ['model response observed'], redactedErrorCode: null,
+      timestamp: new Date().toISOString(),
+    }));
+    const output = capture();
+    expect(await runCli(['poc', 'openai', '--state', state, '--evidence', evidence], output.io)).toBe(0);
+    const printed = JSON.parse(output.stdout[0]!);
+    const stored = JSON.parse(await readFile(join(state, 'gates', 'openai.json'), 'utf8'));
+    expect(Object.keys(printed).sort()).toEqual(['observedChecks', 'redactedErrorCode', 'status', 'timestamp']);
+    expect(stored).toEqual(printed);
   });
 
   it('doctor reports missing and expired durable evidence as non-success', async () => {
@@ -74,12 +125,86 @@ describe('operational CLI', () => {
     expect(output.stdout.join('')).toContain('caldav: unknown');
   });
 
+  it('doctor fails a durable gate closed when its timestamp is in the future', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-doctor-future-'));
+    const state = join(root, 'state');
+    await mkdir(join(state, 'gates'), { recursive: true });
+    await writeFile(join(state, 'gates', 'openai.json'), JSON.stringify({
+      status: 'open', observedChecks: ['model response observed'], redactedErrorCode: null,
+      timestamp: new Date(Date.now() + 60 * 60_000).toISOString(),
+    }));
+    const output = capture();
+    expect(await runCli(['doctor', '--state', state], output.io)).toBe(1);
+    expect(output.stdout.join('')).toContain('openai: unknown');
+  });
+
+  it('repairs and verifies private permissions for every existing init directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-private-tree-'));
+    await mkdir(join(root, 'workspace', 'memory'), { recursive: true });
+    await mkdir(join(root, 'state', 'gates'), { recursive: true });
+    if (process.platform !== 'win32') {
+      await chmod(root, 0o755);
+      await chmod(join(root, 'workspace'), 0o755);
+      await chmod(join(root, 'state', 'gates'), 0o755);
+    }
+    expect(await runCli(['init', '--root', root], capture().io)).toBe(0);
+    const directories = [root, 'workspace', 'workspace/memory', 'workspace/archive', 'state', 'state/gates', 'secrets', 'config']
+      .map(path => path === root ? root : join(root, path));
+    if (process.platform === 'win32') {
+      for (const directory of directories) {
+        const script = `$a=Get-Acl -LiteralPath '${directory.replaceAll("'", "''")}'; if(!$a.AreAccessRulesProtected -or @($a.Access|? IsInherited).Count -ne 0){exit 1}`;
+        expect((await import('node:child_process')).spawnSync('pwsh', ['-NoProfile', '-Command', script]).status).toBe(0);
+      }
+    } else {
+      for (const directory of directories) {
+        const info = await stat(directory);
+        expect(info.mode & 0o777).toBe(0o700);
+        expect(info.uid).toBe(process.getuid!());
+      }
+    }
+  }, 30_000);
+
   it.each([
     ['backup', '--workspace', '/tmp/workspace', '--state', '/tmp/state', '--backup-dir', 'relative', '--identity', '/tmp/key', '--recipient', 'age1test'],
     ['restore', '--archive', 'relative', '--restore-root', '/tmp/restore', '--identity', '/tmp/key'],
   ])('requires absolute paths for %s', async (...args) => {
     const output = capture();
     expect(await runCli(args as string[], output.io)).toBe(64);
+  });
+
+  it('requires reconcile state and records verification failure in the real health store', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-reconcile-health-'));
+    const archive = join(root, '2026-08-25.age');
+    const identity = join(root, 'identity.txt');
+    const state = join(root, 'state');
+    await writeFile(archive, 'not an archive');
+    await writeFile(identity, 'not an identity');
+    expect(await runCli(['backup', 'reconcile', '--archive', archive, '--identity', identity], capture().io)).toBe(64);
+    expect(await runCli(['backup', 'reconcile', '--archive', archive, '--identity', identity, '--state', state], capture().io)).toBe(70);
+    const health = new SubsystemHealthStore(state);
+    try {
+      expect(health.listActive()).toEqual([expect.objectContaining({ target: 'backup' })]);
+      health.recover('backup');
+      health.report({
+        target: `backup-publication:${'a'.repeat(64)}`, errorCode: 'BACKUP_PUBLICATION_UNKNOWN',
+        message: 'Backup commit durability is unknown; run verified reconciliation before retention',
+      });
+    } finally { health.close(); }
+    expect(await runCli(['backup', 'reconcile', '--archive', archive, '--identity', identity, '--state', state], capture().io)).toBe(70);
+    const reopened = new SubsystemHealthStore(state);
+    try {
+      const active = reopened.listActive();
+      expect(active).toEqual([expect.objectContaining({
+        target: `backup-publication:${'a'.repeat(64)}`, errorCode: 'BACKUP_PUBLICATION_UNKNOWN',
+      })]);
+      expect(buildBriefing({
+        now: '2026-08-25T09:00:00+09:00', events: [], tasks: [], studies: [], activeErrors: active,
+      }).messages.join('\n')).toContain('Backup commit durability is unknown');
+      const backupDir = join(root, 'backups');
+      await mkdir(backupDir);
+      await expect(applyRetention({ backupDir, identityFile: identity, health: reopened }))
+        .rejects.toMatchObject({ code: 'publication_unknown' });
+    } finally { reopened.close(); }
   });
 
   it('rejects secrets and credential URLs in command-line arguments', async () => {

@@ -8,6 +8,7 @@ MODE="${1:---non-live}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
+LIVE_VALIDATOR="$SCRIPT_DIR/validate-live-evidence.js"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARTIFACT_REL="artifacts/acceptance/$STAMP"
 ARTIFACT_DIR="$REPO_ROOT/$ARTIFACT_REL"
@@ -54,70 +55,78 @@ run_safe() {
   write_record "$id" "$title" "$description" "$code" "$status" "$out" "$err" "$ARTIFACT_REL/$id.stdout.redacted"
 }
 
+run_safe_unverified() {
+  local id="$1" title="$2" description="$3" reason="$4"; shift 4
+  local raw_out="$ARTIFACT_DIR/$id.stdout.raw" raw_err="$ARTIFACT_DIR/$id.stderr.raw"
+  local out="$ARTIFACT_DIR/$id.stdout.redacted" err="$ARTIFACT_DIR/$id.stderr.redacted" code=0 status=NOT_VERIFIED
+  (cd "$PLUGIN_ROOT" && "$@") >"$raw_out" 2>"$raw_err" || code=$?
+  if [[ "$code" -eq 0 ]]; then printf '\n%s\n' "$reason" >>"$raw_out"; code=125; else status=FAIL; fi
+  redact_file "$raw_out" "$out"; redact_file "$raw_err" "$err"
+  rm -f -- "$raw_out" "$raw_err"
+  write_record "$id" "$title" "$description" "$code" "$status" "$out" "$err" "$ARTIFACT_REL/$id.stdout.redacted"
+}
+
 not_verified() {
   local id="$1" title="$2" reason="$3"
   local out="$ARTIFACT_DIR/$id.stdout.redacted" err="$ARTIFACT_DIR/$id.stderr.redacted"
   printf '%s\n' "$reason" >"$out"; : >"$err"
-  write_record "$id" "$title" '[live command redacted; see acceptance runbook]' 0 NOT_VERIFIED "$out" "$err" "$ARTIFACT_REL/$id.stdout.redacted"
+  write_record "$id" "$title" '[live command not run; see acceptance runbook]' 125 NOT_VERIFIED "$out" "$err" "$ARTIFACT_REL/$id.stdout.redacted"
 }
 
 run_live_evidence() {
-  local id="$1" title="$2" evidence_dir="${ACCEPTANCE_EVIDENCE_DIR:-}" evidence raw_out raw_err out err code=0 status=NOT_VERIFIED
+  local id="$1" title="$2" evidence_dir="${LIVE_EVIDENCE_DIR:-}" raw_out raw_err out err code=125 status=NOT_VERIFIED observed
   if [[ "$MODE" != --all || "${LIVE_TEST:-0}" != 1 || -z "$evidence_dir" ]]; then
-    not_verified "$id" "$title" 'LIVE_TEST=1 and ACCEPTANCE_EVIDENCE_DIR with explicit target evidence are required.'
+    not_verified "$id" "$title" 'LIVE_TEST=1 and an absolute private LIVE_EVIDENCE_DIR with explicit target evidence are required.'
     return
   fi
-  evidence="$evidence_dir/$id.json"
   raw_out="$ARTIFACT_DIR/$id.stdout.raw"; raw_err="$ARTIFACT_DIR/$id.stderr.raw"
   out="$ARTIFACT_DIR/$id.stdout.redacted"; err="$ARTIFACT_DIR/$id.stderr.redacted"
   : >"$raw_out"; : >"$raw_err"
-  if [[ -f "$evidence" ]] && node -e '
-    const fs=require("node:fs"); const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-    if(x.criterionId!==process.argv[2]||x.status!=="PASS"||!x.observedArtifactPath||!x.timestamp) process.exit(1)
-  ' "$evidence" "$id" >"$raw_out" 2>"$raw_err"; then
+  if node "$LIVE_VALIDATOR" "$evidence_dir" "$id" >"$raw_out" 2>"$raw_err"; then
     status=PASS
-    printf '%s\n' "validated explicit evidence for $id" >"$raw_out"
+    code=0
+    observed="$(node -e 'const fs=require("node:fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.observedArtifactPath)' "$raw_out")"
   else
-    code=2
     printf '%s\n' "explicit evidence missing or invalid for $id" >"$raw_out"
+    observed="$ARTIFACT_REL/$id.stdout.redacted"
   fi
   redact_file "$raw_out" "$out"; redact_file "$raw_err" "$err"; rm -f -- "$raw_out" "$raw_err"
-  write_record "$id" "$title" '[live target evidence validation; command and credentials redacted]' "$code" "$status" "$out" "$err" "$ARTIFACT_REL/$id.stdout.redacted"
+  write_record "$id" "$title" '[criterion-specific live evidence validation; target command and credentials redacted]' "$code" "$status" "$out" "$err" "$observed"
 }
 
 # Target, credential, time-bound, reboot, and physical-media checks are live-only.
-run_live_evidence AC-01 'Ubuntu systemd and Gateway active'
-run_live_evidence AC-02 'ChatGPT OAuth model response'
-run_live_evidence AC-03 'Owner Telegram response'
-run_safe AC-04 'Unauthorized Telegram user denied' 'vitest security boundary (no credentials)' npm test -- tests/config/security.test.ts
-run_safe AC-05 'All local record kinds add and query' 'vitest tool and workspace behavior' npm test -- tests/tools/tools.test.ts
-run_safe AC-06 'Task and study mutation/archive' 'vitest repository mutation behavior' npm test -- tests/workspace/repository.test.ts -t 'updates, queries, and archives a record'
-run_live_evidence AC-07 'Real CalDAV calendar read'
-run_live_evidence AC-08 'Exactly one confirmed Naver create'
-run_safe AC-09 'Calendar update/delete boundary' 'vitest tool boundary behavior' npm test -- tests/tools/tools.test.ts -t 'no generic command or delete surface'
-run_safe AC-10 'Manual briefing sections' 'vitest briefing construction' npm test -- tests/briefing/build.test.ts -t 'selects and orders'
-run_safe AC-11 'Empty briefing suppressed' 'vitest briefing construction' npm test -- tests/briefing/build.test.ts -t 'stays silent'
-run_live_evidence AC-12 'Windows and WSL restart recovery'
-run_live_evidence AC-13 'Real age backup and isolated restore'
-run_live_evidence AC-14 'Target files logs and encrypted archive secret scan'
-run_live_evidence AC-15 'Real CalDAV event-shape PoC and limited mode'
-run_safe AC-16 'Ten concurrent adds and reads' 'vitest workspace concurrency' npm test -- tests/workspace/repository.test.ts -t 'allocates ten unique IDs'
-run_safe AC-17 'Crash before replacement preserves original' 'vitest workspace crash injection' npm test -- tests/workspace/repository.test.ts -t 'recovers a dead child process lock'
-run_safe AC-18 'Lost create response reconciles without duplicate' 'vitest outbox uncertain-send recovery' npm test -- tests/calendar/outbox.test.ts -t 'maps a server response|succeeds only for one exact'
-run_safe AC-19 'Invalid and expired calendar confirmations rejected' 'vitest calendar validation and confirmation' npm test -- tests/calendar/ical.test.ts tests/calendar/outbox.test.ts -t 'rejects invalid event values|expires confirmation|changed payload hash'
-run_safe AC-20 'OAuth and CalDAV failure isolation' 'vitest injected calendar failures' npm test -- tests/calendar/oauth.test.ts tests/calendar/caldav.test.ts tests/state/health.test.ts -t 'refresh|timeout|active failure'
-run_safe AC-21 'DM group config shell and elevated denied' 'vitest hardened security configuration' npm test -- tests/config/security.test.ts
-run_safe AC-22 'Untrusted content cannot cause side effects' 'vitest trust boundary' npm test -- tests/tools/tools.test.ts -t 'returns imported instructions'
-run_live_evidence AC-23 'Exact 08:00 and 22:00 target Cron observation'
-run_safe AC-24 'CalDAV failure warning sent once' 'vitest durable briefing warning behavior' npm test -- tests/briefing/durable-outbound.test.ts
-run_live_evidence AC-25 'Reboot and 30-minute idle recovery'
-run_live_evidence AC-26 'ChatGPT renewal failure and revocation'
-run_live_evidence AC-27 'Real Naver OAuth lifecycle and create'
-run_safe AC-28 'Markdown field bounds round trip' 'vitest Markdown codec contract' npm test -- tests/markdown/codec.test.ts
-run_safe AC-29 'Gateway crash outbox recovery and single-use confirmation' 'vitest outbox recovery state machine' npm test -- tests/calendar/outbox.test.ts -t 'stale submitting|consumes one confirmation'
-run_safe AC-30 'Consistent backup and corrupt-manifest rejection' 'vitest backup snapshot and restore corruption' npm test -- tests/ops/backup.test.ts tests/ops/restore.test.ts -t 'consistent online SQLite backup|post-encryption verification failure|wrong key'
-run_live_evidence AC-31 'Target ACL retention and same-handle deletion'
-run_live_evidence AC-32 'Real age full isolated restore and monthly evidence'
+run_live_evidence AC-01 'Ubuntu 24.04 WSL2 systemd and OpenClaw Gateway are healthy'
+run_live_evidence AC-02 'ChatGPT OAuth produces a real model response'
+run_live_evidence AC-03 'The owner receives a response from @Yangisu_openclaw_bot'
+run_safe AC-04 'An unauthorized Telegram user ID cannot access the assistant' 'vitest exact Telegram owner allowlist and pre-read rejection' npm test -- tests/config/security.test.ts tests/tools/tools.test.ts -t 'allows only one numeric Telegram owner|repository read and side effect for a non-owner'
+run_safe_unverified AC-05 'Tasks, notes, preferences, long-term memory, and study plans can be added and queried' 'vitest current typed add schema before recording an unimplemented acceptance clause' 'NOT VERIFIED: the current mutation surface adds tasks only; other record kinds can be queried/modified but not added.' npm test -- tests/tools/tools.test.ts -t 'exposes strict schemas'
+run_safe AC-06 'Task and study progress can be updated, completed, and archived' 'vitest AC-06 task completion and study progress/archive contract' npm test -- tests/workspace/repository.test.ts -t 'AC-06'
+run_live_evidence AC-07 'Existing Naver events are read through CalDAV'
+run_live_evidence AC-08 'One confirmed Naver test event is created without duplicate retry and then deleted by the user'
+run_safe_unverified AC-09 'Calendar update and delete requests explain the Naver app boundary' 'vitest confirms calendar update/delete are absent before recording missing response guidance' 'NOT VERIFIED: the tool surface excludes update/delete, but no executable response path yet proves the exact Naver-app guidance.' npm test -- tests/tools/tools.test.ts -t 'no generic command or delete surface'
+run_safe AC-10 'A manual hourly briefing separates calendar, task, and study sections' 'vitest briefing section selection and ordering' npm test -- tests/briefing/build.test.ts -t 'selects and orders'
+run_safe AC-11 'An empty briefing is not delivered' 'vitest empty briefing suppression' npm test -- tests/briefing/build.test.ts -t 'stays silent'
+run_live_evidence AC-12 'Gateway automatically recovers after Windows and WSL restart'
+run_live_evidence AC-13 'An age backup is created and restored to an isolated test location'
+run_live_evidence AC-14 'Tracked files, logs, and encrypted backup contain no credentials or tokens'
+run_live_evidence AC-15 'The WSL CalDAV PoC reads all required event shapes and closes only calendar functionality on failure'
+run_safe AC-16 'Ten concurrent task adds and briefing reads preserve unique IDs, parseable Markdown, and uncommitted changes' 'vitest AC-16 concurrency and preservation contract' npm test -- tests/workspace/repository.test.ts -t 'AC-16'
+run_safe AC-17 'Interruption immediately before replacement preserves the original and never promotes a temporary file' 'vitest AC-17 interruption-before-replace contract' npm test -- tests/workspace/repository.test.ts -t 'AC-17'
+run_safe AC-18 'A lost create response remains pending reconciliation without duplicate or premature success' 'vitest uncertain create response and exact UID reconciliation' npm test -- tests/calendar/outbox.test.ts -t 'maps a server response|succeeds only for one exact|keeps zero matches'
+run_safe AC-19 'Expired or changed confirmations and invalid event title, range, or timezone are rejected' 'vitest confirmation expiry/hash and event validation boundaries' npm test -- tests/calendar/ical.test.ts tests/calendar/outbox.test.ts -t 'rejects invalid event values|expires confirmation|changed payload hash'
+run_safe AC-20 'OAuth refresh failure and CalDAV timeout close calendar only while local functions continue with a reason' 'vitest calendar failure isolation and durable health' npm test -- tests/tools/tools.test.ts tests/calendar/oauth.test.ts tests/calendar/caldav.test.ts -t 'keeps local briefing output|refresh|timeout'
+run_safe AC-21 'Unauthorized DMs, groups, config writes, shell, elevated, and plugin commands are denied' 'vitest complete hardened Telegram and command boundary' npm test -- tests/config/security.test.ts
+run_safe AC-22 'Instructions in imported calendar or document content cause no side effect or secret read' 'vitest imported instructions remain inert structured data' npm test -- tests/tools/tools.test.ts tests/briefing/build.test.ts -t 'imported instructions'
+run_live_evidence AC-23 'The real Cron runs at 08:00 and 22:00, not 23:00, with no wake catch-up replay'
+run_safe AC-24 'A CalDAV failure with no event data sends one synchronization warning' 'vitest durable one-time CalDAV warning delivery' npm test -- tests/briefing/durable-outbound.test.ts tests/calendar/outbox.test.ts -t 'CalDAV|warns only once'
+run_live_evidence AC-25 'After reboot and 30 idle minutes WSL and Gateway run without login and Telegram responds'
+run_live_evidence AC-26 'ChatGPT OAuth works through Gateway and Telegram and closes after refresh failure or revocation'
+run_live_evidence AC-27 'Naver OAuth rejects invalid state and proves create, refresh, revoke, and post-revoke failure'
+run_safe AC-28 'Minimum, maximum, and optional Markdown fields round-trip with types, unknown fields, LF, and unique IDs' 'vitest complete Markdown codec contract' npm test -- tests/markdown/codec.test.ts
+run_safe AC-29 'Restart converts submitting to pending reconciliation without replay and consumes one confirmation once' 'vitest restart and single-use confirmation state machine' npm test -- tests/calendar/outbox.test.ts -t 'stale submitting|consumes one confirmation'
+run_safe AC-30 'Concurrent backup is consistent and one-byte manifest corruption rejects restore without plaintext or secrets' 'vitest AC-30 one-byte corruption, snapshot consistency, and plaintext cleanup' npm test -- tests/ops/backup.test.ts -t 'AC-30|consistent online SQLite backup|quarantines staged plaintext'
+run_safe AC-31 'Only backups older than 30 days are deleted while at least two points remain and links are rejected' 'vitest AC-31 age/point retention and link rejection' npm test -- tests/ops/backup.test.ts -t 'AC-31|never deletes link'
+run_live_evidence AC-32 'A full isolated restore verifies SHA-256, Git, Markdown, SQLite, and monthly evidence'
 
 INDEX="$ARTIFACT_DIR/index.json"
 node - "$ARTIFACT_DIR" "$INDEX" <<'NODE'

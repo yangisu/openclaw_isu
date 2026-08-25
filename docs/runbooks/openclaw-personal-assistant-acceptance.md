@@ -16,21 +16,30 @@ Generated acceptance artifacts are intentionally Git-ignored. Treat them as loca
 
 ## Live evidence rules
 
-Live work must be performed manually on the target PC with `LIVE_TEST=1`. Do not put credentials or credential-bearing URLs in command arguments or evidence. Each live check needs an explicit file named `AC-XX.json` in a private evidence directory with:
+Live work must be performed manually on the target PC with `LIVE_TEST=1`. Do not put credentials or credential-bearing URLs in command arguments or evidence. `LIVE_EVIDENCE_DIR` must be an absolute, canonical, owner-private directory. Each live check needs an ordinary non-link file named `AC-XX.json`; its exact schema is:
 
 ```json
 {
+  "version": 1,
+  "generator": "openclaw-personal-assistant-live-acceptance/v1",
   "criterionId": "AC-01",
   "status": "PASS",
+  "observedAt": "2026-08-26T00:00:00Z",
+  "exitCode": 0,
   "observedArtifactPath": "/absolute/private/path/to/redacted-observation",
-  "timestamp": "2026-08-26T00:00:00Z"
+  "observedArtifactSha256": "<64 lowercase hex characters>",
+  "observations": {
+    "ubuntuVersion": "24.04",
+    "systemdPid1": true,
+    "gatewayActive": true
+  }
 }
 ```
 
-The observed artifact must contain enough redacted facts to independently establish the criterion: command identity, exit code, target identity, relevant state, and time. A narrative claim or an empty file is not evidence. The runner validates the explicit envelope; the operator remains responsible for inspecting the referenced artifact.
+The evidence and artifact must be under `LIVE_EVIDENCE_DIR`, owned by the current user, private, ordinary files, non-symlinks, fresh within 24 hours, and unchanged from the recorded SHA-256. The exact observation keys differ by criterion and are enforced by `scripts/wsl/validate-live-evidence.js`; inspect that versioned validator before generating evidence. A narrative, empty file, stale timestamp, wrong criterion, unexpected field, missing observation, permissive ACL/mode, or hash mismatch remains `NOT_VERIFIED` with exit code 125.
 
 ```bash
-LIVE_TEST=1 ACCEPTANCE_EVIDENCE_DIR=/absolute/private/live-evidence \
+LIVE_TEST=1 LIVE_EVIDENCE_DIR=/absolute/private/live-evidence \
   bash scripts/wsl/run-acceptance.sh --all
 ```
 
@@ -47,9 +56,9 @@ Capture these live observations without tokens or passwords:
 - `AC-08` and `AC-27`: invalid, expired, and reused OAuth state rejection; token create/refresh/revoke; exactly one confirmed Naver test event; no duplicate retry; revoked-token failure. Delete the one test event yourself in the Naver app after verification.
 - `AC-13`, `AC-14`, and `AC-32`: a real `age` encryption and isolated decrypt; all manifest SHA-256 values; Git, Markdown, and SQLite checks; monthly-full restore evidence; canary scans of Git-tracked files, redacted logs, decrypted manifests, and encrypted archives. Do not retain plaintext or a canary.
 - `AC-23`: actual observations at Asia/Seoul 08:00 and 22:00, absence at 23:00, `staggerMs: 0`, and no catch-up/replay after sleep.
-- `AC-31`: protected NTFS ACL, current-user plus Administrators only, reparse rejection, and production same-open-handle file identity deletion. Also record whether the backup target and WSL virtual disk share a physical device and whether separate physical media exists.
+- `AC-31` is a non-live retention contract: only verified archives older than 30 days are eligible, at least two recovery points remain, and symlink/junction targets are rejected. Separately record protected NTFS ACL, current-user plus Administrators only, production same-open-handle deletion, device identity, and physical-media availability before enabling retention on the target.
 
-The local test evidence covers the remaining safe criteria, including owner authorization, all five data/tool behaviors, crash recovery, outbox state transitions, untrusted-content isolation, warning deduplication, Markdown round trips, and injected backup corruption. Review each `PASS` artifact rather than relying only on the summary counts.
+The local test evidence covers the remaining safe criteria, including owner authorization, crash recovery, outbox state transitions, untrusted-content isolation, warning deduplication, Markdown round trips, exact one-byte backup corruption, and retention boundaries. `AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: update/delete tools are absent, but an executable response path has not yet proven the exact Naver-app guidance. Review each artifact rather than relying only on summary counts.
 
 ## Final gate
 
