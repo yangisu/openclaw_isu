@@ -1,6 +1,7 @@
 import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
 import { Type } from 'typebox';
 
+import { TELEGRAM_USER_ID_PATTERN } from '../telegram-user-id.js';
 import {
   calendarConfirmParameters,
   calendarPrepareParameters,
@@ -16,7 +17,7 @@ export const configSchema = Type.Object({
   workspaceDir: absoluteWslPath,
   stateDir: absoluteWslPath,
   backupDir: absoluteWslPath,
-  telegramUserId: Type.String({ pattern: '^[0-9]+$' }),
+  telegramUserId: Type.String({ pattern: TELEGRAM_USER_ID_PATTERN, maxLength: 19 }),
   timezone: Type.Literal('Asia/Seoul'),
   calendar: Type.Optional(Type.Object({
     caldavBaseUrl: Type.Optional(Type.String({ pattern: '^https://' })),

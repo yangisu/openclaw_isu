@@ -23,7 +23,10 @@ export interface CalendarEvent extends CalendarEventDraft {
 }
 
 const APPLICATION_TIMEZONE = 'Asia/Seoul';
-const LOCAL_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
+const DATE_ONLY = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/;
+const DRAFT_DATE_TIME = /^([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]+))?)?(Z|[+-]([0-9]{2}):?([0-9]{2}))?$/i;
+
+export const CALENDAR_EVENT_DATE_PATTERN = '^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\\.0{1,3})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?)$';
 
 interface WallTime {
   year: number;
@@ -89,15 +92,7 @@ function normalizeTime(component: ICAL.Component, name: 'dtstart' | 'dtend' | 'r
 }
 
 function ianaLocalDateToUtc(value: WallTime, timeZone: string): Date {
-  const localAsUtc = Date.UTC(
-    value.year, value.month - 1, value.day, value.hour, value.minute, value.second, value.millisecond ?? 0,
-  );
-  const validation = new Date(localAsUtc);
-  if (validation.getUTCFullYear() !== value.year || validation.getUTCMonth() !== value.month - 1 ||
-      validation.getUTCDate() !== value.day || validation.getUTCHours() !== value.hour ||
-      validation.getUTCMinutes() !== value.minute || validation.getUTCSeconds() !== value.second) {
-    throw new Error('invalid local event date');
-  }
+  const localAsUtc = validateWallTime(value);
   let formatter: Intl.DateTimeFormat;
   try {
     formatter = new Intl.DateTimeFormat('en-US', {
@@ -159,11 +154,12 @@ export function parseIcal(source: string, calendarId: string): CalendarEvent[] {
 }
 
 export function semanticEventHash(event: CalendarEventDraft): string {
+  const normalized = validateCalendarEventDraft(event);
   const stable = {
     calendarId: event.calendarId,
     uid: event.uid,
-    dtstart: normalizeDraftDate(event.dtstart),
-    dtend: normalizeDraftDate(event.dtend),
+    dtstart: normalized.dtstart,
+    dtend: normalized.dtend,
     summary: event.summary.normalize('NFC'),
     location: event.location?.normalize('NFC') ?? '',
     rrule: sortRecurrence(event.rrule ?? {}),
@@ -172,29 +168,60 @@ export function semanticEventHash(event: CalendarEventDraft): string {
 }
 
 function normalizeDraftDate(value: string): string {
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const fraction = /\.(\d+)(?=Z|[+-]\d{2}:?\d{2}|$)/i.exec(value);
-  if (fraction) {
-    if (fraction[1].length > 3 || /[1-9]/.test(fraction[1])) {
-      throw new Error('fractional seconds must be zero');
-    }
-    value = `${value.slice(0, fraction.index)}${value.slice(fraction.index + fraction[0].length)}`;
+  const dateOnly = DATE_ONLY.exec(value);
+  if (dateOnly) {
+    validateWallTime({
+      year: Number(dateOnly[1]), month: Number(dateOnly[2]), day: Number(dateOnly[3]),
+      hour: 0, minute: 0, second: 0,
+    });
+    return value;
   }
-  const local = LOCAL_DATE_TIME.exec(value);
-  if (local) {
-    return ianaLocalDateToUtc({
-      year: Number(local[1]), month: Number(local[2]), day: Number(local[3]),
-      hour: Number(local[4]), minute: Number(local[5]), second: Number(local[6] ?? 0),
-      millisecond: Number((local[7] ?? '').padEnd(3, '0') || 0),
-    }, APPLICATION_TIMEZONE).toISOString();
+
+  const dateTime = DRAFT_DATE_TIME.exec(value);
+  if (!dateTime) throw new Error('invalid event date');
+  const fraction = dateTime[7];
+  if (fraction && (fraction.length > 3 || /[1-9]/.test(fraction))) {
+    throw new Error('fractional seconds must be zero');
   }
-  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) throw new Error('invalid local event date');
-  const parsed = new Date(value);
+  const wallTime = {
+    year: Number(dateTime[1]), month: Number(dateTime[2]), day: Number(dateTime[3]),
+    hour: Number(dateTime[4]), minute: Number(dateTime[5]), second: Number(dateTime[6] ?? 0),
+  };
+  validateWallTime(wallTime);
+
+  const zone = dateTime[8];
+  if (!zone) return ianaLocalDateToUtc(wallTime, APPLICATION_TIMEZONE).toISOString();
+  if (zone.toUpperCase() !== 'Z' && (Number(dateTime[9]) > 23 || Number(dateTime[10]) > 59)) {
+    throw new Error('invalid event timezone offset');
+  }
+  const canonicalZone = zone.toUpperCase() === 'Z'
+    ? 'Z'
+    : `${zone[0]}${dateTime[9]}:${dateTime[10]}`;
+  const parsed = new Date(
+    `${dateTime[1]}-${dateTime[2]}-${dateTime[3]}T${dateTime[4]}:${dateTime[5]}:${dateTime[6] ?? '00'}${canonicalZone}`,
+  );
   if (Number.isNaN(parsed.valueOf())) throw new Error('invalid event date');
   return parsed.toISOString();
 }
 
+export function validateCalendarEventDraft(event: CalendarEventDraft): {
+  kind: 'all-day' | 'timed';
+  dtstart: string;
+  dtend: string;
+} {
+  const startIsDate = DATE_ONLY.test(event.dtstart);
+  const endIsDate = DATE_ONLY.test(event.dtend);
+  if (startIsDate !== endIsDate) {
+    throw new Error('DTSTART and DTEND must both be all-day dates or timed values');
+  }
+  const dtstart = normalizeDraftDate(event.dtstart);
+  const dtend = normalizeDraftDate(event.dtend);
+  if (dtend <= dtstart) throw new Error('DTEND must be strictly after DTSTART');
+  return { kind: startIsDate ? 'all-day' : 'timed', dtstart, dtend };
+}
+
 export function buildIcal(draft: CalendarEventDraft): string {
+  validateCalendarEventDraft(draft);
   const calendar = new ICAL.Component('vcalendar');
   calendar.addPropertyWithValue('version', '2.0');
   calendar.addPropertyWithValue('prodid', '-//OpenClaw Personal Assistant//EN');
@@ -214,7 +241,20 @@ export function buildIcal(draft: CalendarEventDraft): string {
 }
 
 function addDateProperty(component: ICAL.Component, name: string, source: string): void {
-  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(source);
+  const dateOnly = DATE_ONLY.test(source);
   const value = dateOnly ? ICAL.Time.fromDateString(source) : ICAL.Time.fromJSDate(new Date(normalizeDraftDate(source)), true);
   component.addPropertyWithValue(name, value);
+}
+
+function validateWallTime(value: WallTime): number {
+  const validation = new Date(0);
+  validation.setUTCFullYear(value.year, value.month - 1, value.day);
+  validation.setUTCHours(value.hour, value.minute, value.second, value.millisecond ?? 0);
+  if (validation.getUTCFullYear() !== value.year || validation.getUTCMonth() !== value.month - 1 ||
+      validation.getUTCDate() !== value.day || validation.getUTCHours() !== value.hour ||
+      validation.getUTCMinutes() !== value.minute || validation.getUTCSeconds() !== value.second ||
+      validation.getUTCMilliseconds() !== (value.millisecond ?? 0)) {
+    throw new Error('invalid local event date');
+  }
+  return validation.valueOf();
 }

@@ -4,6 +4,7 @@ import type {
 } from 'openclaw/plugin-sdk/plugin-entry';
 
 import { loadConfig, type AssistantConfig } from '../config.js';
+import { normalizeTelegramUserId } from '../telegram-user-id.js';
 
 export interface CalendarToolConfig {
   caldavBaseUrl?: string;
@@ -57,8 +58,15 @@ export function assertOwner(
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   config: AssistantConfig,
 ): string {
-  const senderId = toolContext.requesterSenderId;
-  if (!senderId || senderId !== config.telegramUserId) {
+  let senderId: string;
+  let ownerId: string;
+  try {
+    senderId = normalizeTelegramUserId(toolContext.requesterSenderId);
+    ownerId = normalizeTelegramUserId(config.telegramUserId);
+  } catch {
+    throw new AssistantToolError('sender_not_allowed', 'This tool is restricted to the configured owner');
+  }
+  if (senderId !== ownerId) {
     throw new AssistantToolError('sender_not_allowed', 'This tool is restricted to the configured owner');
   }
   return senderId;

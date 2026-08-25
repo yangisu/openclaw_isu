@@ -7,8 +7,14 @@ import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
 import { Type, type Static } from 'typebox';
 import { Value } from 'typebox/value';
 
-import type { CalendarEventDraft, RecurrenceRule } from '../calendar/ical.js';
-import { buildIcal, semanticEventHash } from '../calendar/ical.js';
+import {
+  CALENDAR_EVENT_DATE_PATTERN,
+  buildIcal,
+  semanticEventHash,
+  validateCalendarEventDraft,
+  type CalendarEventDraft,
+  type RecurrenceRule,
+} from '../calendar/ical.js';
 import { NaverCalendarApi } from '../calendar/naver-api.js';
 import type { NaverTokenSet } from '../calendar/oauth.js';
 import {
@@ -31,7 +37,7 @@ const uuidSchema = Type.String({
 });
 const payloadHashSchema = Type.String({ pattern: '^[a-f0-9]{64}$', minLength: 64, maxLength: 64 });
 const eventDateSchema = Type.String({
-  pattern: '^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?:Z|[+-][0-9]{2}:[0-9]{2}))$',
+  pattern: CALENDAR_EVENT_DATE_PATTERN,
   maxLength: 40,
 });
 const recurrenceSchema = Type.Object({
@@ -119,6 +125,14 @@ export function createCalendarPrepareTool(
       }
       signal?.throwIfAborted();
       const event = calendarDraft(params);
+      try {
+        validateCalendarEventDraft(event);
+      } catch (error) {
+        throw new AssistantToolError(
+          'invalid_calendar_event',
+          error instanceof Error ? error.message : 'Calendar event is invalid',
+        );
+      }
       const payloadIcal = buildIcal(event);
       const payloadHash = semanticEventHash(event);
       const outbox = (dependencies.openOutbox ?? openPrepareOutbox)(config);

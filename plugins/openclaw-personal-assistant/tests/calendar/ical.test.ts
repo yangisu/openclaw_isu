@@ -159,6 +159,49 @@ describe('iCalendar canonicalization', () => {
   });
 
   it.each([
+    ['invalid all-day civil date', '2026-02-29', '2026-03-01'],
+    ['invalid timed civil date', '2026-04-31T09:00:00+09:00', '2026-04-31T10:00:00+09:00'],
+    ['equal all-day boundary', '2026-08-25', '2026-08-25'],
+    ['equal normalized instant', '2026-08-25T09:00:00+09:00', '2026-08-25T00:00:00Z'],
+    ['reversed normalized instants', '2026-08-25T09:00:01+09:00', '2026-08-25T00:00:00Z'],
+    ['mixed all-day and timed forms', '2026-08-25', '2026-08-26T00:00:00+09:00'],
+  ])('rejects %s before building or hashing', (_label, dtstart, dtend) => {
+    const draft = { calendarId: 'personal', uid: 'invalid-boundary', dtstart, dtend, summary: 'Invalid' };
+    expect(() => semanticEventHash(draft)).toThrow();
+    expect(() => buildIcal(draft)).toThrow();
+  });
+
+  it.each([
+    [
+      'leap-day all-day boundary',
+      '2028-02-29',
+      '2028-03-01',
+      'DTSTART;VALUE=DATE:20280229',
+      'DTEND;VALUE=DATE:20280301',
+    ],
+    [
+      'one-second floating Seoul boundary',
+      '2028-02-29T23:59:59',
+      '2028-03-01T00:00:00',
+      'DTSTART:20280229T145959Z',
+      'DTEND:20280229T150000Z',
+    ],
+    [
+      'one-second explicit-offset boundary',
+      '2028-02-29T23:59:59+09:00',
+      '2028-02-29T15:00:00Z',
+      'DTSTART:20280229T145959Z',
+      'DTEND:20280229T150000Z',
+    ],
+  ])('accepts %s', (_label, dtstart, dtend, expectedStart, expectedEnd) => {
+    const draft = { calendarId: 'personal', uid: 'valid-boundary', dtstart, dtend, summary: 'Valid' };
+    const output = buildIcal(draft);
+    expect(output).toContain(expectedStart);
+    expect(output).toContain(expectedEnd);
+    expect(semanticEventHash(draft)).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it.each([
     ['floating DTSTART', 'dtstart', '2026-08-25T09:00:00.1'],
     ['UTC DTSTART', 'dtstart', '2026-08-25T00:00:00.001Z'],
     ['offset DTSTART', 'dtstart', '2026-08-25T09:00:00.1+09:00'],

@@ -157,10 +157,10 @@ export function createMutationTool(
     async execute(_toolCallId, params, signal) {
       const config = loadConfigFromApi(api);
       assertOwner(toolContext, config);
-      if (params.action !== 'add') assertTargetMatchesRecordType(params.targetId, params.recordType);
       if (!Value.Check(mutationParameters, params)) {
         throw new AssistantToolError('invalid_parameters', 'Mutation parameters do not match the tool schema');
       }
+      if (params.action !== 'add') assertTargetMatchesRecordType(params.targetId, params.recordType);
       signal?.throwIfAborted();
 
       const repository = (dependencies.openRepository ?? openRepository)(config);

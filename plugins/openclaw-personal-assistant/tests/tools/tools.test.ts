@@ -1,13 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
 
 import { Value } from 'typebox/value';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getToolPluginMetadata } from 'openclaw/plugin-sdk/tool-plugin';
 
 import plugin from '../../src/index.js';
+import { CalendarOutbox } from '../../src/calendar/outbox.js';
 import { createCalendarConfirmTool, createCalendarPrepareTool } from '../../src/tools/calendar.js';
 import { createMutationTool } from '../../src/tools/mutate.js';
 import { createQueryTool } from '../../src/tools/query.js';
+import { configSchema } from '../../src/tools/register.js';
 
 const config = {
   workspaceDir: '/home/user/.openclaw/workspace',
@@ -17,12 +20,22 @@ const config = {
   timezone: 'Asia/Seoul',
 } as const;
 
-function api() {
-  return { pluginConfig: config } as never;
+function api(overrides: Record<string, unknown> = {}) {
+  return { pluginConfig: { ...config, ...overrides } } as never;
 }
 
 const ownerContext = { requesterSenderId: config.telegramUserId };
 const nonOwnerContext = { requesterSenderId: '999' };
+const temporaryStateDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryStateDirs.splice(0).map(stateDir => rm(stateDir, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 20,
+  })));
+});
 
 describe('OpenClaw personal-assistant tool boundary', () => {
   it('registers exactly four statically owned optional tools', () => {
@@ -96,6 +109,22 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     });
   });
 
+  it.each([
+    ['invalid all-day civil date', '2026-02-29', '2026-03-01'],
+    ['invalid timed civil date', '2026-04-31T09:00:00+09:00', '2026-04-31T10:00:00+09:00'],
+    ['equal times', '2026-08-25T09:00:00+09:00', '2026-08-25T00:00:00Z'],
+    ['reversed times', '2026-08-25T09:00:01+09:00', '2026-08-25T00:00:00Z'],
+    ['mixed all-day/timed forms', '2026-08-25', '2026-08-26T00:00:00+09:00'],
+  ])('rejects %s before opening the calendar outbox', async (_label, dtstart, dtend) => {
+    const openOutbox = vi.fn();
+    const tool = createCalendarPrepareTool(api(), ownerContext, { openOutbox });
+
+    await expect(tool.execute('call-invalid-date', {
+      calendarId: 'default', uid: 'invalid-date@example.test', dtstart, dtend, summary: 'Invalid',
+    })).rejects.toMatchObject({ code: 'invalid_calendar_event' });
+    expect(openOutbox).not.toHaveBeenCalled();
+  });
+
   it('binds the mutation operation ID and exact target to one typed repository call', async () => {
     const updateRecord = vi.fn(async (operationId, targetId, patch) => ({
       operationId, id: targetId, replayed: false,
@@ -126,38 +155,67 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     await expect(tool.execute('call-4', {
       operationId: 'telegram-update-43', action: 'modify', recordType: 'task',
       targetId: 'S-20260825-001', title: 'Wrong kind',
-    })).rejects.toMatchObject({ code: 'target_type_mismatch' });
+    })).rejects.toMatchObject({ code: 'invalid_parameters' });
     expect(openRepository).not.toHaveBeenCalled();
   });
 
-  it('prepares a content-bound draft without making an external calendar write', async () => {
-    const requestId = '11111111-1111-4111-8111-111111111111';
-    const prepare = vi.fn(input => ({
-      requestId, version: 0, status: 'draft' as const,
-      uid: input.uid, calendarId: input.calendarId, payloadIcal: input.payloadIcal,
-      payloadHash: input.payloadHash, attemptCount: 0,
-      createdAt: '2026-08-25T00:00:00Z', updatedAt: '2026-08-25T00:00:00Z',
+  it('rejects malformed direct mutation calls with a stable error before opening the repository', async () => {
+    const openRepository = vi.fn();
+    const tool = createMutationTool(api(), ownerContext, { openRepository });
+    await expect(tool.execute('call-malformed', {
+      action: 'modify', recordType: 'task',
+    } as never)).rejects.toMatchObject({ code: 'invalid_parameters' });
+    expect(openRepository).not.toHaveBeenCalled();
+  });
+
+  it('maps archive operation ID and exact target to one repository call', async () => {
+    const archiveRecord = vi.fn(async (operationId, targetId) => ({
+      operationId, id: targetId, replayed: false,
+      record: { id: targetId, title: 'Archived', orderedFields: [], fields: {}, body: '' },
     }));
     const close = vi.fn();
-    const externalCreate = vi.fn();
-    const tool = createCalendarPrepareTool(api(), ownerContext, {
-      openOutbox: () => ({ prepare, close }),
+    const tool = createMutationTool(api(), ownerContext, {
+      openRepository: () => ({ archiveRecord, close }) as never,
     });
+
+    await tool.execute('call-archive', {
+      operationId: 'telegram-archive-42', action: 'archive', recordType: 'note',
+      targetId: 'N-20260825-001', reason: 'Owner requested archive',
+    });
+
+    expect(archiveRecord).toHaveBeenCalledWith(
+      'telegram-archive-42', 'N-20260825-001', 'Owner requested archive',
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('prepares a real local outbox draft through hard-fail external adapters', async () => {
+    const stateDir = `/tmp/openclaw-tool-prepare-${randomUUID()}`;
+    temporaryStateDirs.push(stateDir);
+    const tool = createCalendarPrepareTool(api({ stateDir }), ownerContext);
 
     const result = await tool.execute('call-5', {
       calendarId: 'default', uid: 'event-1@example.test',
-      dtstart: '2026-08-25T10:00:00+09:00', dtend: '2026-08-25T11:00:00+09:00',
+      dtstart: '2028-02-29T23:59:59', dtend: '2028-03-01T00:00:00',
       summary: 'Dentist', location: 'Seoul',
     });
 
-    expect(prepare).toHaveBeenCalledTimes(1);
-    expect(externalCreate).not.toHaveBeenCalled();
     expect(result.details).toMatchObject({
-      requestId, payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/),
       status: 'draft', confirmationRequired: true, externalWrite: false,
       event: { summary: 'Dentist', location: 'Seoul' },
     });
-    expect(close).toHaveBeenCalledTimes(1);
+    const outbox = new CalendarOutbox({
+      stateDir,
+      api: { async createSchedule() { throw new Error('unexpected external write'); } },
+      caldav: { async listEvents() { throw new Error('unexpected external read'); } },
+    });
+    expect(outbox.get(String(result.details.requestId))).toMatchObject({
+      status: 'draft',
+      payloadHash: result.details.payloadHash,
+    });
+    outbox.close();
   });
 
   it('binds confirmation to request ID, payload hash, and the trusted owner sender', async () => {
@@ -180,6 +238,42 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(result.details).toMatchObject({ requestId, payloadHash, status: 'succeeded' });
     expect(result.details).not.toHaveProperty('payloadIcal');
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the real outbox to consume confirmation once without a duplicate external write', async () => {
+    const stateDir = `/tmp/openclaw-tool-confirm-${randomUUID()}`;
+    temporaryStateDirs.push(stateDir);
+    const scopedApi = api({ stateDir });
+    const prepared = await createCalendarPrepareTool(scopedApi, ownerContext).execute('call-prepare-real', {
+      calendarId: 'default', uid: 'single-use@example.test',
+      dtstart: '2026-08-25T10:00:00+09:00', dtend: '2026-08-25T11:00:00+09:00',
+      summary: 'Single use',
+    });
+    const createSchedule = vi.fn(async request => ({
+      processType: 'create' as const,
+      calendarId: request.calendarId,
+      icalUid: 'single-use@example.test',
+    }));
+    const confirm = createCalendarConfirmTool(scopedApi, ownerContext, {
+      openOutbox: async () => new CalendarOutbox({
+        stateDir,
+        api: { createSchedule },
+        caldav: { async listEvents() { return []; } },
+        sleep: async () => undefined,
+      }),
+    });
+    const confirmation = {
+      requestId: String(prepared.details.requestId),
+      payloadHash: String(prepared.details.payloadHash),
+    };
+
+    await expect(confirm.execute('call-confirm-real', confirmation)).resolves.toMatchObject({
+      details: { status: 'succeeded', attemptCount: 1 },
+    });
+    await expect(confirm.execute('call-confirm-duplicate', confirmation)).rejects.toMatchObject({
+      code: 'confirmation_consumed',
+    });
+    expect(createSchedule).toHaveBeenCalledTimes(1);
   });
 
   it('exposes strict schemas with no generic command or delete surface', () => {
@@ -213,5 +307,14 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(Value.Check(confirm, {
       requestId: randomUUID(), payloadHash: 'c'.repeat(64), url: 'https://example.test',
     })).toBe(false);
+  });
+
+  it('enforces the canonical signed-int64 Telegram ID boundary in the plugin config schema', () => {
+    expect(Value.Check(configSchema, {
+      ...config, telegramUserId: '9223372036854775807',
+    })).toBe(true);
+    for (const telegramUserId of ['0', '00123', '9223372036854775808']) {
+      expect(Value.Check(configSchema, { ...config, telegramUserId })).toBe(false);
+    }
   });
 });

@@ -355,9 +355,9 @@ describe('CalendarOutbox schema and confirmation state machine', () => {
     f.outbox.close();
   });
 
-  it('preserves numeric sender IDs through the JavaScript safe integer range', async () => {
+  it('preserves the signed SQLite int64 maximum sender ID exactly', async () => {
     const f = await fixture();
-    const senderId = String(Number.MAX_SAFE_INTEGER);
+    const senderId = '9223372036854775807';
     const prepared = f.outbox.prepare(draft());
     expect(f.outbox.confirm(prepared.requestId, senderId, prepared.payloadHash)).toMatchObject({
       confirmedBy: senderId,
@@ -365,6 +365,21 @@ describe('CalendarOutbox schema and confirmation state machine', () => {
     await expect(f.outbox.submit(prepared.requestId, senderId)).resolves.toMatchObject({ status: 'succeeded' });
     f.outbox.close();
   });
+
+  it.each(['0', '00123', '9223372036854775808'])(
+    'rejects non-canonical or overflowing sender ID %s before storage',
+    async senderId => {
+      const f = await fixture();
+      const prepared = f.outbox.prepare(draft());
+      expect(() => f.outbox.confirm(prepared.requestId, senderId, prepared.payloadHash)).toThrowError(
+        expect.objectContaining({ code: 'invalid_sender_id' }),
+      );
+      const stored = f.outbox.get(prepared.requestId);
+      expect(stored).toMatchObject({ status: 'draft' });
+      expect(stored).not.toHaveProperty('confirmedBy');
+      f.outbox.close();
+    },
+  );
 
   it('fails with a stable error instead of overflowing the CAS version', async () => {
     const f = await fixture();

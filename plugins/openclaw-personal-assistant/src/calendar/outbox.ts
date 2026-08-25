@@ -23,6 +23,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { normalizeTelegramUserId } from '../telegram-user-id.js';
 import { parseIcal, semanticEventHash, type CalendarEvent } from './ical.js';
 import type { CreateScheduleRequest } from './naver-api.js';
 
@@ -169,7 +170,6 @@ const CONFIRMATION_LIFETIME_MS = 10 * 60 * 1_000;
 const DEFAULT_STALE_AFTER_MS = 15_000;
 const SUCCEEDED_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const RETRY_DELAYS_MS = [100, 200] as const;
-const MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807n;
 const MAX_SAFE_VERSION = Number.MAX_SAFE_INTEGER;
 const OUTBOX_SCHEMA_VERSION = 1;
 const OUTBOX_SNAPSHOT_PATH = 'state/calendar-outbox.sqlite3';
@@ -935,14 +935,14 @@ function validateUuid(value: string): void {
 }
 
 function validateSenderId(value: string): bigint {
-  if (!/^[1-9]\d*$/.test(value)) {
-    throw new CalendarOutboxError('invalid_sender_id', 'Telegram sender ID must be a positive integer');
+  try {
+    return BigInt(normalizeTelegramUserId(value));
+  } catch {
+    throw new CalendarOutboxError(
+      'invalid_sender_id',
+      'Telegram sender ID must be a canonical positive SQLite integer',
+    );
   }
-  const numeric = BigInt(value);
-  if (numeric > MAX_SQLITE_INTEGER) {
-    throw new CalendarOutboxError('invalid_sender_id', 'Telegram sender ID is outside SQLite integer range');
-  }
-  return numeric;
 }
 
 function formatTimestamp(date: Date): string {

@@ -1,3 +1,5 @@
+import { normalizeTelegramUserId } from './telegram-user-id.js';
+
 export interface AssistantConfig {
   workspaceDir: string;
   stateDir: string;
@@ -12,7 +14,18 @@ export function loadConfig(raw: unknown): AssistantConfig {
     const path = value[key];
     if (!path?.startsWith('/') || path.includes('/../')) throw new Error(`invalid ${key}`);
   }
-  if (!/^\d+$/.test(value.telegramUserId ?? '')) throw new Error('invalid telegramUserId');
+  let telegramUserId: string;
+  try {
+    telegramUserId = normalizeTelegramUserId(value.telegramUserId);
+  } catch {
+    throw new Error('invalid telegramUserId');
+  }
   if (value.timezone !== 'Asia/Seoul') throw new Error('timezone must be Asia/Seoul');
-  return value as AssistantConfig;
+  return {
+    workspaceDir: value.workspaceDir!,
+    stateDir: value.stateDir!,
+    backupDir: value.backupDir!,
+    telegramUserId,
+    timezone: value.timezone,
+  };
 }
