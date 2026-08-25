@@ -19,6 +19,7 @@ import {
   createBackup,
   parseNtfsFileIdentity,
   parseWindowsReparseClassification,
+  publicationUnknownTarget,
   restoreBackup,
   validateWindowsBackupAcl,
   verifyBackup,
@@ -431,6 +432,31 @@ describe('encrypted verified backup', () => {
     expect(f.health.listActive().map(error => error.target)).toEqual([targetsByDay.get('26')]);
   }, 30_000);
 
+  it('derives publication identity and recovery from portable committed facts, not host path spelling', async () => {
+    const record = {
+      version: 1 as const,
+      archive: '2026-08-25.age',
+      size: 123,
+      sha256: 'a'.repeat(64),
+      manifestId: 'b'.repeat(64),
+      manifestHash: 'c'.repeat(64),
+    };
+    const windows = publicationUnknownTarget('D:\\openclaw_setting\\backups\\2026-08-25.age', record);
+    const wsl = publicationUnknownTarget('/mnt/d/openclaw_setting/backups/2026-08-25.age', record);
+    expect(windows).toBe(wsl);
+    const healthRoot = await mkdtemp(join(tmpdir(), 'backup-portable-health-')); roots.push(healthRoot);
+    const health = new SubsystemHealthStore(healthRoot);
+    health.report({ errorCode: 'BACKUP_PUBLICATION_UNKNOWN', target: windows, message: 'unknown' });
+    health.recover(wsl);
+    expect(health.listActive()).toEqual([]);
+    health.close();
+    expect(publicationUnknownTarget('/different/root/2026-08-25.age', record)).toBe(windows);
+    expect(publicationUnknownTarget('/mnt/d/backups/2026-08-24.age', { ...record, archive: '2026-08-24.age' }))
+      .not.toBe(windows);
+    expect(publicationUnknownTarget('/mnt/d/backups/2026-08-25.age', { ...record, sha256: 'd'.repeat(64) }))
+      .not.toBe(windows);
+  });
+
   it('leaves no eligible archive at every commit-record publication crash point', async () => {
     for (const point of ['archive-directory-sync', 'commit-file-sync'] as const) {
       const f = await fixture(); const health: string[] = []; let fileSyncs = 0; let directorySyncs = 0; let renames = 0;
@@ -739,12 +765,10 @@ describe('encrypted verified backup', () => {
 
   it('deletes only verified oldest archives while retaining at least two recovery points', async () => {
     const f = await fixture(); const identityDeleter = new PortableTestIdentityDeleter();
-    const newest = await createBackup({
-      ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
-      now: () => new Date('2026-08-25T00:00:00.000Z'),
-    });
-    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
-    await cloneCommittedArchive(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    for (const day of ['23', '24', '25']) {
+      await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+        now: () => new Date(`2026-08-${day}T00:00:00.000Z`) });
+    }
     const result = await applyRetention({
       backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2, health: f.health, identityDeleter,
     });

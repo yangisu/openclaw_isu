@@ -189,9 +189,26 @@ Fix-round-7 GREEN:
 - `npm run plugin:validate` — exit 0; plugin valid.
 - `git diff --check` — exit 0 (only Windows LF/CRLF conversion warnings).
 
+Fix-round-8 RED:
+
+- `npm test -- --run tests/ops/backup.test.ts -t "derives publication identity"` — exit 1 as expected because the portable publication-identity helper did not exist and production still hashed the host-specific resolved pathname.
+- The first focused integration run after introducing the helper exposed an overly strict assumption that `manifestId` was a SHA-256 rather than the existing bounded created-at/Git-HEAD identifier; UNKNOWN creation and retention correctly failed closed until the canonical contract was corrected.
+
+Fix-round-8 GREEN:
+
+- Publication UNKNOWN identity now hashes only protocol version, normalized archive basename, archive size/SHA-256, and manifest id/SHA-256. It contains no drive, mount point, separator, cwd, casing, inode, or process-local value.
+- A direct regression proves equivalent Windows and WSL path spellings produce the same target and can recover the same real health-journal entry, while different dates or archive hashes remain independent. Existing older-archive reconciliation coverage continues proving it cannot clear a different UNKNOWN publication.
+- The positive retention integration now creates three independent real backups on distinct dates, including their actual committed and audit sidecars, and proves `keep=2` deletes the oldest set while retaining the newest two.
+- `npm test -- --run tests/ops/backup.test.ts -t "derives publication identity|deletes only verified oldest|prevents retention until"` — exit 0; 3 tests passed, 39 skipped.
+- `npm test` — exit 0; 19 files passed, 339 tests passed.
+- `npm run typecheck` — exit 0.
+- `npm run build` — exit 0.
+- `npm run plugin:validate` — exit 0; plugin valid.
+- `git diff --check` — exit 0 (only Windows LF/CRLF conversion warnings).
+
 ## Final verification
 
-- `npm test` — exit 0; 19 files passed, 338 tests passed.
+- `npm test` — exit 0; 19 files passed, 339 tests passed.
 - `npm run typecheck` — exit 0.
 - `npm run build` — exit 0.
 - `npm run plugin:validate` — exit 0; plugin valid.
@@ -207,6 +224,7 @@ Fix-round-7 GREEN:
 - `140bc799b36ab86c8ac6c2cc8348e8b098d9c9ee` (`fix: retain failed backup publication markers`)
 - `9565c6d14308f253c35ab78da590325bb5d89d7b` (`fix: reconcile unknown backup publications`)
 - Fix-round-7 commit: this report's commit (`fix: serialize backup publication integration`); exact hash is supplied in the handoff because a commit cannot contain its own final hash.
+- Fix-round-8 commit: this report's commit (`fix: make backup publication identity portable`); exact hash is supplied in the handoff because a commit cannot contain its own final hash.
 
 ## Concerns and live NOT VERIFIED items
 

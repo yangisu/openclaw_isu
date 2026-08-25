@@ -180,7 +180,7 @@ export interface VerifiedBackup {
 const ARCHIVE_MAGIC = Buffer.from('OCPABK01', 'ascii');
 const COMMIT_RECORD_VERSION = 1;
 const PUBLICATION_COORDINATORS = new Map<string, Promise<void>>();
-interface ArchiveCommitRecord {
+export interface ArchiveCommitRecord {
   version: 1;
   archive: string;
   size: number;
@@ -638,8 +638,22 @@ function backupManifestHash(manifest: BackupManifest): string {
   return sha256(Buffer.from(JSON.stringify(manifest), 'utf8'));
 }
 
-function publicationUnknownTarget(archivePath: string, record: ArchiveCommitRecord): string {
-  const identity = sha256(Buffer.from(`${resolve(archivePath).toLowerCase()}\0${record.sha256}\0${record.manifestHash}`, 'utf8'));
+export function publicationUnknownTarget(archivePath: string, record: ArchiveCommitRecord): string {
+  const archiveName = archivePath.replace(/\\/g, '/').split('/').at(-1) ?? '';
+  if (!ARCHIVE_NAME.test(archiveName) || !validArchiveDate(archiveName) || archiveName !== record.archive
+    || record.version !== COMMIT_RECORD_VERSION || !Number.isSafeInteger(record.size) || record.size < 0
+    || !/^[a-f0-9]{64}$/.test(record.sha256) || record.manifestId.length < 1 || record.manifestId.length > 512
+    || !/^[a-f0-9]{64}$/.test(record.manifestHash)) {
+    throw new BackupError('archive_commit_invalid', 'Publication identity facts are invalid');
+  }
+  const identity = sha256(Buffer.from(JSON.stringify({
+    protocolVersion: COMMIT_RECORD_VERSION,
+    archive: archiveName,
+    size: record.size,
+    sha256: record.sha256,
+    manifestId: record.manifestId,
+    manifestHash: record.manifestHash,
+  }), 'utf8'));
   return `backup-publication:${identity}`;
 }
 
