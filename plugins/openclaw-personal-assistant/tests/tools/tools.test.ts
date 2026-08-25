@@ -8,6 +8,7 @@ import { getToolPluginMetadata } from 'openclaw/plugin-sdk/tool-plugin';
 import plugin from '../../src/index.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
 import { createBriefingTool } from '../../src/tools/briefing.js';
+import { SubsystemHealthStore } from '../../src/state/health.js';
 import { createCalendarConfirmTool, createCalendarPrepareTool } from '../../src/tools/calendar.js';
 import { createMutationTool } from '../../src/tools/mutate.js';
 import { createQueryTool } from '../../src/tools/query.js';
@@ -26,6 +27,12 @@ function api(overrides: Record<string, unknown> = {}) {
 }
 
 const ownerContext = { requesterSenderId: config.telegramUserId };
+const briefingOwnerContext = {
+  ...ownerContext,
+  sessionKey: 'agent:main:cron:personal-assistant-hourly-briefing',
+  messageChannel: 'telegram',
+  deliveryContext: { channel: 'telegram', to: config.telegramUserId },
+};
 const nonOwnerContext = { requesterSenderId: '999' };
 const temporaryStateDirs: string[] = [];
 
@@ -48,6 +55,16 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       { name: 'assistant_calendar_confirm', optional: true },
       { name: 'assistant_briefing', optional: true },
     ]);
+  });
+
+  it('registers the official message_sent delivery hook without adding a sixth tool', () => {
+    const registerTool = vi.fn();
+    const on = vi.fn();
+    plugin.register({ pluginConfig: config, registerTool, on } as never);
+
+    expect(registerTool).toHaveBeenCalledTimes(5);
+    expect(on).toHaveBeenCalledTimes(1);
+    expect(on).toHaveBeenCalledWith('message_sent', expect.any(Function));
   });
 
   it.each([
@@ -93,6 +110,19 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(briefingOpen).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['missing canonical session', { ...briefingOwnerContext, sessionKey: undefined }],
+    ['wrong channel', { ...briefingOwnerContext, messageChannel: 'discord', deliveryContext: { channel: 'discord', to: config.telegramUserId } }],
+    ['wrong target', { ...briefingOwnerContext, deliveryContext: { channel: 'telegram', to: '999' } }],
+  ])('rejects briefing with %s before reading local data', async (_label, context) => {
+    const openRepository = vi.fn();
+    const tool = createBriefingTool(api(), context, { openRepository });
+    await expect(tool.execute('call-invalid-delivery', {})).rejects.toMatchObject({
+      code: 'invalid_delivery_context',
+    });
+    expect(openRepository).not.toHaveBeenCalled();
+  });
+
   it('keeps local briefing output and reports a CalDAV failure instead of an empty calendar', async () => {
     const query = vi.fn(async ({ kind }: { kind: string }) => kind === 'task' ? [{
       id: 'T-20260825-001', title: 'Local report', orderedFields: [], body: '',
@@ -100,20 +130,27 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     }] : []);
     const closeRepository = vi.fn();
     const closeAlerts = vi.fn();
+    const active: Array<{ errorCode: string; target: string; message: string }> = [];
     const tool = createBriefingTool(api({ calendar: {
       caldavBaseUrl: 'https://caldav.example.test',
       caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-    } }), ownerContext, {
+    } }), briefingOwnerContext, {
       now: () => new Date('2026-08-25T09:00:00+09:00'),
       openRepository: () => ({ query, close: closeRepository }),
       openCalendar: () => ({ async listEvents() {
         throw Object.assign(new Error('private network detail'), { code: 'CALDAV_TIMEOUT' });
       } }),
+      openHealth: () => ({
+        report(error) { active.splice(0, active.length, error); },
+        recover: vi.fn(),
+        listActive: () => [...active],
+        close: vi.fn(),
+      }),
       openAlerts: () => ({
-        prepare: (errors: unknown[]) => errors,
-        markDelivered: vi.fn(),
+        claimAndRender: (errors, _delivery, renderer) => renderer(errors),
+        acknowledgeMessage: vi.fn(),
         close: closeAlerts,
-      } as never),
+      }),
     });
 
     const result = await tool.execute('call-briefing-caldav-failure', {});
@@ -126,6 +163,38 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect((result.details as any).messages.join('\n')).not.toContain('private network detail');
     expect(closeRepository).toHaveBeenCalledTimes(1);
     expect(closeAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads durable subsystem errors and clears CalDAV health only after a successful read', async () => {
+    const stateDir = `/tmp/openclaw-tool-health-${randomUUID()}`;
+    temporaryStateDirs.push(stateDir);
+    const health = new SubsystemHealthStore(stateDir);
+    health.report({
+      errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',
+    });
+    health.report({
+      errorCode: 'CALDAV_TIMEOUT', target: 'naver-caldav', message: 'Calendar synchronization is unavailable',
+    });
+    health.close();
+    const scopedApi = api({ stateDir, calendar: {
+      caldavBaseUrl: 'https://caldav.example.test',
+      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+    } });
+    const tool = createBriefingTool(scopedApi, briefingOwnerContext, {
+      now: () => new Date('2026-08-25T09:00:00+09:00'),
+      openRepository: () => ({ async query() { return []; }, close() {} }),
+      openCalendar: () => ({ async listEvents() { return []; } }),
+    });
+
+    const result = await tool.execute('call-briefing-health', {});
+
+    expect((result.details as any).messages.join('\n')).toContain('BACKUP_STALE (backup)');
+    expect((result.details as any).messages.join('\n')).not.toContain('CALDAV_TIMEOUT');
+    const reopened = new SubsystemHealthStore(stateDir);
+    expect(reopened.listActive()).toEqual([{
+      errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',
+    }]);
+    reopened.close();
   });
 
   it('returns imported instructions as quoted structured data without interpreting them', async () => {

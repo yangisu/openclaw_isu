@@ -1,0 +1,21 @@
+{
+  "name": "Personal assistant hourly briefing",
+  "enabled": true,
+  "schedule": {
+    "kind": "cron",
+    "expr": "0 8-22 * * *",
+    "tz": "Asia/Seoul",
+    "staggerMs": 0
+  },
+  "sessionTarget": "isolated",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "Call assistant_briefing once. Deliver only when send=true."
+  },
+  "delivery": {
+    "mode": "announce",
+    "channel": "telegram",
+    "to": "123456789"
+  },
+  "missedRuns": "skip"
+}

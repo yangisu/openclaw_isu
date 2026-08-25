@@ -3,6 +3,10 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from 'openclaw/plugin-sdk/plugin-entry';
+import type {
+  PluginHookMessageContext,
+  PluginHookMessageSentEvent,
+} from 'openclaw/plugin-sdk/plugin-runtime';
 import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
 import { Type } from 'typebox';
 import { Value } from 'typebox/value';
@@ -16,6 +20,7 @@ import { CalDavClient } from '../calendar/caldav.js';
 import type { CalendarEvent } from '../calendar/ical.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
 import { AlertLedger, BriefingService, type AlertJournal } from '../state/alerts.js';
+import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
 import { WorkspaceRepository } from '../workspace/repository.js';
 import {
   AssistantToolError,
@@ -41,12 +46,17 @@ export interface BriefingToolDependencies {
   openRepository?: (config: AssistantToolConfig) => BriefingRepository;
   openCalendar?: (config: AssistantToolConfig) => BriefingCalendar;
   openAlerts?: (config: AssistantToolConfig) => AlertJournal;
-  readActiveErrors?: (config: AssistantToolConfig) => Promise<ActiveSubsystemError[]>;
+  openHealth?: (config: AssistantToolConfig) => SubsystemHealthJournal;
+}
+
+export interface BriefingHookDependencies {
+  openAlerts?: (config: AssistantToolConfig) => AlertJournal;
 }
 
 export function createBriefingTool(
   api: OpenClawPluginApi,
-  toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
+  toolContext: Pick<OpenClawPluginToolContext,
+    'requesterSenderId' | 'sessionKey' | 'messageChannel' | 'deliveryContext'>,
   dependencies: BriefingToolDependencies = {},
 ): AgentTool<typeof briefingParameters> {
   return {
@@ -62,15 +72,17 @@ export function createBriefingTool(
       }
       signal?.throwIfAborted();
 
+      const delivery = deliveryBinding(toolContext, config);
       const now = (dependencies.now ?? (() => new Date()))();
       const repository = (dependencies.openRepository ?? openRepository)(config);
       let alerts: AlertJournal | undefined;
+      let health: SubsystemHealthJournal | undefined;
       try {
         const taskRecords = await repository.query({ kind: 'task' });
         const studyRecords = await repository.query({ kind: 'study' });
         signal?.throwIfAborted();
 
-        const activeErrors = await (dependencies.readActiveErrors ?? (async () => []))(config);
+        health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
         let events: CalendarEvent[] = [];
         try {
           const calendar = (dependencies.openCalendar ?? openCalendar)(config);
@@ -78,30 +90,78 @@ export function createBriefingTool(
             start: now.toISOString(),
             end: new Date(now.valueOf() + 7 * 86_400_000).toISOString(),
           });
+          health.recover('naver-caldav');
         } catch (error) {
-          activeErrors.push({
+          health.report({
             errorCode: publicErrorCode(error),
             target: 'naver-caldav',
             message: 'Calendar synchronization is unavailable',
           });
         }
 
+        const activeErrors = health.listActive();
         alerts = (dependencies.openAlerts ?? (scoped => new AlertLedger(scoped.stateDir)))(config);
         const service = new BriefingService(alerts);
         const result = await service.run({
           now: now.toISOString(),
-          events: events.map(event => ({ start: event.dtstart, title: event.summary })),
+          events: events.map(event => ({
+            start: event.dtstart, title: event.summary, kind: event.kind, status: event.status,
+          })),
           tasks: taskRecords.flatMap(taskFromRecord),
           studies: studyRecords.flatMap(studyFromRecord),
           activeErrors,
-        }, async () => undefined);
+        }, delivery);
         return jsonResult(result);
       } finally {
         alerts?.close();
+        health?.close();
         repository.close();
       }
     },
   };
+}
+
+export function createBriefingMessageSentHandler(
+  api: OpenClawPluginApi,
+  dependencies: BriefingHookDependencies = {},
+): (event: PluginHookMessageSentEvent, context: PluginHookMessageContext) => Promise<void> {
+  return async (event, context) => {
+    if (!event.sessionKey || !context.sessionKey || event.sessionKey !== context.sessionKey) return;
+    if (!event.content || !event.to || !context.channelId) return;
+    const config = loadConfigFromApi(api);
+    if (context.channelId !== 'telegram' || event.to !== config.telegramUserId) return;
+    const alerts = (dependencies.openAlerts ?? (scoped => new AlertLedger(scoped.stateDir)))(config);
+    try {
+      alerts.acknowledgeMessage({
+        sessionKey: event.sessionKey,
+        channelId: context.channelId,
+        target: event.to,
+        content: event.content,
+        success: event.success,
+      });
+    } finally {
+      alerts.close();
+    }
+  };
+}
+
+export function registerBriefingDeliveryHook(api: OpenClawPluginApi): void {
+  api.on('message_sent', createBriefingMessageSentHandler(api));
+}
+
+function deliveryBinding(
+  context: Pick<OpenClawPluginToolContext, 'sessionKey' | 'messageChannel' | 'deliveryContext'>,
+  config: AssistantToolConfig,
+) {
+  const channelId = context.deliveryContext?.channel ?? context.messageChannel;
+  const target = context.deliveryContext?.to;
+  if (!context.sessionKey || channelId !== 'telegram' || target !== config.telegramUserId) {
+    throw new AssistantToolError(
+      'invalid_delivery_context',
+      'Briefing requires a canonical Telegram owner delivery context',
+    );
+  }
+  return { sessionKey: context.sessionKey, channelId, target };
 }
 
 function openRepository(config: AssistantToolConfig): BriefingRepository {

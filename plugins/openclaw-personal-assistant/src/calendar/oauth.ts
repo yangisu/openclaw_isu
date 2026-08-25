@@ -4,6 +4,8 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 
+import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
+
 const AUTHORIZE_ENDPOINT = 'https://nid.naver.com/oauth2.0/authorize';
 const TOKEN_ENDPOINT = 'https://nid.naver.com/oauth2.0/token';
 const REVOKE_ENDPOINT = 'https://nid.naver.com/oauth2.0/revoke';
@@ -57,6 +59,8 @@ export interface NaverOAuthOptions {
   fetch?: FetchLike;
   now?: () => number;
   timeoutMs?: number;
+  health?: Pick<SubsystemHealthJournal, 'report' | 'recover'>;
+  healthStateDir?: string;
 }
 
 export interface SecretStore<T> {
@@ -74,6 +78,8 @@ export class NaverOAuth {
   readonly #fetch: FetchLike;
   readonly #now: () => number;
   readonly #timeoutMs: number;
+  readonly #health?: Pick<SubsystemHealthJournal, 'report' | 'recover'>;
+  readonly #healthStateDir: string;
 
   constructor(options: NaverOAuthOptions) {
     this.#clientId = required(options.clientId, 'client ID');
@@ -84,6 +90,8 @@ export class NaverOAuth {
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#now = options.now ?? Date.now;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
+    this.#health = options.health;
+    this.#healthStateDir = options.healthStateDir ?? dirname(this.#stateDbPath);
   }
 
   authorize(): NaverAuthorization {
@@ -122,60 +130,95 @@ export class NaverOAuth {
     if (callback.error || !callback.code) {
       throw new NaverOAuthError('oauth_callback_error', 'Naver authorization was not completed');
     }
-    const response = await this.#requestToken(new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: this.#clientId,
-      client_secret: this.#clientSecret,
-      redirect_uri: this.#redirectUri,
-      code: callback.code,
-      state: callback.state,
-    }));
-    const tokens = parseTokenResponse(response, undefined, this.#now());
-    await this.#tokenStore.write(tokens);
-    return tokens;
+    const code = callback.code;
+    return this.#trackHealth(async () => {
+      const response = await this.#requestToken(new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: this.#clientId,
+        client_secret: this.#clientSecret,
+        redirect_uri: this.#redirectUri,
+        code,
+        state: callback.state,
+      }));
+      const tokens = parseTokenResponse(response, undefined, this.#now());
+      await this.#tokenStore.write(tokens);
+      return tokens;
+    });
   }
 
   async refresh(current?: NaverTokenSet): Promise<NaverTokenSet> {
-    const existing = current ?? await this.#tokenStore.read();
-    const response = await this.#requestToken(new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: this.#clientId,
-      client_secret: this.#clientSecret,
-      refresh_token: existing.refreshToken,
-    }), true);
-    const tokens = parseTokenResponse(response, existing.refreshToken, this.#now());
-    await this.#tokenStore.write(tokens);
-    return tokens;
+    return this.#trackHealth(async () => {
+      const existing = current ?? await this.#tokenStore.read();
+      const response = await this.#requestToken(new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: this.#clientId,
+        client_secret: this.#clientSecret,
+        refresh_token: existing.refreshToken,
+      }), true);
+      const tokens = parseTokenResponse(response, existing.refreshToken, this.#now());
+      await this.#tokenStore.write(tokens);
+      return tokens;
+    });
   }
 
   async revoke(current?: NaverTokenSet): Promise<void> {
-    const existing = current ?? await this.#tokenStore.read();
-    const signal = AbortSignal.timeout(this.#timeoutMs);
-    let response: Response;
+    return this.#trackHealth(async () => {
+      const existing = current ?? await this.#tokenStore.read();
+      const signal = AbortSignal.timeout(this.#timeoutMs);
+      let response: Response;
+      try {
+        response = await this.#fetch(REVOKE_ENDPOINT, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: new URLSearchParams({
+            client_id: this.#clientId,
+            client_secret: this.#clientSecret,
+            token: existing.refreshToken,
+            token_type_hint: 'refresh_token',
+          }),
+          signal,
+        });
+      } catch {
+        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
+      }
+      if (!response.ok) throw oauthHttpError(response.status);
+      try {
+        await response.text();
+      } catch {
+        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
+      }
+      await this.#tokenStore.delete();
+    });
+  }
+
+  async #trackHealth<T>(operation: () => Promise<T>): Promise<T> {
     try {
-      response = await this.#fetch(REVOKE_ENDPOINT, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-        body: new URLSearchParams({
-          client_id: this.#clientId,
-          client_secret: this.#clientSecret,
-          token: existing.refreshToken,
-          token_type_hint: 'refresh_token',
-        }),
-        signal,
-      });
-    } catch {
-      if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-      throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
+      const result = await operation();
+      this.#withHealth(health => health.recover('naver-oauth'));
+      return result;
+    } catch (error) {
+      this.#withHealth(health => health.report({
+        errorCode: error instanceof NaverOAuthError ? error.code : 'oauth_request_failed',
+        target: 'naver-oauth',
+        message: 'Naver OAuth is unavailable',
+      }));
+      throw error;
     }
-    if (!response.ok) throw oauthHttpError(response.status);
+  }
+
+  #withHealth(operation: (health: Pick<SubsystemHealthJournal, 'report' | 'recover'>) => void): void {
+    if (this.#health) {
+      operation(this.#health);
+      return;
+    }
+    const health = new SubsystemHealthStore(this.#healthStateDir);
     try {
-      await response.text();
-    } catch {
-      if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-      throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
+      operation(health);
+    } finally {
+      health.close();
     }
-    await this.#tokenStore.delete();
   }
 
   async #acceptState(state: string): Promise<void> {

@@ -8,6 +8,8 @@ const SEOUL_TIMEZONE = 'Asia/Seoul';
 export interface BriefingEvent {
   start: string;
   title: string;
+  kind?: 'all-day' | 'recurring' | 'timed';
+  status?: string;
 }
 
 export interface BriefingTask {
@@ -52,6 +54,7 @@ export interface BriefingResult {
   send: boolean;
   messages: string[];
   includedErrorFingerprints: string[];
+  messageErrorFingerprints: string[][];
 }
 
 interface Section {
@@ -74,26 +77,35 @@ export function buildBriefing(input: BriefingInput): BriefingResult {
   const sections = selectSections(input, now, today).filter(section => section.entries.length > 0);
   if (sections.length === 0) return emptyResult(true);
 
-  const renderedSections = sections.map(section => [
-    section.heading,
-    ...section.entries.slice(0, MAX_SECTION_ITEMS).map(entry => `• ${display(entry.text)}`),
-  ].join('\n'));
+  const renderedSections = sections.map(section => ({
+    content: [
+      section.heading,
+      ...section.entries.slice(0, MAX_SECTION_ITEMS).map(entry => `• ${display(entry.text)}`),
+    ].join('\n'),
+    fingerprints: section.entries.slice(0, MAX_SECTION_ITEMS)
+      .flatMap(entry => entry.fingerprint ? [entry.fingerprint] : []),
+  }));
   const title = `🕘 ${current.hour}:${current.minute} briefing`;
-  const messages = splitAtSectionBoundaries(title, renderedSections);
+  const chunks = splitAtSectionBoundaries(title, renderedSections);
+  const messages = chunks.map(chunk => chunk.content);
+  const messageErrorFingerprints = chunks.map(chunk => chunk.fingerprints);
   const includedErrorFingerprints = sections
     .flatMap(section => section.entries.slice(0, MAX_SECTION_ITEMS))
     .flatMap(entry => entry.fingerprint ? [entry.fingerprint] : []);
 
   return {
     trust: 'quoted_untrusted_data', allowed: true, send: true,
-    messages, includedErrorFingerprints,
+    messages, includedErrorFingerprints, messageErrorFingerprints,
   };
 }
 
 function selectSections(input: BriefingInput, now: Date, today: string): Section[] {
   const nextEvent = input.events
-    .filter(event => Number.isFinite(Date.parse(event.start)) && finiteDate(event.start) >= now.valueOf())
-    .sort((left, right) => finiteDate(left.start) - finiteDate(right.start)
+    .filter(event => event.status?.toUpperCase() !== 'CANCELLED')
+    .filter(event => event.kind === 'all-day'
+      ? /^\d{4}-\d{2}-\d{2}$/.test(event.start) && event.start >= today
+      : Number.isFinite(Date.parse(event.start)) && finiteDate(event.start) >= now.valueOf())
+    .sort((left, right) => eventSortTime(left) - eventSortTime(right)
       || left.title.localeCompare(right.title))[0];
 
   const priorityRank = { high: 0, normal: 1, low: 2 } as const;
@@ -140,7 +152,9 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
   return [
     {
       heading: 'Next event',
-      entries: nextEvent ? [{ text: `${seoulTime(nextEvent.start)} ${nextEvent.title}` }] : [],
+      entries: nextEvent ? [{
+        text: `${nextEvent.kind === 'all-day' ? '종일' : seoulTime(nextEvent.start)} ${nextEvent.title}`,
+      }] : [],
     },
     {
       heading: 'Due today',
@@ -172,7 +186,7 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
 function emptyResult(allowed: boolean): BriefingResult {
   return {
     trust: 'quoted_untrusted_data', allowed, send: false,
-    messages: [], includedErrorFingerprints: [],
+    messages: [], includedErrorFingerprints: [], messageErrorFingerprints: [],
   };
 }
 
@@ -183,6 +197,13 @@ function activeStatus(status: string): boolean {
 function finiteDate(value: string): number {
   const time = Date.parse(value);
   return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+}
+
+function eventSortTime(event: BriefingEvent): number {
+  if (event.kind === 'all-day' && /^\d{4}-\d{2}-\d{2}$/.test(event.start)) {
+    return Date.parse(`${event.start}T00:00:00+09:00`);
+  }
+  return finiteDate(event.start);
 }
 
 function seoulParts(date: Date): { year: string; month: string; day: string; hour: string; minute: string } {
@@ -221,19 +242,29 @@ function calendarDayDifference(earlier: string, later: string): number {
 }
 
 function display(value: string): string {
-  const flattened = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const flattened = value
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   const characters = [...flattened];
   if (characters.length <= MAX_DISPLAY_CHARACTERS) return flattened;
   return `${characters.slice(0, MAX_DISPLAY_CHARACTERS - 1).join('')}…`;
 }
 
-function splitAtSectionBoundaries(title: string, sections: string[]): string[] {
-  const messages: string[] = [];
-  let current = title;
+function splitAtSectionBoundaries(
+  title: string,
+  sections: Array<{ content: string; fingerprints: string[] }>,
+): Array<{ content: string; fingerprints: string[] }> {
+  const messages: Array<{ content: string; fingerprints: string[] }> = [];
+  let current = { content: title, fingerprints: [] as string[] };
   for (const section of sections) {
-    const candidate = `${current}\n\n${section}`;
+    const candidate = `${current.content}\n\n${section.content}`;
     if (candidate.length <= TELEGRAM_LIMIT) {
-      current = candidate;
+      current = {
+        content: candidate,
+        fingerprints: [...current.fingerprints, ...section.fingerprints],
+      };
     } else {
       messages.push(current);
       current = section;

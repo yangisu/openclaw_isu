@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NaverOAuth, type NaverTokenSet } from '../../src/calendar/oauth.js';
+import { SubsystemHealthStore } from '../../src/state/health.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -178,6 +179,55 @@ describe('NaverOAuth one-time callback state', () => {
 });
 
 describe('NaverOAuth token lifecycle', () => {
+  it('reports a durable sanitized OAuth failure and records recovery after success', async () => {
+    const files = await fixture();
+    await files.tokenStore.write({
+      accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
+    });
+    const report = vi.fn();
+    const recover = vi.fn();
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(new Response('private token detail', { status: 401 }))
+      .mockResolvedValueOnce(tokenResponse('access-recovered'));
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch, health: { report, recover },
+    });
+
+    await expect(oauth.refresh()).rejects.toMatchObject({ code: 'oauth_auth' });
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_auth', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
+    expect(JSON.stringify(report.mock.calls)).not.toContain('private token detail');
+    await expect(oauth.refresh()).resolves.toMatchObject({ accessToken: 'access-recovered' });
+    expect(recover).toHaveBeenCalledWith('naver-oauth');
+  });
+
+  it('uses the production durable health store when no health seam is injected', async () => {
+    const files = await fixture();
+    await files.tokenStore.write({
+      accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(tokenResponse('access-recovered'));
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch,
+    });
+
+    await expect(oauth.refresh()).rejects.toMatchObject({ code: 'oauth_server' });
+    let health = new SubsystemHealthStore(files.directory);
+    expect(health.listActive()).toEqual([{
+      errorCode: 'oauth_server', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    }]);
+    health.close();
+    await expect(oauth.refresh()).resolves.toMatchObject({ accessToken: 'access-recovered' });
+    health = new SubsystemHealthStore(files.directory);
+    expect(health.listActive()).toEqual([]);
+    health.close();
+  });
+
   it('exchanges a callback code with the official endpoint and stores a complete token set', async () => {
     const files = await fixture();
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(tokenResponse());
