@@ -1,13 +1,15 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { SecretFileStore } from '../secrets/file-store.js';
+import { Worker } from 'node:worker_threads';
 
 const AUTHORIZE_ENDPOINT = 'https://nid.naver.com/oauth2.0/authorize';
 const TOKEN_ENDPOINT = 'https://nid.naver.com/oauth2.0/token';
 const REVOKE_ENDPOINT = 'https://nid.naver.com/oauth2.0/revoke';
 const STATE_LIFETIME_MS = 10 * 60_000;
+const CONSUMED_STATE_RETENTION_MS = 24 * 60 * 60_000;
+const MAX_ACTIVE_STATES = 128;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -51,10 +53,16 @@ export interface NaverOAuthOptions {
   clientSecret: string;
   redirectUri: string;
   stateDbPath: string;
-  tokenStore: SecretFileStore<NaverTokenSet>;
+  tokenStore: SecretStore<NaverTokenSet>;
   fetch?: FetchLike;
   now?: () => number;
   timeoutMs?: number;
+}
+
+export interface SecretStore<T> {
+  read(): Promise<T>;
+  write(value: T): Promise<void>;
+  delete(): Promise<void>;
 }
 
 export class NaverOAuth {
@@ -62,7 +70,7 @@ export class NaverOAuth {
   readonly #clientSecret: string;
   readonly #redirectUri: string;
   readonly #stateDbPath: string;
-  readonly #tokenStore: SecretFileStore<NaverTokenSet>;
+  readonly #tokenStore: SecretStore<NaverTokenSet>;
   readonly #fetch: FetchLike;
   readonly #now: () => number;
   readonly #timeoutMs: number;
@@ -82,9 +90,21 @@ export class NaverOAuth {
     const state = randomBytes(32).toString('base64url');
     const database = this.#openStateDatabase();
     try {
+      database.exec('BEGIN IMMEDIATE');
+      purgeStates(database, this.#now());
+      database.prepare(`
+        DELETE FROM oauth_states
+        WHERE consumed = 0 AND id NOT IN (
+          SELECT id FROM oauth_states WHERE consumed = 0 ORDER BY id DESC LIMIT ?
+        )
+      `).run(MAX_ACTIVE_STATES - 1);
       database.prepare('INSERT INTO oauth_states (state_hash, expires_at, consumed) VALUES (?, ?, 0)').run(
         hashState(state).toString('hex'), this.#now() + STATE_LIFETIME_MS,
       );
+      database.exec('COMMIT');
+    } catch (error) {
+      if (database.isTransaction) database.exec('ROLLBACK');
+      throw error;
     } finally {
       database.close();
     }
@@ -98,7 +118,7 @@ export class NaverOAuth {
   }
 
   async handleCallback(callback: NaverOAuthCallback): Promise<NaverTokenSet> {
-    this.#acceptState(callback.state);
+    await this.#acceptState(callback.state);
     if (callback.error || !callback.code) {
       throw new NaverOAuthError('oauth_callback_error', 'Naver authorization was not completed');
     }
@@ -144,44 +164,28 @@ export class NaverOAuth {
         }),
         signal,
       });
-      await response.text();
     } catch {
       if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
       throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
     }
     if (!response.ok) throw oauthHttpError(response.status);
+    try {
+      await response.text();
+    } catch {
+      if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+      throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
+    }
     await this.#tokenStore.delete();
   }
 
-  #acceptState(state: string): void {
-    const receivedHash = hashState(state);
-    const database = this.#openStateDatabase();
-    database.exec('BEGIN IMMEDIATE');
+  async #acceptState(state: string): Promise<void> {
+    let accepted: boolean;
     try {
-      const candidates = database.prepare(
-        'SELECT id, state_hash, expires_at, consumed FROM oauth_states',
-      ).all() as Array<{ id: number; state_hash: string; expires_at: number; consumed: number }>;
-      const matching = candidates.find(candidate => {
-        const storedHash = Buffer.from(candidate.state_hash, 'hex');
-        return storedHash.length === receivedHash.length && timingSafeEqual(storedHash, receivedHash);
-      });
-      if (!matching || matching.consumed !== 0 || matching.expires_at <= this.#now()) {
-        throw new NaverOAuthError('oauth_state_invalid', 'OAuth state is invalid, expired, or already used');
-      }
-      const result = database.prepare(
-        'UPDATE oauth_states SET consumed = 1, consumed_at = ? WHERE id = ? AND consumed = 0',
-      ).run(this.#now(), matching.id);
-      if (result.changes !== 1) {
-        throw new NaverOAuthError('oauth_state_invalid', 'OAuth state is invalid, expired, or already used');
-      }
-      database.exec('COMMIT');
-    } catch (error) {
-      database.exec('ROLLBACK');
-      if (error instanceof NaverOAuthError) throw error;
-      throw new NaverOAuthError('oauth_state_invalid', 'OAuth state is invalid, expired, or already used');
-    } finally {
-      database.close();
+      accepted = await consumeStateInWorker(this.#stateDbPath, state, this.#now());
+    } catch {
+      accepted = false;
     }
+    if (!accepted) throw new NaverOAuthError('oauth_state_invalid', 'OAuth state is invalid, expired, or already used');
   }
 
   async #requestToken(form: URLSearchParams, retryPreSend = false): Promise<unknown> {
@@ -201,6 +205,7 @@ export class NaverOAuth {
         if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
         throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
       }
+      if (!response.ok) throw oauthHttpError(response.status);
       let body: string;
       try {
         body = await response.text();
@@ -208,7 +213,6 @@ export class NaverOAuth {
         if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
         throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
       }
-      if (!response.ok) throw oauthHttpError(response.status);
       try {
         return JSON.parse(body) as unknown;
       } catch {
@@ -230,6 +234,7 @@ export class NaverOAuth {
         consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
         consumed_at INTEGER
       ) STRICT;
+      CREATE INDEX IF NOT EXISTS oauth_states_active_idx ON oauth_states (consumed, expires_at, id);
     `);
     return database;
   }
@@ -259,14 +264,16 @@ function parseTokenResponse(value: unknown, previousRefreshToken: string | undef
   const expiresIn = typeof record.expires_in === 'string' || typeof record.expires_in === 'number'
     ? Number(record.expires_in)
     : Number.NaN;
+  const expiresAtMs = now + expiresIn * 1000;
   if (!accessToken || !refreshToken || tokenType?.toLowerCase() !== 'bearer' ||
-      !Number.isInteger(expiresIn) || expiresIn <= 0) {
+      !Number.isSafeInteger(expiresIn) || expiresIn <= 0 || !Number.isFinite(expiresAtMs) ||
+      Math.abs(expiresAtMs) > 8_640_000_000_000_000) {
     throw new NaverOAuthError('oauth_invalid_response', 'Naver OAuth returned an incomplete token response');
   }
   return {
     accessToken,
     refreshToken,
-    expiresAt: new Date(now + expiresIn * 1000).toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
   };
 }
 
@@ -292,4 +299,89 @@ function isProvenPreSend(error: unknown): boolean {
     current = record.cause;
   }
   return false;
+}
+
+function purgeStates(database: DatabaseSync, now: number): void {
+  database.prepare(`
+    DELETE FROM oauth_states
+    WHERE expires_at <= ? OR (consumed = 1 AND consumed_at IS NOT NULL AND consumed_at <= ?)
+  `).run(now, now - CONSUMED_STATE_RETENTION_MS);
+}
+
+const STATE_WORKER_SOURCE = String.raw`
+  const { parentPort, workerData } = require('node:worker_threads');
+  const { createHash, timingSafeEqual } = require('node:crypto');
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(workerData.path);
+  let inTransaction = false;
+  try {
+    db.exec('PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE;');
+    inTransaction = true;
+    db.prepare(
+      'DELETE FROM oauth_states WHERE expires_at <= ? OR (consumed = 1 AND consumed_at IS NOT NULL AND consumed_at <= ?)'
+    ).run(workerData.now, workerData.now - workerData.retentionMs);
+    const rows = db.prepare(
+      'SELECT id, state_hash FROM oauth_states WHERE consumed = 0 AND expires_at > ? ORDER BY id DESC LIMIT ?'
+    ).all(workerData.now, workerData.maxCandidates);
+    const received = createHash('sha256').update(workerData.state, 'utf8').digest();
+    let matching;
+    for (const row of rows) {
+      const stored = Buffer.from(row.state_hash, 'hex');
+      if (stored.length === received.length && timingSafeEqual(stored, received)) matching = row;
+    }
+    if (!matching) {
+      db.exec('ROLLBACK');
+      inTransaction = false;
+      parentPort.postMessage({ accepted: false });
+    } else {
+      const result = db.prepare(
+        'UPDATE oauth_states SET consumed = 1, consumed_at = ? WHERE id = ? AND consumed = 0 AND expires_at > ?'
+      ).run(workerData.now, matching.id, workerData.now);
+      if (result.changes !== 1) {
+        db.exec('ROLLBACK');
+        inTransaction = false;
+        parentPort.postMessage({ accepted: false });
+      } else {
+        db.exec('COMMIT');
+        inTransaction = false;
+        parentPort.postMessage({ accepted: true });
+      }
+    }
+  } catch {
+    if (inTransaction) {
+      try { db.exec('ROLLBACK'); } catch {}
+    }
+    parentPort.postMessage({ accepted: false });
+  } finally {
+    db.close();
+  }
+`;
+
+function consumeStateInWorker(path: string, state: string, now: number): Promise<boolean> {
+  return new Promise((resolvePromise, reject) => {
+    const worker = new Worker(STATE_WORKER_SOURCE, {
+      eval: true,
+      workerData: {
+        path,
+        state,
+        now,
+        retentionMs: CONSUMED_STATE_RETENTION_MS,
+        maxCandidates: MAX_ACTIVE_STATES,
+      },
+    });
+    let settled = false;
+    worker.once('message', (message: unknown) => {
+      settled = true;
+      resolvePromise(
+        message !== null && typeof message === 'object' && (message as { accepted?: unknown }).accepted === true,
+      );
+    });
+    worker.once('error', error => {
+      if (!settled) reject(error);
+    });
+    worker.once('exit', code => {
+      if (!settled && code !== 0) reject(new Error('OAuth state worker failed'));
+      else if (!settled) resolvePromise(false);
+    });
+  });
 }

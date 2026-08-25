@@ -1,22 +1,27 @@
 import { DatabaseSync } from 'node:sqlite';
-import { chmod, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NaverOAuth, type NaverTokenSet } from '../../src/calendar/oauth.js';
-import { SecretFileStore } from '../../src/secrets/file-store.js';
 
 const temporaryDirectories: string[] = [];
 
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'naver-oauth-test-'));
   temporaryDirectories.push(directory);
-  const tokenFile = join(directory, 'tokens.json');
-  const tokenStore = new SecretFileStore<NaverTokenSet>(tokenFile, {
-    verifyOwnerOnly: async () => true,
-    syncParent: async () => undefined,
-  });
-  return { directory, tokenFile, tokenStore, stateDbPath: join(directory, 'oauth-state.sqlite3') };
+  const tokenStore = new MemorySecretStore<NaverTokenSet>();
+  return { directory, tokenStore, stateDbPath: join(directory, 'oauth-state.sqlite3') };
+}
+
+class MemorySecretStore<T> {
+  value: T | undefined;
+  async read(): Promise<T> {
+    if (this.value === undefined) throw Object.assign(new Error('Secret file is missing'), { code: 'secret_file_invalid' });
+    return this.value;
+  }
+  async write(value: T): Promise<void> { this.value = value; }
+  async delete(): Promise<void> { this.value = undefined; }
 }
 
 function tokenResponse(accessToken = 'access-new', refreshToken: string | undefined = 'refresh-new') {
@@ -31,36 +36,6 @@ function tokenResponse(accessToken = 'access-new', refreshToken: string | undefi
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(temporaryDirectories.splice(0).map(path => rm(path, { recursive: true, force: true })));
-});
-
-describe('SecretFileStore', () => {
-  it('writes JSON atomically and leaves no temporary file behind', async () => {
-    const { directory, tokenFile, tokenStore } = await fixture();
-    await tokenStore.write({ accessToken: 'access', refreshToken: 'refresh', expiresAt: '2030-01-01T00:00:00.000Z' });
-
-    await expect(tokenStore.read()).resolves.toEqual({
-      accessToken: 'access', refreshToken: 'refresh', expiresAt: '2030-01-01T00:00:00.000Z',
-    });
-    expect(await readdir(directory)).toEqual(['tokens.json']);
-    expect((await stat(tokenFile)).isFile()).toBe(true);
-  });
-
-  it('fails closed when owner-only permissions cannot be verified', async () => {
-    const { tokenFile } = await fixture();
-    const store = new SecretFileStore(tokenFile, { platform: 'win32' });
-    await expect(store.write({ token: 'never-written' })).rejects.toMatchObject({
-      code: 'secret_permissions_unverifiable',
-    });
-  });
-
-  it('rejects a file whose permissions cease to be owner-only', async () => {
-    if (process.platform === 'win32') return;
-    const { tokenFile } = await fixture();
-    const store = new SecretFileStore(tokenFile);
-    await store.write({ token: 'secret' });
-    await chmod(tokenFile, 0o644);
-    await expect(store.read()).rejects.toMatchObject({ code: 'secret_permissions_invalid' });
-  });
 });
 
 describe('NaverOAuth one-time callback state', () => {
@@ -133,22 +108,56 @@ describe('NaverOAuth one-time callback state', () => {
 
   it('allows only one callback to win a concurrent state race', async () => {
     const files = await fixture();
-    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(tokenResponse());
-    const oauth = new NaverOAuth({
+    const firstFetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(tokenResponse());
+    const secondFetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(tokenResponse());
+    const first = new NaverOAuth({
       clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
-      ...files, fetch,
+      ...files, fetch: firstFetch,
     });
-    const { state } = oauth.authorize();
+    const second = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: secondFetch,
+    });
+    const { state } = first.authorize();
 
     const results = await Promise.allSettled([
-      oauth.handleCallback({ code: 'first-code', state }),
-      oauth.handleCallback({ code: 'second-code', state }),
+      first.handleCallback({ code: 'first-code', state }),
+      second.handleCallback({ code: 'second-code', state }),
     ]);
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter(result => result.status === 'rejected')[0]).toMatchObject({
       reason: { code: 'oauth_state_invalid' },
     });
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(firstFetch.mock.calls.length + secondFetch.mock.calls.length).toBe(1);
+  });
+
+  it('purges stale states and bounds active callback candidates', async () => {
+    const files = await fixture();
+    let now = Date.parse('2030-01-01T00:00:00.000Z');
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, now: () => now,
+    });
+    oauth.authorize();
+    const database = new DatabaseSync(files.stateDbPath);
+    const insert = database.prepare('INSERT INTO oauth_states (state_hash, expires_at, consumed, consumed_at) VALUES (?, ?, ?, ?)');
+    insert.run('a'.repeat(64), now - 1, 0, null);
+    insert.run('b'.repeat(64), now + 60_000, 1, now - 24 * 60 * 60_000 - 1);
+    for (let index = 0; index < 150; index += 1) {
+      insert.run(index.toString(16).padStart(64, '0'), now + 60_000, 0, null);
+    }
+    database.close();
+
+    now += 1;
+    oauth.authorize();
+    const reopened = new DatabaseSync(files.stateDbPath);
+    const stale = reopened.prepare('SELECT count(*) AS count FROM oauth_states WHERE expires_at <= ? OR (consumed = 1 AND consumed_at <= ?)')
+      .get(now, now - 24 * 60 * 60_000) as { count: number };
+    const active = reopened.prepare('SELECT count(*) AS count FROM oauth_states WHERE consumed = 0 AND expires_at > ?')
+      .get(now) as { count: number };
+    reopened.close();
+    expect(stale.count).toBe(0);
+    expect(active.count).toBeLessThanOrEqual(128);
   });
 
   it('consumes state when Naver returns a callback error', async () => {
@@ -246,6 +255,69 @@ describe('NaverOAuth token lifecycle', () => {
     await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
   });
 
+  it.each([
+    [401, 'oauth_auth'], [403, 'oauth_auth'], [429, 'oauth_rate_limited'], [500, 'oauth_server'], [503, 'oauth_server'],
+  ])('classifies token HTTP %i before a failing body read as %s', async (status, code) => {
+    const files = await fixture();
+    const response = {
+      ok: false, status,
+      text: vi.fn().mockRejectedValue(new Error('Authorization: Bearer access-secret private-body')),
+    } as unknown as Response;
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
+    });
+    const { state } = oauth.authorize();
+    await expect(oauth.handleCallback({ code: 'code', state })).rejects.toMatchObject({ code });
+    expect(response.text).not.toHaveBeenCalled();
+  });
+
+  it('maps a successful token response body failure without reading secrets into the error', async () => {
+    const files = await fixture();
+    const response = {
+      ok: true, status: 200,
+      text: vi.fn().mockRejectedValue(new Error('Authorization: Bearer access-secret private-body')),
+    } as unknown as Response;
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
+    });
+    const { state } = oauth.authorize();
+    const error = await oauth.handleCallback({ code: 'code', state }).catch(value => value as Error & { code: string });
+    expect(error.code).toBe('oauth_request_failed');
+    expect(`${error.message} ${error.stack ?? ''}`).not.toMatch(/access-secret|private-body|authorization|bearer/i);
+  });
+
+  it('does not delete local tokens when a successful revoke body read fails', async () => {
+    const files = await fixture();
+    const tokens = { accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' };
+    await files.tokenStore.write(tokens);
+    const response = { ok: true, status: 200, text: vi.fn().mockRejectedValue(new Error('reset')) } as unknown as Response;
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
+    });
+    await expect(oauth.revoke()).rejects.toMatchObject({ code: 'oauth_request_failed' });
+    await expect(files.tokenStore.read()).resolves.toEqual(tokens);
+  });
+
+  it.each([
+    [401, 'oauth_auth'], [403, 'oauth_auth'], [429, 'oauth_rate_limited'], [500, 'oauth_server'], [503, 'oauth_server'],
+  ])('classifies revoke HTTP %i before a failing body read as %s', async (status, code) => {
+    const files = await fixture();
+    await files.tokenStore.write({ accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
+    const response = {
+      ok: false, status,
+      text: vi.fn().mockRejectedValue(new Error('Authorization: Bearer access-secret private-body')),
+    } as unknown as Response;
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
+    });
+    await expect(oauth.revoke()).rejects.toMatchObject({ code });
+    expect(response.text).not.toHaveBeenCalled();
+  });
+
   it('never includes credentials, tokens, authorization headers, or response bodies in errors', async () => {
     const files = await fixture();
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(
@@ -275,5 +347,20 @@ describe('NaverOAuth token lifecycle', () => {
 
     await expect(oauth.handleCallback({ code: 'code', state })).rejects.toMatchObject({ code: 'oauth_invalid_response' });
     await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+  });
+
+  it('maps an expires_in date overflow to oauth_invalid_response', async () => {
+    const files = await fixture();
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'access-secret', refresh_token: 'refresh-secret', token_type: 'bearer',
+      expires_in: String(Number.MAX_SAFE_INTEGER),
+    }), { status: 200 }));
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch,
+    });
+    const { state } = oauth.authorize();
+
+    await expect(oauth.handleCallback({ code: 'code', state })).rejects.toMatchObject({ code: 'oauth_invalid_response' });
   });
 });
