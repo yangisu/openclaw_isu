@@ -1,8 +1,27 @@
 /// <reference types="node" />
 
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+  type BigIntStats,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseIcal, semanticEventHash, type CalendarEvent } from './ical.js';
 import type { CreateScheduleRequest } from './naver-api.js';
@@ -330,28 +349,18 @@ export class VerifiedOutboxBackupEvidence {
       if (!relativeSnapshot || relativeSnapshot.startsWith('..') || isAbsolute(relativeSnapshot)) {
         throw new Error('snapshot escapes its verified root');
       }
-      const snapshotBytes = readFileSync(realSnapshot);
+      const snapshotBytes = readStableSqliteArtifact(realSnapshot);
       if (entry.size !== snapshotBytes.byteLength || entry.sha256 !== sha256(snapshotBytes)) {
         throw new Error('snapshot coverage hash mismatch');
       }
 
-      const database = new DatabaseSync(realSnapshot, { readOnly: true, readBigInts: true });
-      try {
-        validateExistingSchema(database);
-        const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
-        if (integrity.integrity_check !== 'ok') throw new Error('snapshot integrity check failed');
-        const rows = database.prepare('SELECT request_id, payload_hash FROM calendar_requests')
-          .all() as Array<{ request_id: string; payload_hash: string }>;
-        const coverage = new Map(rows.map(row => [row.request_id, row.payload_hash]));
-        return new VerifiedOutboxBackupEvidence(
-          VERIFIED_EVIDENCE_TOKEN,
-          `${manifest.createdAt}:${manifest.gitHead}`,
-          manifestHash,
-          coverage,
-        );
-      } finally {
-        database.close();
-      }
+      const coverage = queryVerifiedSnapshotBytes(snapshotBytes);
+      return new VerifiedOutboxBackupEvidence(
+        VERIFIED_EVIDENCE_TOKEN,
+        `${manifest.createdAt}:${manifest.gitHead}`,
+        manifestHash,
+        coverage,
+      );
     } catch (error) {
       if (error instanceof CalendarOutboxError && error.code === 'invalid_backup_evidence') throw error;
       throw new CalendarOutboxError('invalid_backup_evidence', 'Backup manifest coverage could not be verified');
@@ -575,30 +584,46 @@ export class CalendarOutbox {
     const deleted: string[] = [];
     for (const row of candidates) {
       const current = mapRequest(row);
-      if (verified.coveredRequests.get(current.requestId) !== current.payloadHash) continue;
-      this.#transaction(() => {
-        assertVersionCanIncrement(current.version);
+      const pruned = this.#transaction(() => {
+        const live = this.#database.prepare(`
+          SELECT request_id, version, status, payload_hash, updated_at
+          FROM calendar_requests
+          WHERE request_id = ? AND version = ? AND status = 'succeeded' AND updated_at < ?
+        `).get(current.requestId, current.version, cutoff) as unknown as {
+          request_id: string;
+          version: number | bigint;
+          status: 'succeeded';
+          payload_hash: string;
+          updated_at: string;
+        } | undefined;
+        if (!live || verified.coveredRequests.get(live.request_id) !== live.payload_hash) return false;
+        const liveVersion = Number(live.version);
+        assertVersionCanIncrement(liveVersion);
         const versioned = this.#database.prepare(`
           UPDATE calendar_requests SET version = version + 1
-          WHERE request_id = ? AND version = ? AND status = 'succeeded'
-        `).run(current.requestId, current.version);
+          WHERE request_id = ? AND version = ? AND status = 'succeeded' AND payload_hash = ?
+        `).run(live.request_id, liveVersion, live.payload_hash);
         assertOneChange(versioned.changes, current.requestId);
         const audit = this.#database.prepare(`
           INSERT INTO calendar_outbox_audit (
             request_id, payload_hash, completed_at, deleted_at, backup_manifest_id, backup_manifest_hash
-          ) VALUES (?, ?, ?, ?, ?, ?)
+          )
+          SELECT request_id, payload_hash, updated_at, ?, ?, ?
+          FROM calendar_requests
+          WHERE request_id = ? AND version = ? AND status = 'succeeded' AND payload_hash = ?
         `).run(
-          current.requestId, current.payloadHash, current.updatedAt, now,
-          verified.manifestId, verified.manifestHash,
+          now, verified.manifestId, verified.manifestHash,
+          live.request_id, liveVersion + 1, live.payload_hash,
         );
         assertOneChange(audit.changes, current.requestId);
         const removed = this.#database.prepare(`
           DELETE FROM calendar_requests
-          WHERE request_id = ? AND version = ? AND status = 'succeeded'
-        `).run(current.requestId, current.version + 1);
+          WHERE request_id = ? AND version = ? AND status = 'succeeded' AND payload_hash = ?
+        `).run(live.request_id, liveVersion + 1, live.payload_hash);
         assertOneChange(removed.changes, current.requestId);
+        return true;
       });
-      deleted.push(current.requestId);
+      if (pruned) deleted.push(current.requestId);
     }
     return deleted;
   }
@@ -1086,6 +1111,150 @@ function validateExistingSchema(database: DatabaseSync): void {
   } catch (error) {
     throw new CalendarOutboxError('outbox_schema_mismatch', 'Calendar outbox schema does not match the required schema');
   }
+}
+
+function readStableSqliteArtifact(snapshotPath: string): Buffer {
+  rejectSqliteSidecars(snapshotPath);
+  const pathBefore = lstatSync(snapshotPath, { bigint: true });
+  assertRegularOwnedFile(pathBefore, 'snapshot');
+  const noFollow = (fsConstants as Partial<Record<'O_NOFOLLOW', number>>).O_NOFOLLOW ?? 0;
+  const descriptor = openSync(snapshotPath, fsConstants.O_RDONLY | noFollow);
+  try {
+    const handleBefore = fstatSync(descriptor, { bigint: true });
+    assertRegularOwnedFile(handleBefore, 'snapshot');
+    if (!sameFile(pathBefore, handleBefore)) throw new Error('snapshot identity changed while opening');
+
+    const bytes = readFileSync(descriptor);
+    const handleAfter = fstatSync(descriptor, { bigint: true });
+    const pathAfter = lstatSync(snapshotPath, { bigint: true });
+    assertRegularOwnedFile(pathAfter, 'snapshot');
+    if (!sameStableFile(handleBefore, handleAfter) || !sameStableFile(handleAfter, pathAfter)) {
+      throw new Error('snapshot changed while reading');
+    }
+    rejectSqliteSidecars(snapshotPath);
+    return bytes;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function queryVerifiedSnapshotBytes(snapshotBytes: Buffer): ReadonlyMap<string, string> {
+  const privateRoot = mkdtempSync(join(tmpdir(), 'openclaw-outbox-verify-'));
+  chmodSync(privateRoot, 0o700);
+  const rootIdentity = lstatSync(privateRoot, { bigint: true });
+  if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink()) {
+    throw new Error('private verification directory is invalid');
+  }
+  assertCurrentOwner(rootIdentity, 'private verification directory');
+
+  const privateSnapshot = join(privateRoot, 'snapshot.sqlite3');
+  const noFollow = (fsConstants as Partial<Record<'O_NOFOLLOW', number>>).O_NOFOLLOW ?? 0;
+  let snapshotIdentity: BigIntStats | undefined;
+  let database: DatabaseSync | undefined;
+  try {
+    const descriptor = openSync(
+      privateSnapshot,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      0o600,
+    );
+    try {
+      snapshotIdentity = fstatSync(descriptor, { bigint: true });
+      assertRegularOwnedFile(snapshotIdentity, 'private snapshot');
+      writeFileSync(descriptor, snapshotBytes);
+      fsyncSync(descriptor);
+      const writtenIdentity = fstatSync(descriptor, { bigint: true });
+      if (!sameFile(snapshotIdentity, writtenIdentity) || writtenIdentity.size !== BigInt(snapshotBytes.byteLength)) {
+        throw new Error('private snapshot was not written completely');
+      }
+      snapshotIdentity = writtenIdentity;
+    } finally {
+      closeSync(descriptor);
+    }
+
+    const pathIdentity = lstatSync(privateSnapshot, { bigint: true });
+    if (!sameStableFile(snapshotIdentity, pathIdentity)) throw new Error('private snapshot identity changed');
+    database = new DatabaseSync(privateSnapshot, { readOnly: true, readBigInts: true });
+    validateExistingSchema(database);
+    const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+    if (integrity.integrity_check !== 'ok') throw new Error('snapshot integrity check failed');
+    const rows = database.prepare('SELECT request_id, payload_hash FROM calendar_requests')
+      .all() as Array<{ request_id: string; payload_hash: string }>;
+    return new Map(rows.map(row => [row.request_id, row.payload_hash]));
+  } finally {
+    try {
+      database?.close();
+    } finally {
+      cleanupPrivateSnapshot(privateRoot, rootIdentity, privateSnapshot, snapshotIdentity);
+    }
+  }
+}
+
+function rejectSqliteSidecars(snapshotPath: string): void {
+  const snapshotName = basename(snapshotPath);
+  const relevantNames = new Set([
+    `${snapshotName}-wal`,
+    `${snapshotName}-shm`,
+    `${snapshotName}-journal`,
+  ]);
+  const hasSidecar = readdirSync(dirname(snapshotPath)).some(name =>
+    relevantNames.has(name) || name.startsWith(`${snapshotName}-mj`),
+  );
+  if (hasSidecar) throw new Error('snapshot has an unmanifested SQLite sidecar');
+}
+
+function cleanupPrivateSnapshot(
+  privateRoot: string,
+  rootIdentity: BigIntStats,
+  privateSnapshot: string,
+  snapshotIdentity: BigIntStats | undefined,
+): void {
+  const currentRoot = lstatSync(privateRoot, { bigint: true });
+  if (!currentRoot.isDirectory() || currentRoot.isSymbolicLink() || !sameFile(rootIdentity, currentRoot)) {
+    throw new Error('private verification directory identity changed');
+  }
+  const permitted = new Set([
+    basename(privateSnapshot),
+    `${basename(privateSnapshot)}-wal`,
+    `${basename(privateSnapshot)}-shm`,
+    `${basename(privateSnapshot)}-journal`,
+  ]);
+  for (const name of readdirSync(privateRoot)) {
+    if (!permitted.has(name)) throw new Error('private verification directory contains an unexpected artifact');
+    const path = join(privateRoot, name);
+    const stat = lstatSync(path, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('private verification artifact is not regular');
+    if (path === privateSnapshot && (!snapshotIdentity || !sameFile(snapshotIdentity, stat))) {
+      throw new Error('private snapshot identity changed before cleanup');
+    }
+    unlinkSync(path);
+  }
+  const beforeRemove = lstatSync(privateRoot, { bigint: true });
+  if (!sameFile(rootIdentity, beforeRemove) || readdirSync(privateRoot).length !== 0) {
+    throw new Error('private verification directory changed before cleanup');
+  }
+  rmdirSync(privateRoot);
+}
+
+function assertRegularOwnedFile(stat: BigIntStats, description: string): void {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink < 1n) {
+    throw new Error(`${description} is not a regular file`);
+  }
+  assertCurrentOwner(stat, description);
+}
+
+function assertCurrentOwner(stat: BigIntStats, description: string): void {
+  if (typeof process.getuid === 'function' && stat.uid !== BigInt(process.getuid())) {
+    throw new Error(`${description} is not owned by the verifier`);
+  }
+}
+
+function sameFile(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.nlink === right.nlink;
+}
+
+function sameStableFile(left: BigIntStats, right: BigIntStats): boolean {
+  return sameFile(left, right) && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 function parseBackupManifest(source: string): BackupManifest {

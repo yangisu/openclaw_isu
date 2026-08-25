@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFile, mkdir, readFile, rm as remove, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CalendarOutbox,
   CalendarOutboxError,
@@ -19,6 +22,47 @@ import {
   type CalendarEvent,
   type CalendarEventDraft,
 } from '../../src/calendar/ical.js';
+
+const verifierFsFaults = vi.hoisted(() => ({
+  afterHandleRead: undefined as (() => void) | undefined,
+  afterHandleWrite: undefined as (() => void) | undefined,
+  reportSymlinkFor: undefined as string | undefined,
+}));
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    readFileSync(path: Parameters<typeof actual.readFileSync>[0], ...args: unknown[]) {
+      const result = (actual.readFileSync as (...values: unknown[]) => unknown)(path, ...args);
+      if (typeof path === 'number' && verifierFsFaults.afterHandleRead) {
+        const fault = verifierFsFaults.afterHandleRead;
+        verifierFsFaults.afterHandleRead = undefined;
+        fault();
+      }
+      return result;
+    },
+    writeFileSync(path: Parameters<typeof actual.writeFileSync>[0], ...args: unknown[]) {
+      const result = (actual.writeFileSync as (...values: unknown[]) => unknown)(path, ...args);
+      if (typeof path === 'number' && verifierFsFaults.afterHandleWrite) {
+        const fault = verifierFsFaults.afterHandleWrite;
+        verifierFsFaults.afterHandleWrite = undefined;
+        fault();
+      }
+      return result;
+    },
+    lstatSync(path: Parameters<typeof actual.lstatSync>[0], ...args: unknown[]) {
+      const result = (actual.lstatSync as (...values: unknown[]) => object)(path, ...args);
+      if (String(path) !== verifierFsFaults.reportSymlinkFor) return result;
+      return new Proxy(result, {
+        get(target, property, receiver) {
+          if (property === 'isSymbolicLink') return () => true;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    },
+  };
+});
 
 const SENDER_ID = '740123456';
 const START = new Date('2026-08-25T00:00:00.900Z');
@@ -63,6 +107,9 @@ const directories: string[] = [];
 const openOutboxes: CalendarOutbox[] = [];
 
 afterEach(async () => {
+  verifierFsFaults.afterHandleRead = undefined;
+  verifierFsFaults.afterHandleWrite = undefined;
+  verifierFsFaults.reportSymlinkFor = undefined;
   for (const outbox of openOutboxes.splice(0)) outbox.close();
   await Promise.all(directories.splice(0).map(path => rm(path, {
     recursive: true, force: true, maxRetries: 5, retryDelay: 20,
@@ -676,6 +723,162 @@ describe('CalendarOutbox reconciliation and retention', () => {
     expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot)).toThrowError(
       expect.objectContaining({ code: 'invalid_backup_evidence' }),
     );
+  });
+
+  it('rejects an unmanifested row that exists only in an active WAL', async () => {
+    const f = await fixture();
+    f.outbox.prepare(draft());
+    f.outbox.close();
+    const backupRoot = await backupSnapshotFixture(f.stateDir);
+    const snapshotPath = join(backupRoot, 'state', 'calendar-outbox.sqlite3');
+    const database = new DatabaseSync(snapshotPath);
+    try {
+      database.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;');
+      database.prepare(`
+        INSERT INTO calendar_requests
+        SELECT ?, version, status, uid, calendar_id, payload_ical, payload_hash,
+               confirmed_by, confirmed_at, confirmation_expires_at, confirmation_consumed_at,
+               attempt_count, last_attempt_at, created_at, updated_at, http_status,
+               process_type, returned_ical_uid, error_code
+        FROM calendar_requests LIMIT 1
+      `).run('00000000-0000-4000-8000-999999999999');
+      await expect(stat(`${snapshotPath}-wal`)).resolves.toMatchObject({ isFile: expect.any(Function) });
+      expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot)).toThrowError(
+        expect.objectContaining({ code: 'invalid_backup_evidence' }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each(['-wal', '-shm', '-journal'])(
+    'rejects an unmanifested SQLite %s sidecar even when empty',
+    async suffix => {
+      const f = await fixture();
+      f.outbox.prepare(draft());
+      f.outbox.close();
+      const backupRoot = await backupSnapshotFixture(f.stateDir);
+      await writeFile(join(backupRoot, 'state', `calendar-outbox.sqlite3${suffix}`), new Uint8Array());
+      expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot)).toThrowError(
+        expect.objectContaining({ code: 'invalid_backup_evidence' }),
+      );
+    },
+  );
+
+  it('rejects a manifested SQLite symlink and nonregular artifact', async () => {
+    const f = await fixture();
+    f.outbox.prepare(draft());
+    f.outbox.close();
+
+    const symlinkRoot = await backupSnapshotFixture(f.stateDir);
+    const linkedPath = join(symlinkRoot, 'state', 'calendar-outbox.sqlite3');
+    verifierFsFaults.reportSymlinkFor = linkedPath;
+    expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(symlinkRoot)).toThrowError(
+      expect.objectContaining({ code: 'invalid_backup_evidence' }),
+    );
+    verifierFsFaults.reportSymlinkFor = undefined;
+
+    const directoryRoot = await backupSnapshotFixture(f.stateDir);
+    const directoryPath = join(directoryRoot, 'state', 'calendar-outbox.sqlite3');
+    await remove(directoryPath);
+    await mkdir(directoryPath);
+    expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(directoryRoot)).toThrowError(
+      expect.objectContaining({ code: 'invalid_backup_evidence' }),
+    );
+  });
+
+  it('rejects pathname mutation after the manifested bytes are read', async () => {
+    const f = await fixture();
+    f.outbox.prepare(draft());
+    f.outbox.close();
+    const backupRoot = await backupSnapshotFixture(f.stateDir);
+    const snapshotPath = join(backupRoot, 'state', 'calendar-outbox.sqlite3');
+    const replacementPath = join(backupRoot, 'replacement.sqlite3');
+    await copyFile(snapshotPath, replacementPath);
+    const replacement = new DatabaseSync(replacementPath);
+    replacement.prepare(`
+      INSERT INTO calendar_requests
+      SELECT ?, version, status, uid, calendar_id, payload_ical, payload_hash,
+             confirmed_by, confirmed_at, confirmation_expires_at, confirmation_consumed_at,
+             attempt_count, last_attempt_at, created_at, updated_at, http_status,
+             process_type, returned_ical_uid, error_code
+      FROM calendar_requests LIMIT 1
+    `).run('00000000-0000-4000-8000-888888888888');
+    replacement.close();
+    const replacementBytes = await readFile(replacementPath);
+    verifierFsFaults.afterHandleRead = () => { writeFileSync(snapshotPath, replacementBytes); };
+    expect(() => VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot)).toThrowError(
+      expect.objectContaining({ code: 'invalid_backup_evidence' }),
+    );
+  });
+
+  it('queries a private copy of the exact manifested bytes after pathname replacement', async () => {
+    const f = await fixture();
+    const first = f.outbox.prepare(draft());
+    await f.outbox.confirmAndSubmit(first.requestId, SENDER_ID, first.payloadHash);
+    f.outbox.close();
+    const backupRoot = await backupSnapshotFixture(f.stateDir);
+    const snapshotPath = join(backupRoot, 'state', 'calendar-outbox.sqlite3');
+
+    const live = f.create();
+    const second = live.prepare(draft({ uid: 'after-manifest' }));
+    await live.confirmAndSubmit(second.requestId, SENDER_ID, second.payloadHash);
+    live.close();
+    const replacementBytes = await readFile(join(f.stateDir, 'calendar-outbox.sqlite3'));
+    const replacementPath = join(backupRoot, 'replacement-after-hash.sqlite3');
+    writeFileSync(replacementPath, replacementBytes);
+    let replaced = false;
+    verifierFsFaults.afterHandleWrite = () => {
+      unlinkSync(snapshotPath);
+      renameSync(replacementPath, snapshotPath);
+      replaced = true;
+    };
+    const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(backupRoot);
+    expect(replaced).toBe(true);
+
+    const reopened = f.create();
+    f.advance(31 * 24 * 60 * 60 * 1_000);
+    expect(reopened.pruneSucceeded(evidence)).toEqual([first.requestId]);
+    expect(reopened.get(second.requestId)).toBeDefined();
+    reopened.close();
+  });
+
+  it('rechecks payload coverage after waiting for a concurrent writer inside the deletion transaction', async () => {
+    const f = await fixture();
+    const prepared = f.outbox.prepare(draft());
+    await f.outbox.confirmAndSubmit(prepared.requestId, SENDER_ID, prepared.payloadHash);
+    f.outbox.close();
+    const evidence = VerifiedOutboxBackupEvidence.verifySnapshot(await backupSnapshotFixture(f.stateDir));
+    const reopened = f.create();
+    f.advance(31 * 24 * 60 * 60 * 1_000);
+
+    const worker = new Worker(String.raw`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const { DatabaseSync } = require('node:sqlite');
+      const database = new DatabaseSync(workerData.path);
+      database.exec('PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE;');
+      database.prepare('UPDATE calendar_requests SET payload_hash = ? WHERE request_id = ?')
+        .run('f'.repeat(64), workerData.requestId);
+      parentPort.postMessage('locked');
+      setTimeout(() => {
+        database.exec('COMMIT;');
+        database.close();
+        parentPort.postMessage('committed');
+      }, 150);
+    `, {
+      eval: true,
+      workerData: {
+        path: join(f.stateDir, 'calendar-outbox.sqlite3'),
+        requestId: prepared.requestId,
+      },
+    });
+    const exited = once(worker, 'exit');
+    await expect(once(worker, 'message')).resolves.toEqual(['locked']);
+    expect(reopened.pruneSucceeded(evidence)).toEqual([]);
+    await exited;
+    expect(reopened.get(prepared.requestId)).toMatchObject({ payloadHash: 'f'.repeat(64) });
+    expect(reopened.auditEntries()).toEqual([]);
+    reopened.close();
   });
 });
 
