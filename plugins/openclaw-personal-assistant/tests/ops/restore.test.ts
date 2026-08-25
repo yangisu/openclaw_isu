@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -149,6 +149,12 @@ it('rejects a canary in reachable Git history even after the working file is rem
 
 it('records deterministic daily sample and monthly full restore evidence', async () => {
   const f = await fixture();
+  await mkdir(join(f.workspaceDir, 'memory'));
+  await writeFile(join(f.workspaceDir, 'memory', '2026-08-25.md'), [
+    '# Daily Memory', '', '### D-090300-001 Morning note', '- type: "daily"',
+    '- entry_at: 2026-08-25T09:03:00+09:00', '- created_at: 2026-08-25T09:03:00+09:00',
+    '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "telegram"', '', 'Daily body', '',
+  ].join('\n'));
   const backup = await createBackup({ ...f, recipient: 'schedule-key', identityFile: 'schedule-key', ageRunner: f.age,
     now: () => new Date('2026-08-25T00:00:00.000Z') });
   const restoreRoot = join(f.root, 'scheduled-restores'); await mkdir(restoreRoot);
@@ -161,5 +167,38 @@ it('records deterministic daily sample and monthly full restore evidence', async
   expect(records.map(record => [record.kind, record.status, record.gitHead])).toEqual([
     ['daily-sample', 'passed', backup.manifest.gitHead], ['monthly-full', 'passed', backup.manifest.gitHead],
   ]);
+  expect(records[0].sample).toMatchObject({ path: 'workspace/memory/2026-08-25.md', recordId: 'D-090300-001' });
+  expect(records[1].full).toMatchObject({ fileCount: expect.any(Number), treeSha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  expect((await readdir(restoreRoot)).filter(name => name.startsWith('restore-'))).toEqual([]);
+  f.outbox.close(); f.health.close();
+}, 30_000);
+
+it('validates and restores nonempty archived daily Markdown', async () => {
+  const f = await fixture();
+  await mkdir(join(f.workspaceDir, 'archive'));
+  await writeFile(join(f.workspaceDir, 'archive', '2026-08-24.md'), [
+    '# Daily Archive', '', '### D-080000-001 Archived note', '- type: "daily"',
+    '- entry_at: 2026-08-24T08:00:00+09:00', '- created_at: 2026-08-24T08:00:00+09:00',
+    '- updated_at: 2026-08-24T08:00:00+09:00', '- source: "telegram"', '', 'Archived body', '',
+  ].join('\n'));
+  const backup = await createBackup({ ...f, recipient: 'archive-key', identityFile: 'archive-key', ageRunner: f.age,
+    now: () => new Date('2026-08-25T00:00:00.000Z') });
+  const restoreRoot = join(f.root, 'archive-restore'); await mkdir(restoreRoot);
+  const restored = await restoreBackup({ archivePath: backup.archivePath, restoreRoot, identityFile: 'archive-key', ageRunner: f.age });
+  expect(await readFile(join(restored.restorePath, 'workspace', 'archive', '2026-08-24.md'), 'utf8')).toContain('D-080000-001');
+  f.outbox.close(); f.health.close();
+}, 30_000);
+
+it('records failed daily sampling and cleans its temporary restore', async () => {
+  const f = await fixture();
+  const backup = await createBackup({ ...f, recipient: 'failure-key', identityFile: 'failure-key', ageRunner: f.age,
+    now: () => new Date('2026-08-25T00:00:00.000Z') });
+  const restoreRoot = join(f.root, 'failed-sample'); await mkdir(restoreRoot);
+  await expect(verifyScheduledRestore({ archivePath: backup.archivePath, restoreRoot, stateDir: f.stateDir,
+    identityFile: 'failure-key', ageRunner: f.age, kind: 'daily-sample',
+    now: () => new Date('2026-08-25T12:00:00.000Z') })).rejects.toMatchObject({ code: 'restore_sample_missing' });
+  const records = (await readFile(join(f.stateDir, 'backup-restore-verifications.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(records).toEqual([expect.objectContaining({ kind: 'daily-sample', status: 'failed', errorCode: 'restore_sample_missing' })]);
+  expect((await readdir(restoreRoot)).filter(name => name.startsWith('restore-'))).toEqual([]);
   f.outbox.close(); f.health.close();
 }, 30_000);

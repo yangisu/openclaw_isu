@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFile, readFile, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,8 @@ import {
   BACKUP_ARCHIVE_LIMITS,
   cleanupBackupQuarantine,
   createBackup,
+  parseWindowsReparseClassification,
+  validateWindowsBackupAcl,
   verifyBackup,
   type AgeRunner,
 } from '../../src/ops/backup.js';
@@ -190,16 +192,17 @@ describe('encrypted verified backup', () => {
       now: () => new Date('2026-08-25T00:00:00.000Z') });
     expect(await readdir(quarantine)).toEqual(['quarantine-00000000-0000-4000-8000-000000000000']);
     expect(await cleanupBackupQuarantine({ stateDir: f.stateDir })).toEqual([]);
-  });
+  }, 30_000);
 
   it('syncs the encrypted file and containing directory before reporting recovery', async () => {
     const f = await fixture(); const events: string[] = [];
     await createBackup({ repository: f.repository, workspaceDir: f.workspaceDir, stateDir: f.stateDir,
       backupDir: f.backupDir, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
-      durability: { async syncFile() { events.push('file'); }, async syncDirectory() { events.push('directory'); } },
+      durability: { async syncFile() { events.push('file'); }, async syncDirectory() { events.push('directory'); return 'unsupported' as const; } },
+      durabilityDiagnostic(event) { events.push(event); },
       health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
       now: () => new Date('2026-08-25T00:00:00.000Z') });
-    expect(events).toEqual(['file', 'directory', 'recover']);
+    expect(events).toEqual(['file', 'file', 'directory', 'directory-sync-unsupported', 'directory', 'recover']);
   });
 
   it('does not publish or recover when durability fails', async () => {
@@ -213,6 +216,27 @@ describe('encrypted verified backup', () => {
     expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
   });
 
+  it('rolls back a post-rename directory-sync failure and surfaces rollback failure safely', async () => {
+    const rolledBack = await fixture(); const events: string[] = [];
+    await expect(createBackup({ ...rolledBack, recipient: 'age1test', identityFile: 'test-key', ageRunner: rolledBack.age,
+      durability: { async syncFile() {}, async syncDirectory() { throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
+      health: { report() { events.push('report'); }, recover() { events.push('recover'); } } as never,
+      now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'archive_directory_sync_failed' });
+    expect(events).toEqual(['report']); expect(await readdir(rolledBack.backupDir)).not.toContain('2026-08-25.age');
+
+    const stuck = await fixture(); let renames = 0;
+    await expect(createBackup({ ...stuck, recipient: 'age1test', identityFile: 'test-key', ageRunner: stuck.age,
+      durability: { async syncFile() {}, async syncDirectory() { throw Object.assign(new Error('disk'), { code: 'EIO' }); } },
+      publicationOps: {
+        async rename(source, destination) { if (++renames === 1) await rename(source, destination); else throw new Error('rollback rename denied'); },
+        async unlink() { throw new Error('rollback unlink denied'); },
+      }, now: () => new Date('2026-08-25T00:00:00.000Z') }))
+      .rejects.toMatchObject({ code: 'archive_rollback_failed' });
+    expect(await readdir(stuck.backupDir)).toEqual(expect.arrayContaining(['2026-08-25.age', '2026-08-25.age.uncommitted']));
+    const retained = await applyRetention({ backupDir: stuck.backupDir, identityFile: 'test-key', ageRunner: stuck.age, keep: 2 });
+    expect(retained.retained).toEqual([]);
+  }, 30_000);
+
   it('rejects a Markdown source that changes between read and identity verification', async () => {
     const f = await fixture(); let changed = false;
     await expect(createBackup({ repository: f.repository, workspaceDir: f.workspaceDir, stateDir: f.stateDir,
@@ -222,6 +246,33 @@ describe('encrypted verified backup', () => {
       },
       now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'source_changed' });
     expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
+  });
+
+  it('rejects oversized sources before allocation and detects canaries across stream chunks', async () => {
+    const oversized = await fixture();
+    await truncate(join(oversized.workspaceDir, 'NOTES.md'), BACKUP_ARCHIVE_LIMITS.maxFileBytes + 1);
+    await expect(createBackup({ ...oversized, recipient: 'age1test', identityFile: 'test-key', ageRunner: oversized.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toMatchObject({ code: 'source_size_limit' });
+    const boundary = await fixture(); const canary = 'BOUNDARY-CANARY-123456789';
+    await writeFile(join(boundary.workspaceDir, 'NOTES.md'), `${'x'.repeat(65_530)}${canary}\n`);
+    await expect(createBackup({ ...boundary, recipient: 'age1test', identityFile: 'test-key', ageRunner: boundary.age,
+      secretCanaries: [canary], now: () => new Date('2026-08-25T00:00:00.000Z') }))
+      .rejects.toMatchObject({ code: 'secret_material_detected' });
+  }, 30_000);
+
+  it('validates authoritative Windows reparse and ACL evidence', () => {
+    expect(parseWindowsReparseClassification(' True\r\n')).toBe(true);
+    expect(parseWindowsReparseClassification('false')).toBe(false);
+    expect(() => parseWindowsReparseClassification('unknown')).toThrowError(expect.objectContaining({ code: 'reparse_classification_failed' }));
+    const valid = { currentSid: 'S-1-5-21-100', ownerSid: 'S-1-5-21-100', protected: true,
+      rules: [{ sid: 'S-1-5-21-100', inherited: false, type: 'Allow' }, { sid: 'S-1-5-32-544', inherited: false, type: 'Allow' }] };
+    expect(() => validateWindowsBackupAcl(JSON.stringify(valid))).not.toThrow();
+    for (const mutation of [
+      { ownerSid: 'S-1-5-21-999' }, { rules: valid.rules.slice(0, 1) },
+      { rules: [...valid.rules, { sid: 'S-1-5-18', inherited: false, type: 'Allow' }] },
+      { rules: valid.rules.map((rule, index) => index ? { ...rule, type: 'Deny' } : rule) },
+      { protected: false }, { rules: valid.rules.map((rule, index) => index ? { ...rule, inherited: true } : rule) },
+    ]) expect(() => validateWindowsBackupAcl(JSON.stringify({ ...valid, ...mutation }))).toThrowError(expect.objectContaining({ code: 'acl_unsafe' }));
   });
   it('holds the repository writer boundary through the snapshot and returns immutable outbox evidence', async () => {
     const f = await fixture();
@@ -262,6 +313,38 @@ describe('encrypted verified backup', () => {
     expect(secondOutbox.get(second.requestId)).toBeDefined();
     secondOutbox.close();
     f.outbox.close(); f.alerts.close(); f.health.close();
+  }, 30_000);
+
+  it('takes a consistent online SQLite backup while an outbox writer commits under quiesce', async () => {
+    const f = await fixture(); let entered!: () => void; const locked = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void; const hold = new Promise<void>(resolve => { release = resolve; });
+    const backupPromise = createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      snapshotCheckpoint: async phase => { if (phase === 'locked') { entered(); await hold; } },
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    await locked;
+    const prepared = f.outbox.prepare(calendarDraft('backup-event'));
+    f.outbox.confirm(prepared.requestId, '42', prepared.payloadHash); await f.outbox.submit(prepared.requestId, '42');
+    release(); const backup = await backupPromise;
+    f.clock.now = new Date('2026-09-25T00:00:01.000Z');
+    expect(f.outbox.pruneSucceeded(backup.outboxEvidence)).toContain(prepared.requestId);
+  }, 30_000);
+
+  it('quarantines staged plaintext after abort or post-encryption verification failure and never publishes', async () => {
+    const controller = new AbortController(); controller.abort();
+    for (const scenario of [
+      { signal: controller.signal, ageRunner: {
+        async encrypt(_input: string, _output: string, _recipient: string, signal?: AbortSignal) {
+          expect(signal?.aborted).toBe(true); throw Object.assign(new Error('aborted'), { code: 'process_aborted' });
+        }, async decrypt() { throw new Error('unreachable'); },
+      } as AgeRunner },
+      { ageRunner: new FakeAge('test-key', bundle => { const entry = bundle.files.find(file => file.path === 'workspace/TASKS.md')!; entry.data[0] ^= 1; }) },
+    ]) {
+      const f = await fixture();
+      await expect(createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ...scenario,
+        now: () => new Date('2026-08-25T00:00:00.000Z') })).rejects.toBeDefined();
+      expect(await readdir(f.backupDir)).not.toContain('2026-08-25.age');
+      expect((await readdir(join(f.stateDir, '.backup-quarantine'))).some(name => name.startsWith('quarantine-'))).toBe(true);
+    }
   }, 30_000);
 
   it('reports a backup failure to the real briefing source and clears it only after verified success', async () => {
@@ -346,6 +429,19 @@ describe('encrypted verified backup', () => {
     expect((await readdir(f.backupDir)).filter(name => name.endsWith('.age')).sort())
       .toEqual(['2026-08-24.age', '2026-08-25.age']);
     f.outbox.close(); f.alerts.close(); f.health.close();
+  }, 30_000);
+
+  it('checks reparse classification again immediately before retention deletion', async () => {
+    const f = await fixture();
+    const newest = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-25T00:00:00.000Z') });
+    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-24.age'));
+    await copyFile(newest.archivePath, join(f.backupDir, '2026-08-23.age'));
+    let oldestChecks = 0;
+    const result = await applyRetention({ backupDir: f.backupDir, identityFile: 'test-key', ageRunner: f.age, keep: 2,
+      pathSafety: { async isReparsePoint(path) { if (path.endsWith('2026-08-23.age')) { oldestChecks += 1; return oldestChecks >= 3; } return false; } } });
+    expect(oldestChecks).toBe(3); expect(result.deleted).toEqual([]);
+    await expect(stat(join(f.backupDir, '2026-08-23.age'))).resolves.toBeDefined();
   }, 30_000);
 
   it('rejects a configured workspace junction and an injected database reparse classification', async () => {

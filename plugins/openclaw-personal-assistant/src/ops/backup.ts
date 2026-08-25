@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants, type BigIntStats } from 'node:fs';
 import {
-  appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath,
+  chmod, lstat, mkdir, mkdtemp, open, readdir, realpath,
   rename, rm, stat, unlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -31,6 +31,7 @@ const REQUIRED_DATABASES = ['operations.sqlite3', 'calendar-outbox.sqlite3', 'al
 const OPTIONAL_DATABASES = ['subsystem-health.sqlite3'] as const;
 const ARCHIVE_NAME = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\.age$/;
 const TEMP_PREFIX = 'openclaw-backup-';
+const MARKDOWN_MAX_BYTES = 8 * 1024 * 1024;
 
 export class BackupError extends Error {
   constructor(public readonly code: string, message: string) {
@@ -63,10 +64,19 @@ interface BackupBase {
   pathSafety?: PathSafety;
   aclVerifier?: BackupAclVerifier;
   durability?: BackupDurability;
+  publicationOps?: BackupPublicationOps;
+  durabilityDiagnostic?: (event: 'directory-synced' | 'directory-sync-unsupported', path: string) => void;
 }
 
 export interface PathSafety {
   isReparsePoint(path: string): Promise<boolean>;
+}
+
+export function parseWindowsReparseClassification(output: string): boolean {
+  const value = output.trim().toLowerCase();
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new BackupError('reparse_classification_failed', 'Windows reparse classification returned an invalid result');
 }
 
 export interface BackupAclVerifier {
@@ -74,9 +84,37 @@ export interface BackupAclVerifier {
   verifyBackupRoot(path: string): Promise<void>;
 }
 
+interface WindowsAclEvidence {
+  currentSid: string;
+  ownerSid: string;
+  protected: boolean;
+  rules: Array<{ sid: string; inherited: boolean; type: 'Allow' | 'Deny' }>;
+}
+
+export function validateWindowsBackupAcl(output: string): void {
+  let evidence: WindowsAclEvidence;
+  try { evidence = JSON.parse(output) as WindowsAclEvidence; }
+  catch { throw new BackupError('acl_unsafe', 'Backup ACL evidence is invalid'); }
+  const sid = /^S-\d(?:-\d+)+$/;
+  if (!evidence || !sid.test(evidence.currentSid) || evidence.ownerSid !== evidence.currentSid
+    || evidence.protected !== true || !Array.isArray(evidence.rules) || evidence.rules.length < 2) {
+    throw new BackupError('acl_unsafe', 'Backup ACL owner or inheritance policy is unsafe');
+  }
+  const allowed = new Set([evidence.currentSid, 'S-1-5-32-544']);
+  if (evidence.rules.some(rule => !rule || !allowed.has(rule.sid) || rule.inherited || rule.type !== 'Allow')
+    || !evidence.rules.some(rule => rule.sid === evidence.currentSid)
+    || !evidence.rules.some(rule => rule.sid === 'S-1-5-32-544')) {
+    throw new BackupError('acl_unsafe', 'Backup ACL contains a denied, inherited, missing, or unknown principal');
+  }
+}
+
 export interface BackupDurability {
   syncFile(path: string): Promise<void>;
-  syncDirectory(path: string): Promise<void>;
+  syncDirectory(path: string): Promise<void | 'unsupported'>;
+}
+export interface BackupPublicationOps {
+  rename(source: string, destination: string): Promise<void>;
+  unlink(path: string): Promise<void>;
 }
 
 export interface CreateBackupInput extends BackupBase {
@@ -123,8 +161,10 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
   const age = input.ageRunner ?? new AgeExecRunner();
   const acl = input.aclVerifier ?? defaultAclVerifier;
   const durability = input.durability ?? defaultDurability;
+  const publication = input.publicationOps ?? defaultPublicationOps;
   let workRoot: string | undefined;
   let temporaryArchive: string | undefined;
+  let incompleteMarker: string | undefined;
   let plaintextStaged = false;
   try {
     assertNonSecretInputs(input);
@@ -133,10 +173,12 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
     const stateRoot = await canonicalDirectoryRoot(input.stateDir, input.pathSafety);
     const date = seoulDate((input.now ?? (() => new Date()))());
     const finalArchive = join(backupRoot, `${date}.age`);
+    incompleteMarker = `${finalArchive}.uncommitted`;
     temporaryArchive = `${finalArchive}.tmp`;
     await assertAbsent(finalArchive);
     await assertAbsent(temporaryArchive);
-    workRoot = await privateStateTempRoot(stateRoot);
+    await assertAbsent(incompleteMarker);
+    workRoot = await privateStateTempRoot(stateRoot, input.pathSafety);
     await acl.verifyPrivateDirectory(workRoot);
     const snapshotRoot = join(workRoot, 'snapshot');
     const bundlePath = join(workRoot, 'snapshot.bundle');
@@ -169,13 +211,26 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
       throw new BackupError('archive_changed', 'Encrypted archive changed before publication');
     }
     await durability.syncFile(temporaryArchive);
-    await rename(temporaryArchive, finalArchive);
+    await writeFile(incompleteMarker, 'publication pending\n', { flag: 'wx', mode: 0o600 });
+    await durability.syncFile(incompleteMarker);
+    await publication.rename(temporaryArchive, finalArchive);
     temporaryArchive = undefined;
-    try { await durability.syncDirectory(backupRoot); } catch (error) {
-      await rename(finalArchive, `${finalArchive}.tmp`).catch(() => undefined);
-      temporaryArchive = `${finalArchive}.tmp`;
-      throw error;
+    try {
+      const result = await durability.syncDirectory(backupRoot);
+      input.durabilityDiagnostic?.(result === 'unsupported' ? 'directory-sync-unsupported' : 'directory-synced', backupRoot);
+    } catch (error) {
+      try {
+        await publication.rename(finalArchive, `${finalArchive}.failed-${crypto.randomUUID()}`);
+        await durability.syncDirectory(backupRoot).catch(() => undefined);
+      } catch {
+        try { await publication.unlink(finalArchive); }
+        catch { throw new BackupError('archive_rollback_failed', `Backup publication rollback failed; remove ${basename(finalArchive)} only after confirming ${basename(incompleteMarker)} exists`); }
+      }
+      throw new BackupError('archive_directory_sync_failed', 'Backup directory durability failed; archive was not published');
     }
+    await publication.unlink(incompleteMarker);
+    incompleteMarker = undefined;
+    await durability.syncDirectory(backupRoot);
     await cleanupBackupQuarantine({ stateDir: stateRoot, aclVerifier: acl, pathSafety: input.pathSafety });
     input.health?.recover('backup');
     return { archivePath: finalArchive, manifest, outboxEvidence };
@@ -188,6 +243,10 @@ export async function createBackup(input: CreateBackupInput): Promise<VerifiedBa
   } finally {
     if (workRoot) await cleanupPrivateRoot(workRoot).catch(() => undefined);
     if (temporaryArchive) await unlink(temporaryArchive).catch(() => undefined);
+    if (incompleteMarker) {
+      const final = incompleteMarker.slice(0, -'.uncommitted'.length);
+      if (!(await exists(final))) await unlink(incompleteMarker).catch(() => undefined);
+    }
   }
 }
 
@@ -209,9 +268,7 @@ export async function restoreBackup(input: RestoreBackupInput): Promise<{ restor
   let restorePath: string | undefined;
   let restoreStaging: string | undefined;
   try {
-    const root = await realpath(input.restoreRoot);
-    const rootStat = await lstat(root, { bigint: true });
-    assertDirectory(rootStat, 'restore root');
+    const root = await canonicalDirectoryRoot(input.restoreRoot, input.pathSafety, 'restore_root_unsafe');
     verified = await verifyArchiveToFreshDirectory(input);
     const restoreId = crypto.randomUUID();
     restorePath = join(root, `restore-${restoreId}`);
@@ -237,27 +294,81 @@ export async function restoreBackup(input: RestoreBackupInput): Promise<{ restor
 export async function verifyScheduledRestore(input: ScheduledRestoreInput): Promise<{
   restorePath: string; evidencePath: string; manifest: BackupManifest;
 }> {
-  const restored = await restoreBackup(input);
   const stateRoot = await canonicalDirectoryRoot(input.stateDir, input.pathSafety);
   const evidencePath = join(stateRoot, 'backup-restore-verifications.jsonl');
-  const record = {
-    version: 1, kind: input.kind, status: 'passed', archive: basename(input.archivePath),
-    gitHead: restored.manifest.gitHead,
-    verifiedAt: (input.now ?? (() => new Date()))().toISOString(),
-  };
-  await appendFile(evidencePath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
-  await (input.durability ?? defaultDurability).syncFile(evidencePath);
-  await (input.durability ?? defaultDurability).syncDirectory(stateRoot);
-  return { ...restored, evidencePath };
+  let restored: Awaited<ReturnType<typeof restoreBackup>> | undefined;
+  try {
+    restored = await restoreBackup(input);
+    const detail = input.kind === 'daily-sample'
+      ? await inspectDailyRestoreSample(restored.restorePath)
+      : await inspectFullRestore(restored.restorePath);
+    await recordRestoreEvidence(evidencePath, stateRoot, {
+      version: 1, kind: input.kind, status: 'passed', archive: basename(input.archivePath),
+      gitHead: restored.manifest.gitHead, verifiedAt: (input.now ?? (() => new Date()))().toISOString(), ...detail,
+    }, input);
+    const result = { ...restored, evidencePath };
+    await removeScheduledRestore(input.restoreRoot, restored.restorePath, input.pathSafety);
+    await (input.durability ?? defaultDurability).syncDirectory(await realpath(input.restoreRoot));
+    return result;
+  } catch (error) {
+    if (restored) await removeScheduledRestore(input.restoreRoot, restored.restorePath, input.pathSafety).catch(() => undefined);
+    await recordRestoreEvidence(evidencePath, stateRoot, {
+      version: 1, kind: input.kind, status: 'failed', archive: basename(input.archivePath),
+      errorCode: asBackupError(error).code, verifiedAt: (input.now ?? (() => new Date()))().toISOString(),
+    }, input).catch(() => undefined);
+    throw asBackupError(error);
+  }
+}
+
+async function inspectDailyRestoreSample(restorePath: string): Promise<{ sample: { path: string; recordId: string; sha256: string } }> {
+  const workspace = join(restorePath, 'workspace');
+  const candidates = (await listFiles(workspace)).filter(path => /^(?:memory|archive)\/\d{4}-\d{2}-\d{2}\.md$/.test(path)).sort();
+  for (const path of candidates) {
+    const bytes = await readTextBounded(join(workspace, ...path.split('/')), MARKDOWN_MAX_BYTES);
+    const document = parseDocument('daily', bytes, new Set());
+    const record = document.records[0];
+    if (record) return { sample: { path: `workspace/${path}`, recordId: record.id, sha256: sha256(Buffer.from(bytes)) } };
+  }
+  throw new BackupError('restore_sample_missing', 'Daily sample restore found no real record');
+}
+
+async function inspectFullRestore(restorePath: string): Promise<{ full: { fileCount: number; totalBytes: number; treeSha256: string } }> {
+  const paths = await listFiles(restorePath); let totalBytes = 0;
+  const digest = createHash('sha256');
+  for (const path of paths) {
+    const evidence = await hashFileBounded(join(restorePath, ...path.split('/')), BACKUP_ARCHIVE_LIMITS.maxFileBytes);
+    totalBytes += evidence.size; digest.update(`${path}\0${evidence.size}\0${evidence.sha256}\n`);
+  }
+  return { full: { fileCount: paths.length, totalBytes, treeSha256: digest.digest('hex') } };
+}
+
+async function recordRestoreEvidence(
+  evidencePath: string, stateRoot: string, record: Record<string, unknown>, input: ScheduledRestoreInput,
+): Promise<void> {
+  const pathSafety = input.pathSafety ?? DEFAULT_PATH_SAFETY;
+  const existing = await lstat(evidencePath, { bigint: true }).catch(() => undefined);
+  if (existing && (!existing.isFile() || existing.isSymbolicLink() || await pathSafety.isReparsePoint(evidencePath)
+    || await realpath(evidencePath) !== evidencePath || !within(stateRoot, evidencePath))) {
+    throw new BackupError('restore_evidence_unsafe', 'Restore evidence path is unsafe');
+  }
+  const identity = existing ? await canonicalRegularFile(evidencePath, stateRoot, pathSafety) : undefined;
+  const prior = identity ? await readTextBounded(identity.path, MARKDOWN_MAX_BYTES) : '';
+  if (identity) await assertPathIdentity(identity, pathSafety);
+  const temporary = join(stateRoot, `.backup-restore-evidence-${crypto.randomUUID()}.tmp`);
+  await writeFile(temporary, `${prior}${JSON.stringify(record)}\n`, { flag: 'wx', mode: 0o600 });
+  const durability = input.durability ?? defaultDurability;
+  await durability.syncFile(temporary);
+  if (identity) await assertPathIdentity(identity, pathSafety);
+  await rename(temporary, evidencePath);
+  await durability.syncDirectory(stateRoot);
 }
 
 export async function applyRetention(input: RetentionInput): Promise<{ deleted: string[]; retained: string[] }> {
   try {
     const keep = Math.max(2, input.keep ?? 30);
     if (!Number.isSafeInteger(keep)) throw new BackupError('retention_invalid', 'Retention count is invalid');
-    const root = await realpath(input.backupDir);
-    const rootStat = await lstat(root, { bigint: true });
-    assertDirectory(rootStat, 'backup root');
+    const pathSafety = input.pathSafety ?? DEFAULT_PATH_SAFETY;
+    const root = await canonicalDirectoryRoot(input.backupDir, pathSafety, 'retention_root_unsafe');
     const paths = input.candidatePaths
       ? [...input.candidatePaths]
       : (await readdir(root)).map(name => join(root, name));
@@ -265,11 +376,12 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     for (const path of paths) {
       const name = basename(path);
       if (!ARCHIVE_NAME.test(name) || !validArchiveDate(name)) continue;
+      if (await exists(`${resolve(path)}.uncommitted`)) continue;
       const resolvedPath = resolve(path);
       if (!within(root, resolvedPath)) continue;
       let before: BigIntStats;
       try { before = await lstat(resolvedPath, { bigint: true }); } catch { continue; }
-      if (!before.isFile() || before.isSymbolicLink()) continue;
+      if (!before.isFile() || before.isSymbolicLink() || await pathSafety.isReparsePoint(resolvedPath)) continue;
       let real: string;
       try { real = await realpath(resolvedPath); } catch { continue; }
       if (!within(root, real) || real !== resolvedPath) continue;
@@ -282,7 +394,8 @@ export async function applyRetention(input: RetentionInput): Promise<{ deleted: 
     const deleted: string[] = [];
     for (const candidate of verified.slice(keep)) {
       const current = await lstat(candidate.path, { bigint: true });
-      if (!sameStableFile(candidate.identity, current) || current.isSymbolicLink() || !current.isFile()) continue;
+      if (!sameStableFile(candidate.identity, current) || current.isSymbolicLink() || !current.isFile()
+        || await pathSafety.isReparsePoint(candidate.path)) continue;
       const real = await realpath(candidate.path);
       if (!within(root, real) || real !== candidate.path) continue;
       await unlink(candidate.path);
@@ -386,7 +499,8 @@ async function verifyArchiveToFreshDirectory(input: VerifyBackupInput) {
   const age = input.ageRunner ?? new AgeExecRunner();
   const archivePath = resolve(input.archivePath);
   const archiveStat = await lstat(archivePath, { bigint: true });
-  if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) throw new BackupError('archive_unsafe', 'Backup archive is not a regular file');
+  if (!archiveStat.isFile() || archiveStat.isSymbolicLink()
+    || await (input.pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(archivePath)) throw new BackupError('archive_unsafe', 'Backup archive is not a regular file');
   const realArchive = await realpath(archivePath);
   if (realArchive !== archivePath) throw new BackupError('archive_unsafe', 'Backup archive path is indirect');
   const root = await privateTempRoot();
@@ -406,7 +520,7 @@ async function verifyArchiveToFreshDirectory(input: VerifyBackupInput) {
 }
 
 async function verifySnapshotLayout(snapshotRoot: string, canaries: readonly string[]): Promise<BackupManifest> {
-  const manifest = parseManifest(await readFile(join(snapshotRoot, 'manifest.json'), 'utf8'));
+  const manifest = parseManifest(await readTextBounded(join(snapshotRoot, 'manifest.json'), 4 * 1024 * 1024));
   const actual = (await listFiles(snapshotRoot)).filter(path => path !== 'manifest.json').sort();
   const expected = manifest.files.map(file => file.path).sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new BackupError('manifest_file_set_mismatch', 'Snapshot file set does not match manifest');
@@ -439,10 +553,10 @@ async function validateMarkdown(snapshotRoot: string): Promise<void> {
   for (const path of await listFiles(workspace)) {
     if (!path.endsWith('.md')) continue;
     const name = basename(path);
-    const kind = path.startsWith('memory/') ? 'daily' : ROOT_MARKDOWN.get(name);
+    const kind = path.startsWith('memory/') || path.startsWith('archive/') ? 'daily' : ROOT_MARKDOWN.get(name);
     if (!kind) throw new BackupError('markdown_path_invalid', `Unexpected Markdown path: ${path}`);
     const ids = seen.get(kind) ?? new Set<string>();
-    const document = parseDocument(kind, await readFile(join(workspace, ...path.split('/')), 'utf8'), ids);
+    const document = parseDocument(kind, await readTextBounded(join(workspace, ...path.split('/')), MARKDOWN_MAX_BYTES), ids);
     document.records.forEach(record => ids.add(record.id));
     seen.set(kind, ids);
   }
@@ -700,18 +814,23 @@ async function copyStable(
   const canonical = await realpath(source);
   if (canonical !== resolve(source)) throw new BackupError('source_path_escape', 'Snapshot source is indirect');
   const handle = await open(source, fsConstants.O_RDONLY | noFollow);
+  let output: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const opened = await handle.stat({ bigint: true });
     if (!sameStableFile(before, opened)) throw new BackupError('source_changed', 'Snapshot source changed while opening');
-    const bytes = await handle.readFile();
+    if (opened.size > BigInt(BACKUP_ARCHIVE_LIMITS.maxFileBytes)) throw new BackupError('source_size_limit', 'Snapshot source exceeds per-file limit');
+    assertLogicalPathSecretFree(destination);
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+    output = await open(destination, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    await streamHandleWithSecretScan(handle, output, destination, canaries, Number(opened.size));
     await checkpoint?.(source);
     const after = await handle.stat({ bigint: true });
     const pathAfter = await lstat(source, { bigint: true });
-    if (!sameStableFile(opened, after) || !sameStableFile(after, pathAfter)) throw new BackupError('source_changed', 'Snapshot source changed while reading');
-    assertBytesSecretFree(destination, bytes, canaries);
-    await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
-    await writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
-  } finally { await handle.close(); }
+    if (!sameStableFile(opened, after) || !sameStableFile(after, pathAfter)
+      || await pathSafety.isReparsePoint(source) || await realpath(source) !== canonical) {
+      throw new BackupError('source_changed', 'Snapshot source changed while reading');
+    }
+  } finally { await output?.close(); await handle.close(); }
 }
 
 async function copyTreeVerified(source: string, destination: string): Promise<void> {
@@ -734,7 +853,25 @@ interface CanonicalFileIdentity {
 
 const DEFAULT_PATH_SAFETY: PathSafety = {
   async isReparsePoint(path) {
-    return (await lstat(path)).isSymbolicLink();
+    if ((await lstat(path)).isSymbolicLink()) return true;
+    const windowsPath = process.platform === 'win32' && /^d:\\/i.test(path)
+      ? path
+      : process.platform === 'linux' && /^\/mnt\/d\//i.test(path)
+        ? await runExecFileCapture({ executable: 'wslpath', args: ['-w', path], timeoutMs: 10_000 }).then(value => value.trim())
+        : undefined;
+    if (!windowsPath) return false;
+    try {
+      const output = await runExecFileCapture({
+        executable: 'powershell.exe',
+        args: ['-NoProfile', '-NonInteractive', '-Command',
+          '$p=$args[0];[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)', windowsPath],
+        timeoutMs: 10_000,
+      });
+      return parseWindowsReparseClassification(output);
+    } catch (error) {
+      if (error instanceof BackupError) throw error;
+      throw new BackupError('reparse_classification_failed', 'Windows reparse classification was unavailable');
+    }
   },
 };
 
@@ -806,8 +943,7 @@ async function listFiles(root: string): Promise<string[]> {
 
 async function scanSnapshot(root: string, canaries: readonly string[]): Promise<void> {
   for (const path of await listFiles(root)) {
-    const bytes = await readFile(join(root, ...path.split('/')));
-    assertBytesSecretFree(path, bytes, canaries);
+    await assertFileSecretFree(join(root, ...path.split('/')), path, canaries);
   }
 }
 
@@ -816,7 +952,55 @@ async function assertFileSecretFree(
   logicalPath: string,
   canaries: readonly string[],
 ): Promise<void> {
-  assertBytesSecretFree(logicalPath, await readFile(file), canaries);
+  assertLogicalPathSecretFree(logicalPath);
+  const handle = await open(file, 'r');
+  try {
+    const info = await handle.stat({ bigint: true });
+    if (info.size > BigInt(BACKUP_ARCHIVE_LIMITS.maxFileBytes)) throw new BackupError('source_size_limit', 'Secret scan input exceeds per-file limit');
+    await streamHandleWithSecretScan(handle, undefined, logicalPath, canaries, Number(info.size));
+  } finally { await handle.close(); }
+}
+
+function assertLogicalPathSecretFree(logicalPath: string): void {
+  if (/secret|credential|oauth|token|\.key$/i.test(logicalPath)) {
+    throw new BackupError('secret_material_detected', 'Secret-named material is excluded from backups');
+  }
+}
+
+async function streamHandleWithSecretScan(
+  input: Awaited<ReturnType<typeof open>>,
+  output: Awaited<ReturnType<typeof open>> | undefined,
+  logicalPath: string,
+  canaries: readonly string[],
+  expectedSize: number,
+): Promise<{ size: number; sha256: string }> {
+  assertLogicalPathSecretFree(logicalPath);
+  const needles = [...canaries.filter(Boolean), '-----BEGIN PRIVATE KEY-----', '-----BEGIN AGE SECRET KEY-----'];
+  const overlap = Math.max(256, ...needles.map(value => Buffer.byteLength(value))) - 1;
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  const hash = createHash('sha256');
+  let carry = Buffer.alloc(0); let position = 0;
+  while (position < expectedSize) {
+    const { bytesRead } = await input.read(chunk, 0, Math.min(chunk.length, expectedSize - position), position);
+    if (bytesRead === 0) throw new BackupError('source_changed', 'Snapshot source was truncated while reading');
+    const bytes = chunk.subarray(0, bytesRead);
+    const window = Buffer.concat([carry, bytes]);
+    assertBytesSecretFree(logicalPath, window, canaries);
+    hash.update(bytes);
+    if (output) await output.write(bytes, 0, bytes.length, position);
+    carry = Buffer.from(window.subarray(Math.max(0, window.length - overlap)));
+    position += bytesRead;
+  }
+  return { size: position, sha256: hash.digest('hex') };
+}
+
+async function readTextBounded(path: string, maximum: number): Promise<string> {
+  const handle = await open(path, 'r');
+  try {
+    const info = await handle.stat({ bigint: true });
+    if (info.size > BigInt(maximum)) throw new BackupError('markdown_size_limit', 'Markdown file exceeds validation limit');
+    return await handle.readFile({ encoding: 'utf8' });
+  } finally { await handle.close(); }
 }
 
 function assertBytesSecretFree(
@@ -824,9 +1008,7 @@ function assertBytesSecretFree(
   bytes: Uint8Array,
   canaries: readonly string[],
 ): void {
-  if (/secret|credential|oauth|token|\.key$/i.test(logicalPath)) {
-    throw new BackupError('secret_material_detected', 'Secret-named material is excluded from backups');
-  }
+  assertLogicalPathSecretFree(logicalPath);
   const buffer = Buffer.from(bytes);
   const needles = [
     ...canaries.filter(Boolean).map(value => Buffer.from(value)),
@@ -857,14 +1039,12 @@ async function assertGitHistoryClean(
   if (patterns.length === 0) return;
   const commits = (await gitOutput(workspace, ['rev-list', head])).split(/\s+/).filter(Boolean);
   if (commits.length === 0) return;
-  const root = await privateTempRoot();
-  try {
-    const patternFile = join(root, 'patterns');
-    await writeFile(patternFile, `${patterns.join('\n')}\n`, { mode: 0o600 });
-    const { execFile } = await import('node:child_process');
+  const { execFile } = await import('node:child_process');
+  for (const pattern of patterns) {
+    if (Buffer.byteLength(pattern) > 8 * 1024) throw new BackupError('secret_scan_pattern_invalid', 'Secret scan pattern exceeds safe process argument limit');
     for (const commit of commits) {
       const found = await new Promise<boolean>((resolvePromise, reject) => execFile(
-        'git', ['grep', '--quiet', '--fixed-strings', '--ignore-case', '-f', patternFile, commit],
+        'git', ['grep', '--quiet', '--fixed-strings', '--ignore-case', '-e', pattern, commit],
         { cwd: workspace, shell: false, windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024 },
         error => {
           if (!error) resolvePromise(true);
@@ -874,7 +1054,7 @@ async function assertGitHistoryClean(
       ));
       if (found) throw new BackupError('secret_material_detected', 'Secret material was detected in Git history');
     }
-  } finally { await cleanupPrivateRoot(root); }
+  }
 }
 
 async function verifyGitBundle(
@@ -932,14 +1112,14 @@ async function privateTempRoot(): Promise<string> {
   return real;
 }
 
-async function privateStateTempRoot(stateRoot: string): Promise<string> {
+async function privateStateTempRoot(stateRoot: string, pathSafety?: PathSafety): Promise<string> {
   const parent = join(stateRoot, '.backup-private');
   await mkdir(parent, { recursive: true, mode: 0o700 });
   await chmod(parent, 0o700);
-  const canonicalParent = await canonicalDirectoryUnder(parent, stateRoot);
+  const canonicalParent = await canonicalDirectoryUnder(parent, stateRoot, pathSafety);
   const root = await mkdtemp(join(canonicalParent, TEMP_PREFIX));
   await chmod(root, 0o700);
-  return canonicalDirectoryUnder(root, canonicalParent);
+  return canonicalDirectoryUnder(root, canonicalParent, pathSafety);
 }
 
 const defaultAclVerifier: BackupAclVerifier = {
@@ -949,32 +1129,32 @@ const defaultAclVerifier: BackupAclVerifier = {
     if (process.platform !== 'win32' && (Number(info.mode) & 0o077) !== 0) {
       throw new BackupError('acl_unsafe', 'Private directory permits group or other access');
     }
+    await verifyWindowsAclPath(path);
   },
   async verifyBackupRoot(path) {
     const info = await lstat(path, { bigint: true });
     assertDirectory(info, 'backup root');
-    // The deployed D: target is NTFS and must be explicitly audited by the host.
-    const windowsPath = process.platform === 'win32' && /^d:\\/i.test(path)
+    await verifyWindowsAclPath(path);
+  },
+};
+
+async function verifyWindowsAclPath(path: string): Promise<void> {
+  // The deployed D: target is NTFS and must be explicitly audited by the host.
+  const windowsPath = process.platform === 'win32' && /^d:\\/i.test(path)
       ? path
       : process.platform === 'linux' && /^\/mnt\/d\//i.test(path)
         ? await runExecFileCapture({ executable: 'wslpath', args: ['-w', path], timeoutMs: 10_000 }).then(value => value.trim())
         : undefined;
-    if (windowsPath) {
+  if (windowsPath) {
       const output = await runExecFileCapture({
         executable: 'powershell.exe',
         args: ['-NoProfile', '-NonInteractive', '-Command',
-          '$p=$args[0];$a=Get-Acl -LiteralPath $p;"OWNER|$($a.Owner)";$a.Access|%{"$($_.IdentityReference.Value)|$($_.IsInherited)|$($_.AccessControlType)"}', windowsPath],
+          '$p=$args[0];$a=Get-Acl -LiteralPath $p;$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.Owner;if($o -notmatch "^S-"){$o=([Security.Principal.NTAccount]$o).Translate([Security.Principal.SecurityIdentifier]).Value};$r=@($a.Access|%{$s=$_.IdentityReference;if($s -isnot [Security.Principal.SecurityIdentifier]){$s=$s.Translate([Security.Principal.SecurityIdentifier])};@{sid=$s.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4', windowsPath],
         timeoutMs: 10_000,
       });
-      const lines = output.split(/\r?\n/).filter(Boolean);
-      const owner = lines.shift()?.replace(/^OWNER\|/, '');
-      if (!owner || lines.length === 0 || lines.some(line => /\|True\|/i.test(line)
-        || (!/\\Administrators\||S-1-5-32-544\|/i.test(line) && !line.startsWith(`${owner}|False|Allow`)))) {
-        throw new BackupError('acl_unsafe', 'Backup root ACL is not restricted to its owner and Administrators');
-      }
-    }
-  },
-};
+      validateWindowsBackupAcl(output);
+  }
+}
 
 const defaultDurability: BackupDurability = {
   async syncFile(path) { const handle = await open(path, 'r+'); try { await handle.sync(); } finally { await handle.close(); } },
@@ -988,9 +1168,12 @@ const defaultDurability: BackupDurability = {
       // Windows does not expose directory handles through Node; the atomic rename
       // is the strongest available fallback on these documented error codes.
       if (!(process.platform === 'win32' && (code === 'EINVAL' || code === 'EPERM' || code === 'EISDIR'))) throw error;
+      return 'unsupported';
     } finally { await handle?.close(); }
   },
 };
+
+const defaultPublicationOps: BackupPublicationOps = { rename, unlink };
 
 async function quarantinePrivateRoot(stateDir: string, workRoot: string, acl: BackupAclVerifier, pathSafety?: PathSafety): Promise<string> {
   const stateRoot = await canonicalDirectoryRoot(stateDir, pathSafety);
@@ -1049,6 +1232,18 @@ async function removeRestoreStaging(restoreRoot: string, staging: string): Promi
   const info = await lstat(target, { bigint: true }).catch(() => undefined);
   if (!info) return;
   assertDirectory(info, 'restore staging directory');
+  await rm(target, { recursive: true });
+}
+
+async function removeScheduledRestore(restoreRoot: string, restorePath: string, pathSafety?: PathSafety): Promise<void> {
+  const root = await canonicalDirectoryRoot(restoreRoot, pathSafety, 'restore_root_unsafe');
+  const target = resolve(restorePath);
+  if (!within(root, target) || !/^restore-[0-9a-f-]+$/.test(basename(target))) {
+    throw new BackupError('cleanup_target_unsafe', 'Refusing unsafe scheduled restore cleanup target');
+  }
+  const info = await lstat(target, { bigint: true });
+  if (!info.isDirectory() || info.isSymbolicLink() || await (pathSafety ?? DEFAULT_PATH_SAFETY).isReparsePoint(target)
+    || await realpath(target) !== target) throw new BackupError('cleanup_target_unsafe', 'Scheduled restore cleanup target is indirect');
   await rm(target, { recursive: true });
 }
 
