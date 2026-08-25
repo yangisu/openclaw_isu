@@ -1,0 +1,47 @@
+{
+  channels: {
+    telegram: {
+      enabled: true,
+      tokenFile: '/home/user/.openclaw/secrets/telegram-token',
+      dmPolicy: 'allowlist',
+      allowFrom: ['tg:123456789'],
+      groupPolicy: 'disabled',
+      configWrites: false,
+    },
+  },
+  commands: {
+    bash: false,
+    config: false,
+    mcp: false,
+    plugins: false,
+  },
+  tools: {
+    allow: [
+      'assistant_query',
+      'assistant_mutate',
+      'assistant_calendar_prepare',
+      'assistant_calendar_confirm',
+      'assistant_briefing',
+    ],
+    elevated: { enabled: false },
+  },
+  plugins: {
+    entries: {
+      'openclaw-personal-assistant': {
+        enabled: true,
+        config: {
+          workspaceDir: '/home/user/.openclaw/workspace',
+          stateDir: '/home/user/.openclaw/state/openclaw-personal-assistant',
+          backupDir: '/mnt/d/openclaw_setting/backups',
+          telegramUserId: '123456789',
+          timezone: 'Asia/Seoul',
+          calendar: {
+            caldavBaseUrl: 'https://caldav.calendar.naver.com',
+            caldavSecretFile: '/home/user/.openclaw/secrets/naver-caldav',
+            naverTokenFile: '/home/user/.openclaw/secrets/naver-oauth',
+          },
+        },
+      },
+    },
+  },
+}

@@ -10,6 +10,7 @@ import {
 } from './calendar.js';
 import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
+import { briefingParameters, createBriefingTool } from './briefing.js';
 
 const absoluteWslPath = Type.String({ pattern: '^/(?!.*(?:^|/)\\.\\.(?:/|$)).+' });
 
@@ -70,6 +71,16 @@ export default defineToolPlugin({
       optional: true,
       factory({ api, toolContext }) {
         return createCalendarConfirmTool(api, toolContext);
+      },
+    }),
+    tool({
+      name: 'assistant_briefing',
+      label: 'Assistant Briefing',
+      description: 'Build one deterministic owner briefing from local records and fresh calendar state.',
+      parameters: briefingParameters,
+      optional: true,
+      factory({ api, toolContext }) {
+        return createBriefingTool(api, toolContext);
       },
     }),
   ],

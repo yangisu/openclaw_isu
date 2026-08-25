@@ -63,7 +63,8 @@
       "assistant_query",
       "assistant_mutate",
       "assistant_calendar_prepare",
-      "assistant_calendar_confirm"
+      "assistant_calendar_confirm",
+      "assistant_briefing"
     ]
   },
   "toolMetadata": {
@@ -77,6 +78,9 @@
       "optional": true
     },
     "assistant_calendar_confirm": {
+      "optional": true
+    },
+    "assistant_briefing": {
       "optional": true
     }
   }

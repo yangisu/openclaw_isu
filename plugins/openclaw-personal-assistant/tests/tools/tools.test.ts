@@ -7,6 +7,7 @@ import { getToolPluginMetadata } from 'openclaw/plugin-sdk/tool-plugin';
 
 import plugin from '../../src/index.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
+import { createBriefingTool } from '../../src/tools/briefing.js';
 import { createCalendarConfirmTool, createCalendarPrepareTool } from '../../src/tools/calendar.js';
 import { createMutationTool } from '../../src/tools/mutate.js';
 import { createQueryTool } from '../../src/tools/query.js';
@@ -38,13 +39,14 @@ afterEach(async () => {
 });
 
 describe('OpenClaw personal-assistant tool boundary', () => {
-  it('registers exactly four statically owned optional tools', () => {
+  it('registers exactly five statically owned optional tools', () => {
     const metadata = getToolPluginMetadata(plugin);
     expect(metadata?.tools.map(tool => ({ name: tool.name, optional: tool.optional }))).toEqual([
       { name: 'assistant_query', optional: true },
       { name: 'assistant_mutate', optional: true },
       { name: 'assistant_calendar_prepare', optional: true },
       { name: 'assistant_calendar_confirm', optional: true },
+      { name: 'assistant_briefing', optional: true },
     ]);
   });
 
@@ -56,11 +58,16 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     const mutateOpen = vi.fn();
     const prepareOpen = vi.fn();
     const confirmOpen = vi.fn();
+    const briefingOpen = vi.fn();
 
     const query = createQueryTool(api(), toolContext, { openRepository: queryOpen });
     const mutate = createMutationTool(api(), toolContext, { openRepository: mutateOpen });
     const prepare = createCalendarPrepareTool(api(), toolContext, { openOutbox: prepareOpen });
     const confirm = createCalendarConfirmTool(api(), toolContext, { openOutbox: confirmOpen });
+    const briefing = createBriefingTool(api(), toolContext, {
+      openRepository: briefingOpen,
+      now: () => new Date('2026-08-25T09:00:00+09:00'),
+    });
 
     await expect(query.execute('call-query', { kind: 'records', recordType: 'task' }))
       .rejects.toMatchObject({ code: 'sender_not_allowed' });
@@ -76,11 +83,49 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     await expect(confirm.execute('call-confirm', {
       requestId: randomUUID(), payloadHash: 'a'.repeat(64),
     })).rejects.toMatchObject({ code: 'sender_not_allowed' });
+    await expect(briefing.execute('call-briefing', {}))
+      .rejects.toMatchObject({ code: 'sender_not_allowed' });
 
     expect(queryOpen).not.toHaveBeenCalled();
     expect(mutateOpen).not.toHaveBeenCalled();
     expect(prepareOpen).not.toHaveBeenCalled();
     expect(confirmOpen).not.toHaveBeenCalled();
+    expect(briefingOpen).not.toHaveBeenCalled();
+  });
+
+  it('keeps local briefing output and reports a CalDAV failure instead of an empty calendar', async () => {
+    const query = vi.fn(async ({ kind }: { kind: string }) => kind === 'task' ? [{
+      id: 'T-20260825-001', title: 'Local report', orderedFields: [], body: '',
+      fields: { type: 'task', status: 'open', priority: 'high', due_at: '2026-08-25T12:00:00+09:00' },
+    }] : []);
+    const closeRepository = vi.fn();
+    const closeAlerts = vi.fn();
+    const tool = createBriefingTool(api({ calendar: {
+      caldavBaseUrl: 'https://caldav.example.test',
+      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+    } }), ownerContext, {
+      now: () => new Date('2026-08-25T09:00:00+09:00'),
+      openRepository: () => ({ query, close: closeRepository }),
+      openCalendar: () => ({ async listEvents() {
+        throw Object.assign(new Error('private network detail'), { code: 'CALDAV_TIMEOUT' });
+      } }),
+      openAlerts: () => ({
+        prepare: (errors: unknown[]) => errors,
+        markDelivered: vi.fn(),
+        close: closeAlerts,
+      } as never),
+    });
+
+    const result = await tool.execute('call-briefing-caldav-failure', {});
+
+    expect(result.details).toMatchObject({
+      send: true, allowed: true, trust: 'quoted_untrusted_data',
+    });
+    expect((result.details as any).messages.join('\n')).toContain('Local report');
+    expect((result.details as any).messages.join('\n')).toContain('CALDAV_TIMEOUT (naver-caldav)');
+    expect((result.details as any).messages.join('\n')).not.toContain('private network detail');
+    expect(closeRepository).toHaveBeenCalledTimes(1);
+    expect(closeAlerts).toHaveBeenCalledTimes(1);
   });
 
   it('returns imported instructions as quoted structured data without interpreting them', async () => {
