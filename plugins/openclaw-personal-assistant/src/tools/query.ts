@@ -109,10 +109,12 @@ function openRepository(config: AssistantToolConfig): QueryRepository {
 
 function openCalendar(config: AssistantToolConfig): CalendarReader {
   const calendar = requireCalendarReadConfig(config);
-  return new CalDavClient({
+  const client = new CalDavClient({
     baseUrl: calendar.caldavBaseUrl,
     secretFile: calendar.caldavSecretFile,
+    calendarMappings: calendar.calendarMappings,
   });
+  return { listEvents: range => client.listMappedEvents(range) };
 }
 
 function validateRange(from: string, to: string): void {

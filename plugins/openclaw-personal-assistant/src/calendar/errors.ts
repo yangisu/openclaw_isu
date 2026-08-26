@@ -8,7 +8,8 @@ export type CalDavErrorCode =
   | 'CALDAV_TLS_REQUIRED'
   | 'CALDAV_HTTP'
   | 'CALDAV_RESPONSE_TOO_LARGE'
-  | 'CALDAV_XML_LIMIT';
+  | 'CALDAV_XML_LIMIT'
+  | 'CALDAV_MAPPING';
 
 export class CalDavError extends Error {
   constructor(public readonly code: CalDavErrorCode, message: string) {

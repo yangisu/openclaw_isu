@@ -4,13 +4,16 @@ import type {
 } from 'openclaw/plugin-sdk/plugin-entry';
 import { isCronSessionKey } from 'openclaw/plugin-sdk/routing';
 
-import { loadConfig, type AssistantConfig } from '../config.js';
+import {
+  loadCalendarMappings, loadConfig, type AssistantConfig, type CalendarCollectionMapping,
+} from '../config.js';
 import { normalizeTelegramUserId } from '../telegram-user-id.js';
 
 export interface CalendarToolConfig {
   caldavBaseUrl?: string;
   caldavSecretFile?: string;
   naverTokenFile?: string;
+  calendarMappings?: CalendarCollectionMapping[];
 }
 
 export interface AssistantToolConfig extends AssistantConfig {
@@ -32,7 +35,7 @@ export function loadConfigFromApi(api: OpenClawPluginApi): AssistantToolConfig {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration must be an object');
   }
   const value = rawCalendar as Record<string, unknown>;
-  const allowed = new Set(['caldavBaseUrl', 'caldavSecretFile', 'naverTokenFile']);
+  const allowed = new Set(['caldavBaseUrl', 'caldavSecretFile', 'naverTokenFile', 'calendarMappings']);
   if (Object.keys(value).some(key => !allowed.has(key))) {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration contains an unknown field');
   }
@@ -51,6 +54,16 @@ export function loadConfigFromApi(api: OpenClawPluginApi): AssistantToolConfig {
       throw new AssistantToolError('invalid_calendar_config', 'CalDAV base URL must use HTTPS');
     }
     calendar.caldavBaseUrl = value.caldavBaseUrl;
+  }
+  if (value.calendarMappings !== undefined) {
+    if (!calendar.caldavBaseUrl) {
+      throw new AssistantToolError('invalid_calendar_config', 'Calendar mappings require a CalDAV base URL');
+    }
+    try {
+      calendar.calendarMappings = loadCalendarMappings(calendar.caldavBaseUrl, value.calendarMappings);
+    } catch {
+      throw new AssistantToolError('invalid_calendar_config', 'Invalid calendarMappings');
+    }
   }
   return { ...config, calendar };
 }
@@ -100,12 +113,13 @@ export function assertOwnerOrTrustedBriefingCron(
 export function requireCalendarReadConfig(config: AssistantToolConfig): {
   caldavBaseUrl: string;
   caldavSecretFile: string;
+  calendarMappings: CalendarCollectionMapping[];
 } {
-  const { caldavBaseUrl, caldavSecretFile } = config.calendar ?? {};
-  if (!caldavBaseUrl || !caldavSecretFile) {
+  const { caldavBaseUrl, caldavSecretFile, calendarMappings } = config.calendar ?? {};
+  if (!caldavBaseUrl || !caldavSecretFile || !calendarMappings?.length) {
     throw new AssistantToolError('calendar_not_configured', 'CalDAV read access is not configured');
   }
-  return { caldavBaseUrl, caldavSecretFile };
+  return { caldavBaseUrl, caldavSecretFile, calendarMappings };
 }
 
 export function requireCalendarWriteConfig(config: AssistantToolConfig): {

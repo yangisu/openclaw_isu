@@ -45,6 +45,12 @@
             caldavBaseUrl: 'https://caldav.calendar.naver.com',
             caldavSecretFile: '/home/user/.openclaw/secrets/naver-caldav',
             naverTokenFile: '/home/user/.openclaw/secrets/naver-oauth',
+            calendarMappings: [
+              {
+                apiCalendarId: 'OWNER_APPROVED_NAVER_API_CALENDAR_ID',
+                caldavHref: 'https://caldav.calendar.naver.com/OWNER_APPROVED_CALDAV_COLLECTION/',
+              },
+            ],
           },
         },
       },

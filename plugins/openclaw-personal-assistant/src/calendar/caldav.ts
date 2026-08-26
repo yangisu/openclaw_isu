@@ -1,4 +1,5 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { canonicalizeCalDavHref, loadCalendarMappings } from '../config.js';
 import { CalDavError, type CalDavErrorCode } from './errors.js';
 import { type CalendarEvent, parseIcal } from './ical.js';
 import { readCalDavCredentials } from './secret.js';
@@ -17,6 +18,11 @@ export interface EventRange {
   end: string | Date;
 }
 
+export interface CalDavCalendarMapping {
+  apiCalendarId: string;
+  caldavHref: string;
+}
+
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export interface CalDavClientOptions {
@@ -25,6 +31,7 @@ export interface CalDavClientOptions {
   fetch?: FetchLike;
   /** Defaults to the fixed production request bound of 15 seconds. */
   timeoutMs?: number;
+  calendarMappings?: readonly CalDavCalendarMapping[];
 }
 
 const DAV_HEADERS = { 'content-type': 'application/xml; charset=utf-8' };
@@ -45,6 +52,7 @@ export class CalDavClient {
   readonly #secretFile: string;
   readonly #fetch: FetchLike;
   readonly #timeoutMs: number;
+  readonly #calendarMappings: ReadonlyMap<string, URL>;
 
   constructor(options: CalDavClientOptions) {
     this.#baseUrl = new URL(options.baseUrl);
@@ -54,6 +62,16 @@ export class CalDavClient {
     this.#secretFile = options.secretFile;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
+    try {
+      const mappings = options.calendarMappings === undefined
+        ? [] : loadCalendarMappings(this.#baseUrl.href, options.calendarMappings);
+      this.#calendarMappings = new Map(mappings.map(mapping => [
+        mapping.apiCalendarId,
+        new URL(mapping.caldavHref),
+      ]));
+    } catch {
+      throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is invalid');
+    }
   }
 
   async listCalendars(): Promise<CalDavCalendar[]> {
@@ -68,15 +86,50 @@ export class CalDavClient {
       const resourceType = objectValue(prop?.resourcetype);
       if (!prop || !Object.prototype.hasOwnProperty.call(resourceType, 'calendar')) return [];
       const id = boundedText(response.href, CALDAV_HREF_MAX_BYTES).trim();
+      let href: URL;
+      try { href = canonicalizeCalDavHref(this.#baseUrl, id); }
+      catch { throw new CalDavError('CALDAV_MAPPING', 'CalDAV discovery returned an unsafe collection href'); }
       return [{
         id,
-        href: new URL(id, this.#baseUrl).href,
+        href: href.href,
         displayName: boundedText(prop.displayname, CALDAV_DISPLAY_NAME_MAX_BYTES).trim(),
       }];
     });
   }
 
-  async listEvents(range: EventRange): Promise<CalendarEvent[]> {
+  async validateCalendarMappings(): Promise<CalDavCalendar[]> {
+    if (this.#calendarMappings.size === 0) {
+      throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
+    }
+    const discovered = await this.listCalendars();
+    for (const target of this.#calendarMappings.values()) {
+      const ambiguous = discovered.some(calendar => calendar.href !== target.href && (
+        new URL(calendar.href).pathname.startsWith(target.pathname) ||
+        target.pathname.startsWith(new URL(calendar.href).pathname)
+      ));
+      if (discovered.filter(calendar => calendar.href === target.href).length !== 1 || ambiguous) {
+        throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping did not match discovery');
+      }
+    }
+    return discovered;
+  }
+
+  async listMappedEvents(range: EventRange): Promise<CalendarEvent[]> {
+    const events: CalendarEvent[] = [];
+    for (const apiCalendarId of this.#calendarMappings.keys()) {
+      events.push(...await this.listEvents(range, apiCalendarId));
+    }
+    if (this.#calendarMappings.size === 0) {
+      throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
+    }
+    return events;
+  }
+
+  async listEvents(range: EventRange, apiCalendarId: string): Promise<CalendarEvent[]> {
+    const mappedApiCalendarId = apiCalendarId;
+    const target = this.#calendarMappings.get(mappedApiCalendarId);
+    if (!target) throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
+    await this.validateCalendarMappings();
     const start = calDavTimestamp(range.start);
     const end = calDavTimestamp(range.end);
     const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -86,7 +139,7 @@ export class CalDavClient {
     <c:time-range start="${start}" end="${end}"/>
   </c:comp-filter></c:comp-filter></c:filter>
 </c:calendar-query>`;
-    const xml = await this.#request('REPORT', body, '1');
+    const xml = await this.#request('REPORT', body, '1', target);
     const events: CalendarEvent[] = [];
     const seenIdentities = new Set<string>();
     for (const response of responseList(parseXml(xml))) {
@@ -96,7 +149,7 @@ export class CalDavClient {
       assertIcalStructureBounded(calendarData);
       let parsed: CalendarEvent[];
       try {
-        parsed = parseIcal(calendarData, this.#baseUrl.pathname);
+        parsed = parseIcal(calendarData, mappedApiCalendarId);
       } catch {
         throw new CalDavError('CALDAV_XML', 'CalDAV response contains invalid iCalendar data');
       }
@@ -116,12 +169,12 @@ export class CalDavClient {
     return events;
   }
 
-  async #request(method: 'PROPFIND' | 'REPORT', body: string, depth: string): Promise<string> {
+  async #request(method: 'PROPFIND' | 'REPORT', body: string, depth: string, target = this.#baseUrl): Promise<string> {
     const credentials = await readCalDavCredentials(this.#secretFile);
     const signal = AbortSignal.timeout(this.#timeoutMs);
     let response: Response;
     try {
-      response = await this.#fetch(this.#baseUrl, {
+      response = await this.#fetch(target, {
         method,
         body,
         signal,

@@ -54,6 +54,16 @@ describe('hardened OpenClaw example config', () => {
     expect(source).not.toMatch(/botToken\s*:/i);
     expect(source).not.toMatch(/(?:password|clientSecret|accessToken|refreshToken)\s*:/i);
   });
+
+  it('declares an explicit owner-approved API-to-CalDAV collection mapping', async () => {
+    const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
+    expect(config.plugins.entries['openclaw-personal-assistant'].config.calendar.calendarMappings).toEqual([
+      {
+        apiCalendarId: 'OWNER_APPROVED_NAVER_API_CALENDAR_ID',
+        caldavHref: 'https://caldav.calendar.naver.com/OWNER_APPROVED_CALDAV_COLLECTION/',
+      },
+    ]);
+  });
 });
 
 describe('exact hourly briefing cron evidence', () => {

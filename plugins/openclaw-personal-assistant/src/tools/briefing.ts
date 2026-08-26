@@ -127,7 +127,12 @@ function openRepository(config: AssistantToolConfig): BriefingRepository {
 
 function openCalendar(config: AssistantToolConfig): BriefingCalendar {
   const calendar = requireCalendarReadConfig(config);
-  return new CalDavClient({ baseUrl: calendar.caldavBaseUrl, secretFile: calendar.caldavSecretFile });
+  const client = new CalDavClient({
+    baseUrl: calendar.caldavBaseUrl,
+    secretFile: calendar.caldavSecretFile,
+    calendarMappings: calendar.calendarMappings,
+  });
+  return { listEvents: range => client.listMappedEvents(range) };
 }
 
 function taskFromRecord(record: ParsedRecord): BriefingTask[] {

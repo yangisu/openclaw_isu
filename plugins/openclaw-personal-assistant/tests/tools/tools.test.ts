@@ -535,4 +535,16 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       expect(Value.Check(configSchema, { ...config, telegramUserId })).toBe(false);
     }
   });
+
+  it('accepts only structurally explicit calendar collection mappings in the plugin schema', () => {
+    const calendar = {
+      caldavBaseUrl: 'https://caldav.example.test/',
+      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+      calendarMappings: [{ apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' }],
+    };
+    expect(Value.Check(configSchema, { ...config, calendar })).toBe(true);
+    expect(Value.Check(configSchema, {
+      ...config, calendar: { ...calendar, calendarMappings: [{ ...calendar.calendarMappings[0], inferredId: 'personal' }] },
+    })).toBe(false);
+  });
 });

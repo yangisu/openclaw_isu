@@ -372,6 +372,17 @@ describe('deployment scripts', () => {
     ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
     ['wrong CalDAV secret path', (text: string) => text.replace('/naver-caldav', '/wrong-caldav')],
     ['wrong Naver token path', (text: string) => text.replace('/naver-oauth', '/wrong-oauth')],
+    ['missing calendar mapping', (text: string) => text.replace(/\s*calendarMappings: \[[\s\S]*?\n\s*\],/, '')],
+    ['duplicate calendar API ID', (text: string) => text.replace(
+      "apiCalendarId: 'api-personal'",
+      "apiCalendarId: 'api-personal'",
+    ).replace(
+      "caldavHref: 'https://caldav.calendar.naver.com/collections/personal/'",
+      "caldavHref: 'https://caldav.calendar.naver.com/collections/personal/',\n              },\n              {\n                apiCalendarId: 'api-personal',\n                caldavHref: 'https://caldav.calendar.naver.com/collections/work/'",
+    )],
+    ['cross-origin calendar href', (text: string) => text.replace('https://caldav.calendar.naver.com/collections/personal/', 'https://attacker.example/collections/personal/')],
+    ['base-root calendar href', (text: string) => text.replace('https://caldav.calendar.naver.com/collections/personal/', 'https://caldav.calendar.naver.com/')],
+    ['encoded traversal calendar href', (text: string) => text.replace('collections/personal/', 'collections/%252e%252e/admin/')],
     ['placeholder', (text: string) => text.replace("timezone: 'Asia/Seoul'", "timezone: '<replace-timezone>'")],
   ])('rejects %s through the full hardened config contract used by --check', (_label, mutate) => {
     const root = mkdtempSync(resolve(tmpdir(), 'ocpa-check-config-'));
@@ -381,7 +392,9 @@ describe('deployment scripts', () => {
       const secretRoot = resolve(root, 'secrets');
       const configSecretRoot = secretRoot.replaceAll('\\', '/');
       const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
-        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot);
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
+        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
+        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal');
       writeFileSync(config, baseline, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
       const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });

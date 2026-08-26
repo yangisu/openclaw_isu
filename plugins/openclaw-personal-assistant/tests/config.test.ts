@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
+import { loadCalendarMappings, loadConfig } from '../src/config.js';
+import { loadConfigFromApi } from '../src/tools/trust.js';
 
 const validConfig = {
   workspaceDir: '/home/user/.openclaw/workspace',
@@ -10,6 +11,72 @@ const validConfig = {
 } as const;
 
 describe('loadConfig', () => {
+  it('loads calendarMappings through the hardened plugin config boundary', () => {
+    const loaded = loadConfigFromApi({ pluginConfig: {
+      ...validConfig,
+      calendar: {
+        caldavBaseUrl: 'https://caldav.example.test/',
+        caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+        naverTokenFile: '/home/user/.openclaw/secrets/oauth',
+        calendarMappings: [{ apiCalendarId: 'api-personal', caldavHref: '/collections/personal/' }],
+      },
+    } } as never);
+    expect(loaded.calendar?.calendarMappings).toEqual([
+      { apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' },
+    ]);
+  });
+
+  it('loads explicit API IDs mapped to exact canonical same-origin collection URLs', () => {
+    expect(loadCalendarMappings('https://caldav.example.test/root/', [
+      { apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' },
+      { apiCalendarId: 'api-work', caldavHref: '/collections/work/' },
+    ])).toEqual([
+      { apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' },
+      { apiCalendarId: 'api-work', caldavHref: 'https://caldav.example.test/collections/work/' },
+    ]);
+  });
+
+  it.each([
+    ['API ID', [
+      { apiCalendarId: 'same', caldavHref: '/collections/a/' },
+      { apiCalendarId: 'same', caldavHref: '/collections/b/' },
+    ]],
+    ['canonical href', [
+      { apiCalendarId: 'a', caldavHref: '/collections/same/' },
+      { apiCalendarId: 'b', caldavHref: 'https://caldav.example.test/collections/same/' },
+    ]],
+  ])('rejects a duplicate calendar mapping %s', (_kind, mappings) => {
+    expect(() => loadCalendarMappings('https://caldav.example.test/', mappings)).toThrow(/calendarMappings/);
+  });
+
+  it.each([
+    ['cross-origin', 'https://other.example.test/collections/a/'],
+    ['credentials', 'https://owner:secret@caldav.example.test/collections/a/'],
+    ['query', 'https://caldav.example.test/collections/a/?view=all'],
+    ['fragment', 'https://caldav.example.test/collections/a/#events'],
+    ['traversal', '/collections/a/../admin/'],
+    ['double-encoded traversal', '/collections/a/%252e%252e/admin/'],
+    ['base root', 'https://caldav.example.test/'],
+  ])('rejects a calendar mapping href with %s', (_kind, caldavHref) => {
+    expect(() => loadCalendarMappings('https://caldav.example.test/', [
+      { apiCalendarId: 'a', caldavHref },
+    ])).toThrow(/calendarMappings/);
+  });
+
+  it('rejects mappings whose canonical collection paths are ambiguous prefixes', () => {
+    expect(() => loadCalendarMappings('https://caldav.example.test/', [
+      { apiCalendarId: 'a', caldavHref: '/collections/team/' },
+      { apiCalendarId: 'b', caldavHref: '/collections/team/private/' },
+    ])).toThrow(/calendarMappings/);
+  });
+
+  it('rejects an unbounded calendar mapping array', () => {
+    expect(() => loadCalendarMappings('https://caldav.example.test/', Array.from({ length: 101 }, (_, index) => ({
+      apiCalendarId: `api-${index}`,
+      caldavHref: `/collections/${index}/`,
+    })))).toThrow(/calendarMappings/);
+  });
+
   it('accepts absolute WSL paths and one Telegram sender', () => {
     expect(loadConfig(validConfig).telegramUserId).toBe('123456789');
   });
