@@ -2,7 +2,7 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isOwnerOnlySecretMode, readCalDavCredentials } from '../../src/calendar/secret.js';
+import { isOwnerOnlySecretMode, parseCalDavCredentials, readCalDavCredentials } from '../../src/calendar/secret.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -20,6 +20,16 @@ afterEach(async () => {
 });
 
 describe('CalDAV secret reader', () => {
+  it('accepts only the exact nonempty credential schema', () => {
+    expect(parseCalDavCredentials('{"username":"naver-user","password":"top-secret"}'))
+      .toEqual({ username: 'naver-user', password: 'top-secret' });
+    for (const invalid of [
+      '{"username":"","password":"top-secret"}',
+      '{"username":"naver-user","password":"   "}',
+      '{"username":"naver-user","password":"top-secret","token":"leak"}',
+    ]) expect(() => parseCalDavCredentials(invalid)).toThrowError(/Invalid CalDAV secret file/);
+  });
+
   it('accepts exact POSIX 0600 only and fails closed on Windows', () => {
     expect(isOwnerOnlySecretMode(0o100600, 'linux')).toBe(true);
     expect(isOwnerOnlySecretMode(0o100400, 'linux')).toBe(false);

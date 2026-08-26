@@ -13,6 +13,7 @@ export interface SecretStats {
   nlink: number;
   mode: number;
   uid: number;
+  size: number;
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
@@ -21,7 +22,7 @@ export interface SecretStats {
 export interface SecretHandle {
   stat(): Promise<SecretStats>;
   chmod(mode: number): Promise<void>;
-  readFile(): Promise<string>;
+  readBounded(maxBytes: number): Promise<string>;
   writeFile(content: string): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
@@ -49,7 +50,18 @@ export const productionSecretFs: SecretFsAdapter = {
     return {
       stat: () => handle.stat(),
       chmod: value => handle.chmod(value),
-      readFile: () => handle.readFile('utf8'),
+      readBounded: async maxBytes => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        while (true) {
+          const buffer = Buffer.allocUnsafe(Math.min(8_192, maxBytes + 1 - total));
+          const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+          if (bytesRead === 0) return Buffer.concat(chunks, total).toString('utf8');
+          total += bytesRead;
+          if (total > maxBytes) throw new SecretFileError('secret_file_invalid', 'Secret file is missing or invalid');
+          chunks.push(buffer.subarray(0, bytesRead));
+        }
+      },
       writeFile: content => handle.writeFile(content, 'utf8'),
       sync: () => handle.sync(),
       close: () => handle.close(),
@@ -65,7 +77,7 @@ interface SecuredParent {
   identity: SecretStats;
 }
 
-export async function readSecretFile(path: string, fs: SecretFsAdapter): Promise<string> {
+export async function readSecretFile(path: string, fs: SecretFsAdapter, maxBytes = 1_048_576): Promise<string> {
   requireVerifiablePlatform(fs);
   const target = resolve(path);
   let parent: SecuredParent | undefined;
@@ -77,8 +89,9 @@ export async function readSecretFile(path: string, fs: SecretFsAdapter): Promise
     handle = await fs.open(target, constants.O_RDONLY | SECRET_NOFOLLOW_FLAG);
     const opened = await handle.stat();
     assertSecureFile(opened, fs.uid!);
+    if (opened.size > maxBytes) throw new SecretFileError('secret_file_invalid', 'Secret file is missing or invalid');
     assertSameIdentity(before, opened);
-    const content = await handle.readFile();
+    const content = await handle.readBounded(maxBytes);
     const afterPath = await fs.lstat(target);
     const afterHandle = await handle.stat();
     assertSecureFile(afterPath, fs.uid!);

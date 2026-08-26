@@ -28,6 +28,17 @@ export interface CalDavClientOptions {
 }
 
 const DAV_HEADERS = { 'content-type': 'application/xml; charset=utf-8' };
+const CALDAV_RESPONSE_MAX_BYTES = 2_097_152;
+const CALDAV_XML_MAX_DEPTH = 32;
+const CALDAV_XML_MAX_NODES = 10_000;
+const CALDAV_MULTISTATUS_MAX_RESPONSES = 1_000;
+const CALDAV_HREF_MAX_BYTES = 4_096;
+const CALDAV_DISPLAY_NAME_MAX_BYTES = 1_024;
+const CALDAV_DATA_MAX_BYTES = 1_048_576;
+const CALDAV_ICAL_MAX_CALENDARS = 8;
+const CALDAV_ICAL_MAX_EVENTS = 1_000;
+const CALDAV_ICAL_UID_MAX_BYTES = 1_024;
+const CALDAV_ICAL_TEXT_MAX_BYTES = 16_384;
 
 export class CalDavClient {
   readonly #baseUrl: URL;
@@ -56,11 +67,11 @@ export class CalDavClient {
       const prop = successfulProperty(response);
       const resourceType = objectValue(prop?.resourcetype);
       if (!prop || !Object.prototype.hasOwnProperty.call(resourceType, 'calendar')) return [];
-      const id = textValue(response.href).trim();
+      const id = boundedText(response.href, CALDAV_HREF_MAX_BYTES).trim();
       return [{
         id,
         href: new URL(id, this.#baseUrl).href,
-        displayName: textValue(prop.displayname).trim(),
+        displayName: boundedText(prop.displayname, CALDAV_DISPLAY_NAME_MAX_BYTES).trim(),
       }];
     });
   }
@@ -80,8 +91,9 @@ export class CalDavClient {
     const seenIdentities = new Set<string>();
     for (const response of responseList(parseXml(xml))) {
       const prop = successfulProperty(response);
-      const calendarData = decodeNumericEntities(textValue(prop?.['calendar-data']));
+      const calendarData = decodeNumericEntities(boundedText(prop?.['calendar-data'], CALDAV_DATA_MAX_BYTES));
       if (!calendarData.trim()) continue;
+      assertIcalStructureBounded(calendarData);
       let parsed: CalendarEvent[];
       try {
         parsed = parseIcal(calendarData, this.#baseUrl.pathname);
@@ -89,6 +101,10 @@ export class CalDavClient {
         throw new CalDavError('CALDAV_XML', 'CalDAV response contains invalid iCalendar data');
       }
       for (const event of parsed) {
+        if (events.length >= CALDAV_ICAL_MAX_EVENTS) {
+          throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV iCalendar exceeded structural limits');
+        }
+        assertEventFieldsBounded(event);
         const identity = JSON.stringify([event.uid, event.recurrenceId ?? null]);
         if (seenIdentities.has(identity)) {
           throw new CalDavError('CALDAV_DUPLICATE_UID', 'CalDAV response contains a duplicate event UID');
@@ -123,16 +139,66 @@ export class CalDavClient {
       throw new CalDavError('CALDAV_AUTH', 'CalDAV authentication failed');
     }
     if (!response.ok) throw new CalDavError('CALDAV_HTTP', `CalDAV request failed with HTTP ${response.status}`);
+    const declaredLength = response.headers.get('content-length');
+    if (declaredLength !== null && /^\d+$/.test(declaredLength) && Number(declaredLength) > CALDAV_RESPONSE_MAX_BYTES) {
+      throw new CalDavError('CALDAV_RESPONSE_TOO_LARGE', 'CalDAV response exceeded the allowed size');
+    }
     try {
-      return await response.text();
-    } catch {
+      return await readBoundedResponseBody(response, CALDAV_RESPONSE_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof CalDavError) throw error;
       if (signal.aborted) throw new CalDavError('CALDAV_TIMEOUT', 'CalDAV request timed out');
       throw new CalDavError('CALDAV_HTTP', 'CalDAV response body failed');
     }
   }
 }
 
+function assertEventFieldsBounded(event: CalendarEvent): void {
+  if (Buffer.byteLength(event.uid) > CALDAV_ICAL_UID_MAX_BYTES ||
+      Buffer.byteLength(event.summary) > CALDAV_ICAL_TEXT_MAX_BYTES ||
+      Buffer.byteLength(event.location ?? '') > CALDAV_ICAL_TEXT_MAX_BYTES) {
+    throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV iCalendar exceeded field limits');
+  }
+}
+
+function assertIcalStructureBounded(source: string): void {
+  let calendars = 0;
+  let events = 0;
+  const component = /^BEGIN:(VCALENDAR|VEVENT)\r?$/gim;
+  let match: RegExpExecArray | null;
+  while ((match = component.exec(source)) !== null) {
+    if (match[1].toUpperCase() === 'VCALENDAR') calendars += 1;
+    else events += 1;
+    if (calendars > CALDAV_ICAL_MAX_CALENDARS || events > CALDAV_ICAL_MAX_EVENTS) {
+      throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV iCalendar exceeded structural limits');
+    }
+  }
+}
+
+async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let total = 0;
+  let result = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return result + decoder.decode();
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new CalDavError('CALDAV_RESPONSE_TOO_LARGE', 'CalDAV response exceeded the allowed size');
+      }
+      result += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function parseXml(xml: string): Record<string, unknown> {
+  assertXmlStructureBounded(xml);
   if (XMLValidator.validate(xml) !== true) {
     throw new CalDavError('CALDAV_XML', 'Malformed CalDAV XML response');
   }
@@ -143,11 +209,46 @@ function parseXml(xml: string): Record<string, unknown> {
   }
 }
 
+function assertXmlStructureBounded(xml: string): void {
+  let depth = 0;
+  let nodes = 0;
+  let offset = 0;
+  while (true) {
+    const start = xml.indexOf('<', offset);
+    if (start < 0) return;
+    if (xml.startsWith('<![CDATA[', start)) {
+      const end = xml.indexOf(']]>', start + 9);
+      if (end < 0) return;
+      offset = end + 3;
+      continue;
+    }
+    const end = xml.indexOf('>', start + 1);
+    if (end < 0) return;
+    const markup = xml.slice(start + 1, end).trim();
+    offset = end + 1;
+    if (!markup || markup.startsWith('?') || markup.startsWith('!')) continue;
+    if (markup.startsWith('/')) {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    nodes += 1;
+    depth += 1;
+    if (nodes > CALDAV_XML_MAX_NODES || depth > CALDAV_XML_MAX_DEPTH) {
+      throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV XML exceeded structural limits');
+    }
+    if (markup.endsWith('/')) depth -= 1;
+  }
+}
+
 function responseList(document: Record<string, unknown>): Array<Record<string, unknown>> {
   const multistatus = objectValue(document.multistatus);
   const responses = multistatus.response;
   if (responses === undefined) return [];
-  return (Array.isArray(responses) ? responses : [responses]).map(objectValue);
+  const list = Array.isArray(responses) ? responses : [responses];
+  if (list.length > CALDAV_MULTISTATUS_MAX_RESPONSES) {
+    throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV XML exceeded structural limits');
+  }
+  return list.map(objectValue);
 }
 
 function successfulProperty(response: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -172,6 +273,14 @@ function objectValue(value: unknown): Record<string, unknown> {
 function textValue(value: unknown): string {
   if (typeof value === 'string' || typeof value === 'number') return String(value);
   return '';
+}
+
+function boundedText(value: unknown, maxBytes: number): string {
+  const text = textValue(value);
+  if (Buffer.byteLength(text) > maxBytes) {
+    throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV XML exceeded field limits');
+  }
+  return text;
 }
 
 function decodeNumericEntities(value: string): string {

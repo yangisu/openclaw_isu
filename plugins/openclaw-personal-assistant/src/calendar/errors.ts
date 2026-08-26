@@ -6,7 +6,9 @@ export type CalDavErrorCode =
   | 'CALDAV_SECRET_PERMISSIONS'
   | 'CALDAV_SECRET'
   | 'CALDAV_TLS_REQUIRED'
-  | 'CALDAV_HTTP';
+  | 'CALDAV_HTTP'
+  | 'CALDAV_RESPONSE_TOO_LARGE'
+  | 'CALDAV_XML_LIMIT';
 
 export class CalDavError extends Error {
   constructor(public readonly code: CalDavErrorCode, message: string) {

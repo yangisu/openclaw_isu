@@ -43,6 +43,7 @@ class FakeFs implements SecretFsAdapter {
   stats(entry: NodeEntry): SecretStats {
     return {
       dev: entry.dev, ino: entry.ino, nlink: entry.nlink, mode: entry.mode, uid: entry.uid,
+      size: Buffer.byteLength(entry.content),
       isFile: () => entry.kind === 'file',
       isDirectory: () => entry.kind === 'directory',
       isSymbolicLink: () => entry.kind === 'symlink',
@@ -83,11 +84,12 @@ class FakeFs implements SecretFsAdapter {
     return {
       stat: async () => this.stats(captured),
       chmod: async modeValue => { captured.mode = modeValue; },
-      readFile: async () => {
+      readBounded: async maxBytes => {
         if (this.swapTargetAfterRead) {
           this.swapTargetAfterRead = false;
           this.nodes.set(path, this.node(this.replacementKind, 0o600, 'replacement'));
         }
+        if (Buffer.byteLength(captured.content) > maxBytes) throw new Error('oversized');
         return captured.content;
       },
       writeFile: async content => { captured.content = content; },
@@ -233,5 +235,12 @@ describe('SecretFileStore production policy', () => {
     Object.assign(entry, mutation);
     fs.nodes.set(target, entry);
     await expect(readSecretFile(target, fs)).rejects.toMatchObject({ code: 'secret_permissions_invalid' });
+  });
+
+  it('rejects a secret larger than the caller bound before reading it', async () => {
+    const { target, fs } = fakeFixture();
+    fs.nodes.set(target, fs.node('file', 0o600, 'x'.repeat(17)));
+
+    await expect(readSecretFile(target, fs, 16)).rejects.toMatchObject({ code: 'secret_file_invalid' });
   });
 });
