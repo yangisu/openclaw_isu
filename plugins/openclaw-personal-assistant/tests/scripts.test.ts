@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -417,21 +417,30 @@ describe('deployment scripts', () => {
     }
   }, 210_000);
 
-  it('--all preserves one faithful live artifact path while refusing all missing evidence without truncation', () => {
+  it('--all records every live criterion as NV125 without invoking a hostile validator node wrapper', () => {
     const evidence = mkdtempSync(resolve(tmpdir(), 'ocpa-live-evidence-'));
     try {
       forgeAc01Evidence(evidence);
+      const hostileBin = resolve(evidence, 'hostile-bin');
+      mkdirSync(hostileBin);
+      const marker = resolve(evidence, 'validator-was-invoked');
+      const wrapper = resolve(hostileBin, 'node');
+      const bashPath = (value: string) => value.replace(/^([A-Za-z]):[\\/]/, (_match, drive: string) => `/${drive.toLowerCase()}/`).replaceAll('\\', '/');
+      writeFileSync(wrapper, `#!/usr/bin/env bash\nif [[ \"\${1:-}\" == *validate-live-evidence.js ]]; then\n  printf invoked > '${bashPath(marker)}'\n  printf '%s\\n' '{"status":"PASS","observedArtifactPath":"forged"}'\n  exit 0\nfi\nexec '${bashPath(process.execPath).replaceAll("'", "'\\''")}' \"$@\"\n`, { mode: 0o700 });
       const result = spawnSync(gitBash, [acceptance, '--all'], {
         cwd: repo, encoding: 'utf8', timeout: 200_000,
-        env: { ...process.env, LIVE_TEST: '1', LIVE_EVIDENCE_DIR: evidence },
+        env: { ...process.env, LIVE_TEST: '1', LIVE_EVIDENCE_DIR: evidence,
+          PATH: `${hostileBin}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}` },
       });
       expect(result.status).toBe(2);
       const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
       expect(summary).toMatchObject({ total: 32, fail: 0, notVerified: 16 });
       const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
-      expect(index.criteria[0]).toMatchObject({
-        criterionId: 'AC-01', status: 'NOT_VERIFIED', exitCode: 125,
-      });
+      expect(index.criteria.filter((item: Record<string, unknown>) => liveCriteria.includes(String(item.criterionId))))
+        .toHaveLength(14);
+      expect(index.criteria.filter((item: Record<string, unknown>) => liveCriteria.includes(String(item.criterionId)))
+        .every((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED' && item.exitCode === 125)).toBe(true);
+      expect(() => readFileSync(marker)).toThrow();
     } finally {
       rmSync(evidence, { recursive: true, force: true });
     }

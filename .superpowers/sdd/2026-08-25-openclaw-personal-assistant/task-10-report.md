@@ -60,7 +60,7 @@ The latest safe acceptance evidence contained exactly 32 stable IDs (`AC-01` thr
 - FAIL: 0
 - NOT_VERIFIED: 16 criteria (14 live-only criteria and 2 honestly unverified product gaps)
 
-All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-05 and AC-09 also remain NOT_VERIFIED because the current product does not implement every mutation kind or executable-response boundary those criteria require. `--all` without `LIVE_TEST=1` and complete explicit evidence exits nonzero and still writes a complete 32-row index. Generated `artifacts/acceptance/*` directories were deleted after verification and remain ignored.
+All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-05 and AC-09 also remain NOT_VERIFIED because the current product does not implement every mutation kind or executable-response boundary those criteria require. The runner always records all 14 live rows as NOT_VERIFIED/125; `--all`, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, and arbitrary evidence cannot promote them. Generated `artifacts/acceptance/*` directories are deleted after verification and remain ignored.
 
 ## Security and operational notes
 
@@ -73,7 +73,7 @@ All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Tele
 
 ## Concerns / deferred evidence
 
-There are no known non-live test failures. The 14 live acceptance criteria require an authorized operator on the target machine with `LIVE_TEST=1` and explicit evidence. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
+There are no known non-live test failures. All 14 live acceptance criteria remain automated-unsupported and cannot be accepted by the runner until authoritative product commands or an attestation API are implemented. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
 
 ## Review fix round 1
 
@@ -171,7 +171,7 @@ Package-local plugin validation passed. A fresh isolated OpenClaw runtime inspec
 
 ## Review fix round 4
 
-The round-3 live support claim was withdrawn. Installed OpenClaw 2026.7.1 exposes no authoritative acceptance-result or attestation API. Its audit API remains metadata-only and cannot prove command output or criterion outcomes; direct OS/service output is also owner-controlled rather than an authoritative product attestation. Therefore all 14 live IDs, including `AC-01` and `AC-12`, are now automated-unsupported. Both production `run-live-probe.js` and `validate-live-evidence.js` return `NOT_VERIFIED` with exit 125 before executing PATH commands, adapters, or reading operator evidence. They create and promote no PASS artifact. The old live target, test-adapter producer path, raw-result derivation, ledger/hash promotion, and audit-to-PASS code were removed. A forged production AC-01 fixture containing matching-looking identity and SHA-256 fields, test flags, and a hostile PATH remains exit 125 and invokes nothing.
+The round-3 live support claim was withdrawn. Installed OpenClaw 2026.7.1 exposes no authoritative acceptance-result or attestation API. Its audit API remains metadata-only and cannot prove command output or criterion outcomes; direct OS/service output is also owner-controlled rather than an authoritative product attestation. Therefore all 14 live IDs, including `AC-01` and `AC-12`, are automated-unsupported. Standalone `run-live-probe.js` and `validate-live-evidence.js` return `NOT_VERIFIED` with exit 125, while the acceptance runner directly writes NV125 without invoking either script or consulting live-related environment/evidence. The old live target, test-adapter producer path, raw-result derivation, ledger/hash promotion, audit-to-PASS code, and acceptance-runner PASS branch were removed. A forged production AC-01 fixture and a hostile PATH cannot change a live row.
 
 The installer now pins `OPENCLAW_STATE_DIR` and `OPENCLAW_CONFIG_PATH` to the same explicit active file (`$OPENCLAW_HOME/openclaw.json`) for config commands and Gateway installation. This follows installed source behavior: `paths-BMBAvkNf.js` resolves the override directly, `config-cli-ClpzD-HN.js` implements `openclaw config file` from the active snapshot, and `runtime-paths-C6MOwQ_j.js` copies `env.OPENCLAW_CONFIG_PATH` into the Gateway service environment. Check mode resolves that actual path using the package-local `openclaw config file`, rejects path drift, verifies a direct canonical stable current-owner mode-0600 file, and runs the full hardened validator on the active file. Finish separately validates the patch source, applies it to the pinned active file, then repeats active path/privacy/full-hardening checks before Gateway installation or start. Cross-platform path-contract tests cover absolute POSIX, `~`, and Windows paths; hardened tests cover disabled Telegram, wrong CalDAV/Naver paths, and placeholders. Static contract tests cover missing/link/owner/mode/identity drift and read-only check ordering.
 
@@ -190,3 +190,19 @@ C:\Program Files\Git\bin\bash.exe scripts/wsl/run-acceptance.sh --non-live
 Exit 0; exactly 32 unique ordered rows (`AC-01` through `AC-32`): 16 PASS, 0 FAIL, 16 NOT_VERIFIED. Every NOT_VERIFIED row used exit code 125, and all 14 live rows were NOT_VERIFIED. The generated index was inspected and then removed.
 
 Package-local OpenClaw 2026.7.1 plugin validation exited 0. A fresh isolated runtime inspection passed the bounded runtime validator and exposed exactly five optional tools: `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. Bash/Node syntax checks, installer dry-run, `git diff --check`, and a production/docs credential-shape plus canary scan passed. The isolated runtime directory and all acceptance artifacts were removed. No real OpenClaw state, config, credential, service, scheduled task, firewall, Naver, Telegram, or external service was touched.
+
+## Review fix round 5
+
+The acceptance runner no longer invokes `validate-live-evidence.js` at all. Its live-row function directly calls the NOT_VERIFIED recorder, so mode, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, evidence contents, validator output, and validator exit status cannot create a PASS branch. All 14 live IDs are unconditionally recorded as NOT_VERIFIED with exit code 125 until an authoritative product command or attestation API exists.
+
+The focused RED used a hostile PATH `node` wrapper that returned a fabricated validator PASS envelope with exit 0. Before the fix, `--all` produced 30 PASS and only 2 NOT_VERIFIED, proving the runner still had an injectable promotion branch. After the minimal fix, the focused test passed in 58.79 seconds: all 14 live rows were NV125 and the wrapper's validator-invocation marker was absent.
+
+Fresh verification:
+
+```text
+npm run typecheck; npm run build; npm test
+```
+
+Exit 0; typecheck and build passed; 21/21 test files and 408/408 tests passed in 313.73 seconds. The full suite includes the hostile `--all` regression.
+
+The standalone non-live run exited 0 with exactly 32 unique rows: 16 PASS, 0 FAIL, and 16 NOT_VERIFIED; all NOT_VERIFIED rows used exit 125 and every live row was NV125. Package-local OpenClaw 2026.7.1 plugin validation passed. Fresh isolated runtime inspection again exposed exactly five optional tools: `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. No live state or external service was used.

@@ -8,7 +8,6 @@ MODE="${1:---non-live}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
-LIVE_VALIDATOR="$SCRIPT_DIR/validate-live-evidence.js"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARTIFACT_REL="artifacts/acceptance/$STAMP"
 ARTIFACT_DIR="$REPO_ROOT/$ARTIFACT_REL"
@@ -74,25 +73,7 @@ not_verified() {
 }
 
 run_live_evidence() {
-  local id="$1" title="$2" evidence_dir="${LIVE_EVIDENCE_DIR:-}" raw_out raw_err out err code=125 status=NOT_VERIFIED observed
-  if [[ "$MODE" != --all || "${LIVE_TEST:-0}" != 1 ]]; then
-    not_verified "$id" "$title" 'Automated live PASS is unsupported pending an authoritative product result or attestation API.'
-    return
-  fi
-  evidence_dir="${evidence_dir:-$ARTIFACT_DIR}"
-  raw_out="$ARTIFACT_DIR/$id.stdout.raw"; raw_err="$ARTIFACT_DIR/$id.stderr.raw"
-  out="$ARTIFACT_DIR/$id.stdout.redacted"; err="$ARTIFACT_DIR/$id.stderr.redacted"
-  : >"$raw_out"; : >"$raw_err"
-  if node "$LIVE_VALIDATOR" "$evidence_dir" "$id" >"$raw_out" 2>"$raw_err"; then
-    status=PASS
-    code=0
-    observed="$(node -e 'const fs=require("node:fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.observedArtifactPath)' "$raw_out")"
-  else
-    printf '%s\n' "authoritative live attestation unavailable for $id" >"$raw_out"
-    observed="$ARTIFACT_REL/$id.stdout.redacted"
-  fi
-  redact_file "$raw_out" "$out"; redact_file "$raw_err" "$err"; rm -f -- "$raw_out" "$raw_err"
-  write_record "$id" "$title" '[fail-closed live attestation gate; automated PASS unsupported]' "$code" "$status" "$out" "$err" "$observed"
+  not_verified "$1" "$2" 'Automated live PASS and evidence acceptance are unsupported pending an authoritative product result or attestation API.'
 }
 
 # Target, credential, time-bound, reboot, and physical-media checks are live-only.

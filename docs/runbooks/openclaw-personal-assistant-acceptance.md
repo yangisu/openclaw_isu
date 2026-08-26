@@ -18,7 +18,7 @@ Generated acceptance artifacts are intentionally Git-ignored. Treat them as loca
 
 All 14 live criteria (`AC-01`, `AC-02`, `AC-03`, `AC-07`, `AC-08`, `AC-12`, `AC-13`, `AC-14`, `AC-15`, `AC-23`, `AC-25`, `AC-26`, `AC-27`, and `AC-32`) are currently unsupported for automated PASS. Installed OpenClaw 2026.7.1 has no authoritative criterion-result or attestation API. Its audit page is metadata-only (`{events,nextCursor?}` with fields such as `action`, `toolName`, and `occurredAt`) and cannot prove command output, message delivery, calendar outcome, reboot recovery, backup integrity, or restoration.
 
-Consequently, `scripts/wsl/run-live-probe.js` writes no evidence and exits 125 for every live criterion. `scripts/wsl/validate-live-evidence.js` also exits 125 without accepting any file. Operator-authored JSON, raw output, ledgers, hashes, target identities, environment flags, test adapters, or PATH substitutions cannot promote a row. Automated PASS remains disabled until an approved product command or attestation API provides authoritative criterion-specific results.
+Consequently, the acceptance runner directly records every live row as `NOT_VERIFIED` with exit code 125. It does not invoke a live producer or validator and ignores `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH substitutions, and any evidence files. The standalone `scripts/wsl/run-live-probe.js` writes no evidence and exits 125; `scripts/wsl/validate-live-evidence.js` likewise accepts nothing and exits 125. Automated PASS remains disabled until an approved product command or attestation API provides authoritative criterion-specific results.
 
 The following command demonstrates the fail-closed state; it returns `NOT_VERIFIED` with exit 125 and creates no PASS artifact:
 
@@ -28,11 +28,10 @@ node scripts/wsl/run-live-probe.js --criterion AC-01 --output-dir /absolute/priv
 ```
 
 ```bash
-LIVE_TEST=1 LIVE_EVIDENCE_DIR=/absolute/private/live-evidence \
-  bash scripts/wsl/run-acceptance.sh --all
+bash scripts/wsl/run-acceptance.sh --all
 ```
 
-`--all` exits nonzero and records all live rows as `NOT_VERIFIED`, even with `LIVE_TEST=1` and a populated evidence directory. It never promotes a skipped or operator-asserted check to PASS.
+`--all` exits nonzero and records all live rows as `NOT_VERIFIED`. Setting live-related environment variables or supplying evidence cannot change those rows.
 
 ## Required target observations
 
