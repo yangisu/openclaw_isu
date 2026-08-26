@@ -19,6 +19,53 @@ function capture(stdin = ''): { io: CliIo; stdout: string[]; stderr: string[] } 
 }
 
 describe('operational CLI', () => {
+  it('runs daily and monthly maintenance from one absolute private config path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-maintenance-cli-'));
+    const config = join(root, 'maintenance.json');
+    const runner = vi.fn().mockImplementation(async (kind: 'daily' | 'monthly', path: string) => ({
+      status: 'open', kind, archive: join(root, `${kind}.age`),
+      evidencePath: join(root, `${kind}.evidence.json`), deletedCount: kind === 'daily' ? 2 : 0,
+    }));
+    for (const kind of ['daily', 'monthly'] as const) {
+      const output = capture();
+      expect(await runCli(['maintenance', kind, '--config', config], output.io, { maintenanceRunner: runner })).toBe(0);
+      expect(JSON.parse(output.stdout[0]!)).toEqual({
+        status: 'open', kind, archive: `${kind}.age`, deletedCount: kind === 'daily' ? 2 : 0,
+        redactedErrorCode: null,
+      });
+      expect(output.stderr).toEqual([]);
+    }
+    expect(runner.mock.calls).toEqual([['daily', config], ['monthly', config]]);
+  });
+
+  it('rejects malformed maintenance argv before opening any config or secret', async () => {
+    const runner = vi.fn();
+    for (const args of [
+      ['maintenance', 'daily', '--config', 'relative.json'],
+      ['maintenance', 'weekly', '--config', '/absolute/config.json'],
+      ['maintenance', 'daily', '--config', '/absolute/config.json', '--identity', 'secret'],
+    ]) {
+      const output = capture();
+      expect(await runCli(args, output.io, { maintenanceRunner: runner })).toBe(64);
+      expect(output.stdout).toEqual([]);
+    }
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('checks the private maintenance config and offline identity without running maintenance', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-maintenance-check-'));
+    const config = join(root, 'maintenance.json');
+    const checker = vi.fn().mockResolvedValue(undefined);
+    const runner = vi.fn();
+    const output = capture();
+    expect(await runCli(['maintenance', 'check', '--config', config], output.io, {
+      maintenanceConfigChecker: checker, maintenanceRunner: runner,
+    })).toBe(0);
+    expect(checker).toHaveBeenCalledWith(config);
+    expect(runner).not.toHaveBeenCalled();
+    expect(JSON.parse(output.stdout[0]!)).toEqual({ status: 'open', redactedErrorCode: null });
+  });
+
   it('runs the Naver OAuth lifecycle with sensitive values only on private stdin and secret stores', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-cli-'));
     const clientFile = join(root, 'naver-client.json');

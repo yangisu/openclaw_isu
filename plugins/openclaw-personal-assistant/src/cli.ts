@@ -3,7 +3,7 @@
 
 import { chmod, lstat, mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -16,6 +16,7 @@ import {
   type NaverOAuthClientCredentials, type NaverTokenSet, type SecretStore,
 } from './calendar/oauth.js';
 import { SecretFileStore } from './secrets/file-store.js';
+import { runMaintenanceFromConfig, validateMaintenanceConfigFromFile } from './ops/maintenance.js';
 
 export interface CliIo {
   stdout(value: string): void;
@@ -29,6 +30,8 @@ export interface CliDependencies {
   tokenStore?: (path: string) => SecretStore<NaverTokenSet>;
   oauthFetch?: FetchLike;
   now?: () => number;
+  maintenanceRunner?: typeof runMaintenanceFromConfig;
+  maintenanceConfigChecker?: typeof validateMaintenanceConfigFromFile;
 }
 
 type GateStatus = 'open' | 'closed' | 'unknown' | 'expired';
@@ -59,7 +62,8 @@ export async function runCli(
     if (command === 'oauth') return await oauth(rest, io, dependencies);
     if (command === 'backup') return await backup(rest, io);
     if (command === 'restore') return await restore(rest, io);
-    throw usageError('expected init, poc, doctor, oauth, backup, or restore');
+    if (command === 'maintenance') return await maintenance(rest, io, dependencies);
+    throw usageError('expected init, poc, doctor, oauth, backup, restore, or maintenance');
   } catch (error) {
     const code = safeErrorCode(error);
     io.stderr(JSON.stringify({ status: 'error', redactedErrorCode: code }));
@@ -357,6 +361,28 @@ async function restore(args: readonly string[], io: CliIo): Promise<number> {
   if (resolve(restoreRoot) === resolve(join(archivePath, '..'))) throw usageError('restore root must be isolated');
   const result = await restoreBackup({ archivePath, restoreRoot, identityFile });
   io.stdout(JSON.stringify({ status: 'open', observedChecks: ['isolated restore verified'], restorePath: result.restorePath, redactedErrorCode: null, timestamp: now() }));
+  return EXIT.ok;
+}
+
+async function maintenance(
+  args: readonly string[], io: CliIo, dependencies: CliDependencies,
+): Promise<number> {
+  const [kind, ...optionArgs] = args;
+  if (kind !== 'daily' && kind !== 'monthly' && kind !== 'check') {
+    throw usageError('expected daily, monthly, or check maintenance');
+  }
+  const options = parseOptions(optionArgs, ['config']);
+  const configPath = requiredAbsolute(options, 'config');
+  if (kind === 'check') {
+    await (dependencies.maintenanceConfigChecker ?? validateMaintenanceConfigFromFile)(configPath);
+    io.stdout(JSON.stringify({ status: 'open', redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  const result = await (dependencies.maintenanceRunner ?? runMaintenanceFromConfig)(kind, configPath);
+  io.stdout(JSON.stringify({
+    status: result.status, kind: result.kind, archive: basename(result.archive),
+    deletedCount: result.deletedCount, redactedErrorCode: null,
+  }));
   return EXIT.ok;
 }
 

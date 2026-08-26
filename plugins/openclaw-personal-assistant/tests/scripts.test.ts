@@ -14,6 +14,7 @@ const liveEvidenceValidator = resolve(repo, 'scripts/wsl/validate-live-evidence.
 const liveProbe = resolve(repo, 'scripts/wsl/run-live-probe.js');
 const liveContract = resolve(repo, 'scripts/wsl/live-probe-contract.js');
 const cronValidator = resolve(repo, 'scripts/wsl/validate-cron-contract.js');
+const maintenanceCronValidator = resolve(repo, 'scripts/wsl/validate-maintenance-cron-contract.js');
 const hardenedConfigValidator = resolve(repo, 'scripts/wsl/validate-hardened-config.js');
 const activeConfigPathValidator = resolve(repo, 'scripts/wsl/validate-active-config-path.js');
 const runtimeToolsValidator = resolve(repo, 'scripts/wsl/validate-runtime-tools.js');
@@ -306,6 +307,62 @@ describe('deployment scripts', () => {
     valid.jobs[0]!.declarationKey = 'openclaw-personal-assistant-hourly-briefing';
     valid.jobs[0]!.trigger.script = `malicious(); /* ${script} */`;
     expect(spawnSync(process.execPath, args, { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
+  });
+
+  it('requires exactly the two non-model maintenance command jobs in addition to briefing', () => {
+    const dailyTrigger = resolve(repo, 'scripts/wsl/maintenance-daily-cron-trigger.js');
+    const monthlyTrigger = resolve(repo, 'scripts/wsl/maintenance-monthly-cron-trigger.js');
+    const dailyScript = readFileSync(dailyTrigger, 'utf8');
+    const monthlyScript = readFileSync(monthlyTrigger, 'utf8');
+    const node = '/usr/bin/node';
+    const cli = '/opt/ocpa/dist/cli.js';
+    const plugin = '/opt/ocpa';
+    const config = '/home/owner/.openclaw/maintenance.json';
+    const job = (kind: 'daily' | 'monthly') => ({
+      declarationKey: `openclaw-personal-assistant-${kind}-maintenance`,
+      name: `Personal assistant ${kind} maintenance`, enabled: true,
+      schedule: { expr: kind === 'daily' ? '0 3 * * *' : '0 4 1 * *', tz: 'Asia/Seoul', staggerMs: 0 },
+      sessionTarget: 'isolated',
+      payload: {
+        kind: 'command', argv: [node, cli, 'maintenance', kind, '--config', config], cwd: plugin,
+        timeoutSeconds: 1800, noOutputTimeoutSeconds: 600, outputMaxBytes: 65536,
+      },
+      delivery: { mode: 'none' }, trigger: { script: kind === 'daily' ? dailyScript : monthlyScript },
+    });
+    const valid = { jobs: [job('daily'), job('monthly')] };
+    const args = [maintenanceCronValidator, dailyTrigger, monthlyTrigger, node, cli, plugin, config];
+    const validate = (value: unknown) => spawnSync(process.execPath, args, {
+      input: JSON.stringify(value), encoding: 'utf8',
+    }).status;
+    expect(validate(valid)).toBe(0);
+    expect(validate({ jobs: [] })).not.toBe(0);
+    for (const mutate of [
+      (value: typeof valid) => { value.jobs[0]!.enabled = false; },
+      (value: typeof valid) => { value.jobs.push(job('daily')); },
+      (value: typeof valid) => { value.jobs[0]!.schedule.expr = '0 2 * * *'; },
+      (value: typeof valid) => { value.jobs[0]!.payload.argv.push('--identity', 'secret'); },
+      (value: typeof valid) => { (value.jobs[0]!.payload as Record<string, unknown>).env = { SECRET: 'value' }; },
+      (value: typeof valid) => { value.jobs[0]!.delivery.mode = 'announce'; },
+    ]) {
+      const adversarial = structuredClone(valid);
+      mutate(adversarial);
+      expect(validate(adversarial)).not.toBe(0);
+    }
+  });
+
+  it('installs and read-only checks both exact maintenance jobs and private config', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('validate_maintenance_cron_contract');
+    expect(source).toContain('maintenance check --config "$MAINTENANCE_CONFIG_FILE"');
+    expect(source).toContain('--declaration-key "$DAILY_MAINTENANCE_KEY"');
+    expect(source).toContain('--declaration-key "$MONTHLY_MAINTENANCE_KEY"');
+    expect(source).toContain('--command-argv "$DAILY_MAINTENANCE_ARGV"');
+    expect(source).toContain('--command-argv "$MONTHLY_MAINTENANCE_ARGV"');
+    expect(source).toContain('--no-deliver');
+    const checkBlock = source.split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
+    expect(checkBlock).toContain('maintenance check --config');
+    expect(checkBlock).toContain('validate_maintenance_cron_contract');
+    expect(checkBlock).not.toMatch(/cron add|mkdir|config patch/);
   });
 
   it('validates the private hardened config before patching or starting the service', () => {

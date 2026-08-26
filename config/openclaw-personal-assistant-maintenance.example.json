@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "workspaceDir": "/home/user/.openclaw/workspace",
+  "stateDir": "/home/user/.openclaw/state/openclaw-personal-assistant",
+  "backupDir": "/mnt/d/openclaw_setting/backups",
+  "restoreRoot": "/home/user/.openclaw/state/openclaw-personal-assistant/maintenance-restores",
+  "identityFile": "/media/user/OFFLINE_BACKUP_MEDIA/age-identity",
+  "recipient": "OWNER_APPROVED_AGE_RECIPIENT"
+}

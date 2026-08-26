@@ -20,12 +20,17 @@ CRON_EXPR='0 8-22 * * *'
 CRON_TZ='Asia/Seoul'
 CRON_MESSAGE='Call assistant_briefing once. Deliver only when send=true.'
 CRON_KEY='openclaw-personal-assistant-hourly-briefing'
+DAILY_MAINTENANCE_KEY='openclaw-personal-assistant-daily-maintenance'
+MONTHLY_MAINTENANCE_KEY='openclaw-personal-assistant-monthly-maintenance'
 PLUGIN_ID='openclaw-personal-assistant'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
 CRON_TRIGGER="$SCRIPT_DIR/briefing-cron-trigger.js"
 CRON_VALIDATOR="$SCRIPT_DIR/validate-cron-contract.js"
+DAILY_MAINTENANCE_TRIGGER="$SCRIPT_DIR/maintenance-daily-cron-trigger.js"
+MONTHLY_MAINTENANCE_TRIGGER="$SCRIPT_DIR/maintenance-monthly-cron-trigger.js"
+MAINTENANCE_CRON_VALIDATOR="$SCRIPT_DIR/validate-maintenance-cron-contract.js"
 HARDENED_CONFIG_VALIDATOR="$SCRIPT_DIR/validate-hardened-config.js"
 ACTIVE_CONFIG_PATH_VALIDATOR="$SCRIPT_DIR/validate-active-config-path.js"
 RUNTIME_TOOLS_VALIDATOR="$SCRIPT_DIR/validate-runtime-tools.js"
@@ -35,6 +40,8 @@ OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 SECRET_DIR="$OPENCLAW_HOME/secrets"
 CONFIG_TEMPLATE="$REPO_ROOT/config/openclaw.personal-assistant.example.json5"
 CONFIG_FILE="$OPENCLAW_HOME/openclaw.personal-assistant.json5"
+MAINTENANCE_CONFIG_TEMPLATE="$REPO_ROOT/config/openclaw-personal-assistant-maintenance.example.json"
+MAINTENANCE_CONFIG_FILE="$OPENCLAW_HOME/maintenance.json"
 OPENCLAW_STATE_DIR="$OPENCLAW_HOME"
 ACTIVE_CONFIG_FILE="$OPENCLAW_STATE_DIR/openclaw.json"
 OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"
@@ -129,12 +136,22 @@ validate_cron_contract() {
     || { say 'cron_contract_invalid'; return 1; }
 }
 
+validate_maintenance_cron_contract() {
+  local cron_json
+  cron_json="$($OPENCLAW cron list --all --json)"
+  printf '%s' "$cron_json" | node "$MAINTENANCE_CRON_VALIDATOR" \
+    "$DAILY_MAINTENANCE_TRIGGER" "$MONTHLY_MAINTENANCE_TRIGGER" "$NODE_BIN" \
+    "$PLUGIN_ROOT/dist/cli.js" "$PLUGIN_ROOT" "$MAINTENANCE_CONFIG_FILE" \
+    || { say 'maintenance_cron_contract_invalid'; return 1; }
+}
+
 if [[ "$MODE" == "dry-run" ]]; then
   say "DRY_RUN verify Ubuntu $EXPECTED_UBUNTU, Node >=$MIN_NODE <$MAX_NODE, systemd, lingering"
   say "DRY_RUN verify package-local OpenClaw $EXPECTED_OPENCLAW"
   say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_confirm,assistant_calendar_prepare,assistant_mutate,assistant_query"
   say "DRY_RUN install owner-private token/config files and user systemd service"
-  say "DRY_RUN declare exactly one Cron row: $CRON_EXPR $CRON_TZ staggerMs=0 isolated announce telegram owner"
+  say "DRY_RUN declare briefing Cron row: $CRON_EXPR $CRON_TZ staggerMs=0 isolated announce telegram owner"
+  say 'DRY_RUN declare command Cron rows: daily 0 3 * * * and monthly 0 4 1 * * Asia/Seoul, exact, no delivery/catch-up'
   say 'DRY_RUN exact-hour trigger suppresses OpenClaw startup catch-up/replay'
   say "DRY_RUN message: $CRON_MESSAGE"
   say 'DRY_RUN no firewall, portproxy, listener, secret CLI argument, or external call'
@@ -146,6 +163,7 @@ fi
 source /etc/os-release
 [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == "$EXPECTED_UBUNTU" ]] || { say 'ubuntu_release_incompatible'; exit 1; }
 command -v node >/dev/null || { say 'node_missing'; exit 1; }
+NODE_BIN="$(readlink -f -- "$(command -v node)")"
 NODE_VERSION="$(node --version | sed 's/^v//')"
 version_ge "$NODE_VERSION" "$MIN_NODE" && ! version_ge "$NODE_VERSION" "$MAX_NODE" || { say 'node_version_incompatible'; exit 1; }
 [[ "$(ps -p 1 -o comm=)" == systemd ]] || { say 'systemd_not_pid1'; exit 1; }
@@ -170,15 +188,20 @@ if [[ "$MODE" == check ]]; then
   "$OPENCLAW" config validate
   validate_active_config
   node "$PLUGIN_ROOT/dist/cli.js" oauth status --client-file "$SECRET_DIR/naver-oauth-client" --token-file "$SECRET_DIR/naver-oauth-token"
+  node "$PLUGIN_ROOT/dist/cli.js" maintenance check --config "$MAINTENANCE_CONFIG_FILE"
   systemctl --user is-enabled --quiet openclaw-gateway.service
   systemctl --user is-active --quiet openclaw-gateway.service
   validate_cron_contract
+  validate_maintenance_cron_contract
   say 'CHECK_OK'
   exit 0
 fi
 
-run mkdir -p -m 700 "$OPENCLAW_HOME" "$SECRET_DIR" "$OPENCLAW_HOME/workspace" "$OPENCLAW_HOME/state/openclaw-personal-assistant"
+run mkdir -p -m 700 "$OPENCLAW_HOME" "$SECRET_DIR" "$OPENCLAW_HOME/workspace" \
+  "$OPENCLAW_HOME/state/openclaw-personal-assistant" \
+  "$OPENCLAW_HOME/state/openclaw-personal-assistant/maintenance-restores"
 if [[ ! -e "$CONFIG_FILE" ]]; then run install -m 600 "$CONFIG_TEMPLATE" "$CONFIG_FILE"; fi
+if [[ ! -e "$MAINTENANCE_CONFIG_FILE" ]]; then run install -m 600 "$MAINTENANCE_CONFIG_TEMPLATE" "$MAINTENANCE_CONFIG_FILE"; fi
 
 if [[ "$PHASE" == prepare ]]; then
   say 'STOP_INTERACTIVE: enter credentials locally; do not paste them into chat or command-line arguments.'
@@ -189,6 +212,8 @@ if [[ "$PHASE" == prepare ]]; then
   say "node '$PLUGIN_ROOT/dist/cli.js' oauth callback --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' < /absolute/owner-private/naver-callback.json"
   say "node '$PLUGIN_ROOT/dist/cli.js' oauth status --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token'"
   say "node '$PLUGIN_ROOT/dist/cli.js' doctor --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' --naver-client-file '$SECRET_DIR/naver-oauth-client' --naver-token-file '$SECRET_DIR/naver-oauth-token'"
+  say "Edit '$MAINTENANCE_CONFIG_FILE' locally: set this user's workspace/state/restore paths, mounted offline-media identity path, and approved age recipient; never paste the identity into chat or argv."
+  say "node '$PLUGIN_ROOT/dist/cli.js' maintenance check --config '$MAINTENANCE_CONFIG_FILE'"
   say "$OPENCLAW models auth login"
   say 'Complete Naver OAuth in the local browser, then rerun: install-openclaw.sh --finish'
   exit 2
@@ -212,6 +237,7 @@ OWNER_ID="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.con
 [[ "$OWNER_ID" =~ ^[1-9][0-9]{0,18}$ ]] || { say 'telegram_owner_id_invalid'; exit 1; }
 
 validate_runtime_tools
+node "$PLUGIN_ROOT/dist/cli.js" maintenance check --config "$MAINTENANCE_CONFIG_FILE"
 
 run "$OPENCLAW" gateway install --force
 run systemctl --user enable --now openclaw-gateway.service
@@ -219,6 +245,20 @@ run "$OPENCLAW" cron add --declaration-key "$CRON_KEY" --name 'Personal assistan
   --cron "$CRON_EXPR" --tz "$CRON_TZ" --exact --session isolated --message "$CRON_MESSAGE" \
   --trigger-script "$CRON_TRIGGER" --announce --channel telegram --to "$OWNER_ID" --json
 
+DAILY_MAINTENANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' \
+  "$NODE_BIN" "$PLUGIN_ROOT/dist/cli.js" maintenance daily --config "$MAINTENANCE_CONFIG_FILE")"
+MONTHLY_MAINTENANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' \
+  "$NODE_BIN" "$PLUGIN_ROOT/dist/cli.js" maintenance monthly --config "$MAINTENANCE_CONFIG_FILE")"
+run "$OPENCLAW" cron add --declaration-key "$DAILY_MAINTENANCE_KEY" --name 'Personal assistant daily maintenance' \
+  --cron '0 3 * * *' --tz "$CRON_TZ" --exact --session isolated --command-argv "$DAILY_MAINTENANCE_ARGV" \
+  --command-cwd "$PLUGIN_ROOT" --timeout-seconds 1800 --no-output-timeout-seconds 600 --output-max-bytes 65536 \
+  --trigger-script "$DAILY_MAINTENANCE_TRIGGER" --no-deliver --json
+run "$OPENCLAW" cron add --declaration-key "$MONTHLY_MAINTENANCE_KEY" --name 'Personal assistant monthly maintenance' \
+  --cron '0 4 1 * *' --tz "$CRON_TZ" --exact --session isolated --command-argv "$MONTHLY_MAINTENANCE_ARGV" \
+  --command-cwd "$PLUGIN_ROOT" --timeout-seconds 1800 --no-output-timeout-seconds 600 --output-max-bytes 65536 \
+  --trigger-script "$MONTHLY_MAINTENANCE_TRIGGER" --no-deliver --json
+
 validate_cron_contract
+validate_maintenance_cron_contract
 
 say 'INSTALL_OK'

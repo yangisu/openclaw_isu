@@ -92,7 +92,7 @@ bash scripts/wsl/install-openclaw.sh --finish
 bash scripts/wsl/install-openclaw.sh --check
 ```
 
-The finish phase builds the mixed plugin, validates its built registration contract, links it, and then validates the installed plugin through package-local OpenClaw runtime inspection. OpenClaw 2026.7.1's `plugins build/validate --entry` commands are for simple `defineToolPlugin` entries and are not used for this mixed `definePluginEntry`. The installer then validates the hardened config, installs/enables the user Gateway service, and declares one idempotent isolated Cron job with:
+The finish phase builds the mixed plugin, validates its built registration contract, links it, and then validates the installed plugin through package-local OpenClaw runtime inspection. OpenClaw 2026.7.1's `plugins build/validate --entry` commands are for simple `defineToolPlugin` entries and are not used for this mixed `definePluginEntry`. The installer then validates the hardened config, installs/enables the user Gateway service, and declares the idempotent isolated briefing Cron job with:
 
 - expression `0 8-22 * * *`
 - timezone `Asia/Seoul`
@@ -100,6 +100,8 @@ The finish phase builds the mixed plugin, validates its built registration contr
 - message `Call assistant_briefing once. Deliver only when send=true.`
 - Telegram announce delivery to the configured numeric owner
 - the checked-in exact-hour trigger, with `cron.triggers.enabled`, suppressing OpenClaw 2026.7.1 startup catch-up outside minute 00 so sleeping-time briefings are not replayed
+
+It also declares two non-model `payload.kind=command` jobs. Inspection of the installed OpenClaw 2026.7.1 cron source confirms that command payloads execute an argv array directly without a shell. The daily job is `0 3 * * *`; the monthly job is `0 4 1 * *`; both use `Asia/Seoul`, `staggerMs: 0`, exact trigger scripts, no delivery, no secret environment, and argv containing only the package-local Node/CLI paths, `maintenance daily|monthly`, and the private config path. These times are the deterministic installation ruling because the approved design specifies daily/monthly frequency but not wall-clock times.
 
 Inspect the result locally:
 
@@ -183,6 +185,14 @@ node plugins/openclaw-personal-assistant/dist/cli.js backup reconcile \
 Reconciliation performs the full archive/commit/manifest/Git/SQLite/outbox verification and clears only the hash-bound matching unknown publication.
 
 Before enabling retention, verify the target NTFS ACL is protected and allows only the current user and Administrators, directory durability is supported, and the production same-handle file-identity deletion succeeds. If any proof is unavailable, retention must stay closed. Compare the Windows disk unique IDs for the WSL virtual disk and `D:`. If they share a physical device, the backup does not protect against device failure or ransomware; maintain a weekly copy of the same encrypted archive on separately managed physical media.
+
+Automated maintenance reads the public age recipient and the identity-file path from the owner-private `~/.openclaw/maintenance.json`; the identity value is never stored in config, argv, output, or logs. During the prepare pause, replace all `/home/user` example paths with the current owner's actual paths. The installer creates the default private restore root, but an operator-selected alternative must also be created owner-private before finish. The identity must be a direct, stable, current-owner mode-0600 file on separately managed mounted media outside the workspace, state, Git, and `D:` backup root. Validate it locally before finish:
+
+```bash
+node plugins/openclaw-personal-assistant/dist/cli.js maintenance check --config "$HOME/.openclaw/maintenance.json"
+```
+
+Daily maintenance creates and verifies the encrypted archive, performs an isolated sample restore, and only then applies verified retention (latest 30 points, minimum 2). `publication_unknown`, missing media/identity, backup, restore, or durable-health failure closes backup health and performs no retention. Monthly maintenance verifies the exact selected archive and performs a full isolated restore, recording schema/hash-bound evidence; it never applies to the live workspace. A cross-process lock prevents overlap and temporary restore roots are cleaned by the verified restore API. These schedules are installed automation, but their real age/media/ACL execution remains `NOT_VERIFIED` until observed on the target host.
 
 ## 7. Rollback and uninstall
 
