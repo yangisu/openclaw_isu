@@ -13,7 +13,7 @@ try {
   const [evidenceDirectory, criterionId, option] = process.argv.slice(2);
   const allowTest = option === '--allow-test-evidence' && process.argv.length === 5
     && process.env.OCPA_LIVE_PROBE_TEST_MODE === '1';
-  if (!evidenceDirectory || !criterionId || !PROBES[criterionId]
+  if (!evidenceDirectory || !criterionId || !PROBES[criterionId] || !PROBES[criterionId].supported
     || (option !== undefined && !allowTest) || !isAbsolute(evidenceDirectory)
     || resolve(evidenceDirectory) !== evidenceDirectory) fail();
   const rootInfo = lstatSync(evidenceDirectory);

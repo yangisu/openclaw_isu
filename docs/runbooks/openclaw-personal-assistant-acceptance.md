@@ -16,7 +16,9 @@ Generated acceptance artifacts are intentionally Git-ignored. Treat them as loca
 
 ## Live evidence rules
 
-Live work must be performed on the target PC. Never hand-write or edit an `AC-XX.json` envelope. The only authorized producer is `scripts/wsl/run-live-probe.js`, which executes the fixed criterion/phase command described by the versioned probe contract, derives observations from bounded structured raw results, and writes the raw records, stateful ledger, hashes, target identity, and final evidence. The validator independently reopens nothing by path after its bounded no-follow read, verifies stable file identity and privacy, checks the fixed probe ID/digest, and re-derives every observation from the raw records.
+Live work must be performed on the target PC. Never hand-write or edit an `AC-XX.json` envelope. The only authorized producer is `scripts/wsl/run-live-probe.js`, which executes a supported fixed criterion/phase command, derives observations from bounded structured command output, and writes the raw records, stateful ledger, hashes, target identity, and final evidence. The validator independently reopens nothing by path after its bounded no-follow read, verifies stable file identity and privacy, checks the fixed probe ID/digest, and re-derives every observation from the raw records.
+
+Automated live evidence is currently supported only for `AC-01` (direct `/etc/os-release`, PID 1, and user Gateway service output) and `AC-12` (direct before/after Windows and WSL boot identities plus Gateway service output). OpenClaw 2026.7.1 `audit --json` returns `{events,nextCursor?}` metadata with `action`, `toolName`, and `occurredAt`, but deliberately contains no tool arguments, results, command output, message content, or calendar/backup verification result. It therefore cannot prove the other live criteria. `AC-02`, `AC-03`, `AC-07`, `AC-08`, `AC-13`, `AC-14`, `AC-15`, `AC-23`, `AC-25`, `AC-26`, `AC-27`, and `AC-32` are explicitly unsupported by this producer: invocation exits 125, writes no PASS evidence, and cannot be supplemented with operator JSON, text, environment assertions, or an audit event. They remain `NOT_VERIFIED` until a future approved product command emits authoritative criterion-specific structured results.
 
 Create the evidence directory and optional canary list locally. Canary values and credentials must never be command arguments:
 
@@ -27,22 +29,12 @@ export OCPA_LIVE_CANARY_FILE=/absolute/private/live-canaries
 node scripts/wsl/run-live-probe.js --criterion AC-01 --output-dir /absolute/private/live-evidence
 ```
 
-For multi-stage criteria, run the listed fixed phases in order. The producer records `NOT_VERIFIED` and exits 125 until every phase is present; it emits final PASS evidence only after cross-phase identity/time checks succeed:
-
-- `AC-03`: `owner-request`, then `owner-response`.
-- `AC-08`: `before-create`, `after-create`, then `after-user-delete` after the user deletes the one event in Naver.
-- `AC-12`: `before-restart`, restart Windows and WSL, then `after-restart`.
-- `AC-13`: `backup`, then `isolated-restore`.
-- `AC-15`: `caldav-shapes`, then `failure-injection`.
-- `AC-23`: `observe-0800`, `observe-2200`, `observe-2300`, then `after-wake`.
-- `AC-25`: `before-reboot`, reboot and remain logged out/idle for at least 30 minutes, then `after-reboot-idle`.
-- `AC-26`: `gateway-call`, `telegram-call`, `refresh-failure`, then `revocation`.
-- `AC-27`: `state-rejection`, `create`, `refresh`, then `revoke`.
+For supported `AC-12`, run `before-restart`, restart Windows and WSL, then run `after-restart`. The producer records `NOT_VERIFIED` and exits 125 until both direct-command phases are present; it emits final PASS evidence only after both boot identities changed and the Gateway is active.
 
 Example phase invocation:
 
 ```bash
-node scripts/wsl/run-live-probe.js --criterion AC-25 --phase before-reboot --output-dir /absolute/private/live-evidence
+node scripts/wsl/run-live-probe.js --criterion AC-12 --phase before-restart --output-dir /absolute/private/live-evidence
 ```
 
 The producer and validator reject unknown fields, secret-bearing keys at any nesting depth, credential-shaped values, canaries, credential URLs, symlinks, non-private files, oversized input, stale evidence, path swaps, wrong IDs/digests, missing phases, and raw/evidence hash mismatches. `--test-adapter` evidence is explicitly test-only and is never accepted by the acceptance runner.
@@ -56,7 +48,7 @@ LIVE_TEST=1 LIVE_EVIDENCE_DIR=/absolute/private/live-evidence \
 
 ## Required target observations
 
-Capture these live observations without tokens or passwords:
+The following observations are still required by the approved design, but except for the supported `AC-01` and `AC-12` probes they are operator checkpoints only and cannot promote an acceptance row to PASS with the current product commands. Capture no tokens or passwords:
 
 - `AC-01`, `AC-12`, and `AC-25`: Ubuntu 24.04, systemd PID 1, lingering, the exact current-user Windows startup task, `wsl.exe -d <distro> --exec /bin/sleep infinity`, restart-after-one-minute settings, Gateway active after reboot and 30 idle minutes without interactive login, and a fresh Telegram response.
 - `AC-02` and `AC-26`: a real ChatGPT OAuth Gateway and Telegram model response, injected refresh failure, approval revocation, and confirmed closed behavior after revocation.

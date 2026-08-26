@@ -19,7 +19,7 @@ try {
   const value = JSON.parse(input);
   const jobs = (value.jobs ?? value).filter(job => job.declarationKey === declarationKey || job.name === 'Personal assistant hourly briefing');
   const job = jobs[0];
-  if (jobs.length !== 1 || job.enabled !== true || job.schedule?.expr !== expression
+  if (jobs.length !== 1 || job.declarationKey !== declarationKey || job.enabled !== true || job.schedule?.expr !== expression
     || job.schedule?.tz !== 'Asia/Seoul' || job.schedule?.staggerMs !== 0 || job.sessionTarget !== 'isolated'
     || job.payload?.message !== message || job.delivery?.mode !== 'announce' || job.delivery?.channel !== 'telegram'
     || String(job.delivery?.to) !== ownerId || typeof job.trigger?.script !== 'string'

@@ -27,6 +27,7 @@ PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
 CRON_TRIGGER="$SCRIPT_DIR/briefing-cron-trigger.js"
 CRON_VALIDATOR="$SCRIPT_DIR/validate-cron-contract.js"
 HARDENED_CONFIG_VALIDATOR="$SCRIPT_DIR/validate-hardened-config.js"
+RUNTIME_TOOLS_VALIDATOR="$SCRIPT_DIR/validate-runtime-tools.js"
 OPENCLAW="$PLUGIN_ROOT/node_modules/.bin/openclaw"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 SECRET_DIR="$OPENCLAW_HOME/secrets"
@@ -75,12 +76,8 @@ validate_config_file() {
 validate_runtime_tools() {
   local inspect_json
   inspect_json="$($OPENCLAW plugins inspect "$PLUGIN_ID" --runtime --json)"
-  node -e '
-const x=JSON.parse(process.argv[1]); const tools=x.tools??x.plugin?.tools??[];
-const actual=tools.map(t=>({name:t.name,optional:t.optional})).sort((a,b)=>a.name.localeCompare(b.name));
-const expected=["assistant_briefing","assistant_calendar_confirm","assistant_calendar_prepare","assistant_mutate","assistant_query"].map(name=>({name,optional:true}));
-if(JSON.stringify(actual)!==JSON.stringify(expected)) process.exit(1);
-' "$inspect_json" || { say 'runtime_tool_contract_invalid'; return 1; }
+  printf '%s' "$inspect_json" | node "$RUNTIME_TOOLS_VALIDATOR" >/dev/null \
+    || { say 'runtime_tool_contract_invalid'; return 1; }
 }
 
 config_scalar() { "$OPENCLAW" config get "$1" --json | node -e 'let x="";process.stdin.on("data",c=>x+=c).on("end",()=>process.stdout.write(String(JSON.parse(x))))'; }
@@ -150,6 +147,7 @@ OPENCLAW_VERSION="$($OPENCLAW --version | sed -n 's/^OpenClaw \([^ ]*\).*/\1/p')
 if [[ "$MODE" == check ]]; then
   validate_secret_tree
   validate_config_file
+  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck

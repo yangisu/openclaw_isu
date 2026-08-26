@@ -14,6 +14,7 @@ const liveProbe = resolve(repo, 'scripts/wsl/run-live-probe.js');
 const liveContract = resolve(repo, 'scripts/wsl/live-probe-contract.js');
 const cronValidator = resolve(repo, 'scripts/wsl/validate-cron-contract.js');
 const hardenedConfigValidator = resolve(repo, 'scripts/wsl/validate-hardened-config.js');
+const runtimeToolsValidator = resolve(repo, 'scripts/wsl/validate-runtime-tools.js');
 const privateAcl = resolve(repo, 'scripts/windows/set-private-directory-acl.ps1');
 const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
 
@@ -29,8 +30,12 @@ describe('deployment scripts', () => {
     privateDirectory(root);
     const adapter = resolve(root, 'fake-adapter.cjs');
     const result = payload ?? {
-      probeId: 'ocpa-live-ac01-v2', phase: 'single', capturedAt: new Date().toISOString(),
-      target: { ubuntuVersion: '24.04', pid1: 'systemd', gatewayState: 'active' },
+      probeId: 'ocpa-live-ac01-v3', phase: 'single', capturedAt: new Date().toISOString(), adapter: 'system-health-v1',
+      commandResults: [
+        { commandId: 'os-release', exitCode: 0, stdoutLines: ['ID=ubuntu', 'VERSION_ID="24.04"'] },
+        { commandId: 'pid1', exitCode: 0, stdoutLines: ['systemd'] },
+        { commandId: 'gateway-active', exitCode: 0, stdoutLines: ['active'] },
+      ],
     };
     writeFileSync(adapter, `process.stdout.write(${JSON.stringify(`${JSON.stringify(result)}\n`)});\n`, { mode: 0o600 });
     const generated = spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-01', '--output-dir', root, '--test-adapter', adapter], {
@@ -100,6 +105,9 @@ describe('deployment scripts', () => {
   it.each([
     ['short secret key', { token: 'x' }],
     ['nested secret key', { nested: { apiKey: 'x' } }],
+    ['bare secret key', { Se_CrEt: 'x' }],
+    ['secret value key', { nested: { 'secret-value': 'x' } }],
+    ['password hash key', { Password_Hash: 'x' }],
     ['credential-shaped value', { note: 'Basic YTpi' }],
     ['URL query credential', { note: 'https://example.invalid/cb?state=x' }],
   ])('rejects %s before a live probe artifact can be persisted', (_label, injected) => {
@@ -108,8 +116,12 @@ describe('deployment scripts', () => {
       privateDirectory(evidenceRoot);
       const adapter = resolve(evidenceRoot, 'fake-adapter.cjs');
       const payload = {
-        probeId: 'ocpa-live-ac01-v2', phase: 'single', capturedAt: new Date().toISOString(),
-        target: { ubuntuVersion: '24.04', pid1: 'systemd', gatewayState: 'active' }, ...injected,
+        probeId: 'ocpa-live-ac01-v3', phase: 'single', capturedAt: new Date().toISOString(), adapter: 'system-health-v1',
+        commandResults: [
+          { commandId: 'os-release', exitCode: 0, stdoutLines: ['ID=ubuntu', 'VERSION_ID="24.04"'] },
+          { commandId: 'pid1', exitCode: 0, stdoutLines: ['systemd'] },
+          { commandId: 'gateway-active', exitCode: 0, stdoutLines: ['active'] },
+        ], ...injected,
       };
       writeFileSync(adapter, `process.stdout.write(${JSON.stringify(`${JSON.stringify(payload)}\n`)});\n`, { mode: 0o600 });
       const result = spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-01', '--output-dir', evidenceRoot, '--test-adapter', adapter], {
@@ -149,11 +161,42 @@ describe('deployment scripts', () => {
     for (const value of [
       { token: 'x' }, { nested: { access_token: 'x' } }, { client_secret: 'x' }, { apiKey: 'x' },
       { authorization: 'x' }, { password: 'x' }, { oauth_state: 'x' }, { cookie: 'x' }, { privateKey: 'x' }, { 'telegram token': 'x' },
+      { secret: 'x' }, { nested: { SECRET_VALUE: 'x' } }, { 'password-hash': 'x' },
       { value: 'Bearer x' }, { value: '123456789:abcdefghijklmnopqrstuvwxyzABCDE' },
       { value: 'eyJabcdefghi.abcdefghijk.abcdefghijk' }, { value: '-----BEGIN PRIVATE KEY-----' },
       { value: 'https://example.invalid/cb?code=x' }, { value: 'operator-canary-42' },
     ]) expect(() => validateSafeValue(value, ['operator-canary-42'])).toThrow();
     expect(() => validateSafeValue({ tokenRefreshed: true, gatewayState: 'active', codeStatus: 'rejected' })).not.toThrow();
+  });
+
+  it('parses only the real OpenClaw audit events page and never derives unsupported acceptance results from it', () => {
+    const { parseOpenClawAuditPage, deriveObservations } = createRequire(import.meta.url)(liveContract) as {
+      parseOpenClawAuditPage(value: unknown): unknown[];
+      deriveObservations(criterionId: string, raw: Record<string, unknown>): unknown;
+    };
+    const actual = { events: [{
+      eventId: 'event-123456', sequence: 7, sourceSequence: 3, occurredAt: Date.now(), kind: 'tool_action',
+      action: 'tool.action.finished', status: 'succeeded', actor: { type: 'user', id: 'owner' }, agentId: 'main',
+      runId: 'run-123456', toolName: 'assistant_calendar_confirm', redaction: 'metadata_only',
+    }], nextCursor: '6' };
+    expect(parseOpenClawAuditPage(actual)).toEqual(actual.events);
+    expect(() => parseOpenClawAuditPage({ records: actual.events })).toThrow();
+    expect(() => deriveObservations('AC-08', { audit: actual })).toThrow('probe_unsupported');
+  });
+
+  it('returns 125 without PASS evidence for an unsupported live criterion even when an audit event matches by name', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-unsupported-'));
+    try {
+      privateDirectory(root);
+      const adapter = resolve(root, 'audit-adapter.cjs');
+      writeFileSync(adapter, `process.stdout.write(JSON.stringify({events:[{occurredAt:Date.now(),action:'tool.action.finished',toolName:'assistant_calendar_confirm',status:'succeeded'}]}));\n`, { mode: 0o600 });
+      const result = spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-08', '--output-dir', root, '--test-adapter', adapter], {
+        encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
+      });
+      expect(result.status).toBe(125);
+      expect(result.stdout).toContain('NOT_VERIFIED');
+      expect(() => readFileSync(resolve(root, 'AC-08.json'))).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('keeps a multi-stage restart probe NOT_VERIFIED until fixed before and after phases prove changed boot identities', () => {
@@ -162,7 +205,12 @@ describe('deployment scripts', () => {
       privateDirectory(root);
       const runPhase = (phase: string, target: Record<string, unknown>) => {
         const adapter = resolve(root, `${phase}.cjs`);
-        const payload = { probeId: 'ocpa-live-ac12-v2', phase, capturedAt: new Date().toISOString(), target };
+        const payload = { probeId: 'ocpa-live-ac12-v3', phase, capturedAt: new Date().toISOString(), adapter: 'restart-health-v1',
+          commandResults: [
+            { commandId: 'windows-boot-id', exitCode: 0, stdoutLines: [String(target.windowsBootId)] },
+            { commandId: 'wsl-boot-id', exitCode: 0, stdoutLines: [String(target.wslBootId)] },
+            { commandId: 'gateway-active', exitCode: 0, stdoutLines: [String(target.gatewayState ?? 'active')] },
+          ] };
         writeFileSync(adapter, `process.stdout.write(${JSON.stringify(`${JSON.stringify(payload)}\n`)});\n`, { mode: 0o600 });
         return spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-12', '--phase', phase,
           '--output-dir', root, '--test-adapter', adapter], {
@@ -172,10 +220,7 @@ describe('deployment scripts', () => {
       const before = runPhase('before-restart', { windowsBootId: 'windows-before', wslBootId: 'wsl-before' });
       expect(before.status, `${before.stdout}\n${before.stderr}`).toBe(125);
       expect(() => readFileSync(resolve(root, 'AC-12.json'))).toThrow();
-      expect(runPhase('after-restart', {
-        windowsBootId: 'windows-after', wslBootId: 'wsl-after', windowsRecovery: 'observed',
-        wslRecovery: 'observed', gatewayState: 'active',
-      }).status).toBe(0);
+      expect(runPhase('after-restart', { windowsBootId: 'windows-after', wslBootId: 'wsl-after', gatewayState: 'active' }).status).toBe(0);
       expect(spawnSync(process.execPath, [liveEvidenceValidator, root, 'AC-12', '--allow-test-evidence'], {
         encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
       }).status).toBe(0);
@@ -215,6 +260,17 @@ describe('deployment scripts', () => {
     expect(result.stdout).toContain('0 8-22 * * *');
   });
 
+  it('validates the actual OpenClaw runtime inspect names-array shape as exactly five optional tools', () => {
+    const valid = { tools: [
+      { names: ['assistant_query'], optional: true }, { names: ['assistant_mutate'], optional: true },
+      { names: ['assistant_calendar_prepare'], optional: true }, { names: ['assistant_calendar_confirm'], optional: true },
+      { names: ['assistant_briefing'], optional: true },
+    ] };
+    expect(spawnSync(process.execPath, [runtimeToolsValidator], { input: JSON.stringify(valid), encoding: 'utf8' }).status).toBe(0);
+    valid.tools[0]!.optional = false;
+    expect(spawnSync(process.execPath, [runtimeToolsValidator], { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
+  });
+
   it('suppresses OpenClaw startup catch-up outside an exact Seoul hour', () => {
     const source = readFileSync(installer, 'utf8');
     const trigger = resolve(repo, 'scripts/wsl/briefing-cron-trigger.js');
@@ -240,6 +296,9 @@ describe('deployment scripts', () => {
     valid.jobs[0]!.enabled = false;
     expect(spawnSync(process.execPath, args, { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
     valid.jobs[0]!.enabled = true;
+    valid.jobs[0]!.declarationKey = 'attacker-key';
+    expect(spawnSync(process.execPath, args, { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
+    valid.jobs[0]!.declarationKey = 'openclaw-personal-assistant-hourly-briefing';
     valid.jobs[0]!.trigger.script = `malicious(); /* ${script} */`;
     expect(spawnSync(process.execPath, args, { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
   });
@@ -261,14 +320,42 @@ describe('deployment scripts', () => {
     try {
       privateDirectory(root);
       const config = resolve(root, 'openclaw.json5');
+      const secretRoot = resolve(root, 'secrets');
+      const configSecretRoot = secretRoot.replaceAll('\\', '/');
       const unsafe = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
         .replace("bind: 'loopback'", "bind: 'lan'");
       writeFileSync(config, unsafe, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, '/home/user/.openclaw/secrets'], { encoding: 'utf8' });
+      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('active_config_not_hardened');
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
+    ['wrong CalDAV secret path', (text: string) => text.replace('/naver-caldav', '/wrong-caldav')],
+    ['wrong Naver token path', (text: string) => text.replace('/naver-oauth', '/wrong-oauth')],
+    ['placeholder', (text: string) => text.replace("timezone: 'Asia/Seoul'", "timezone: '<replace-timezone>'")],
+  ])('rejects %s through the full hardened config contract used by --check', (_label, mutate) => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-check-config-'));
+    try {
+      privateDirectory(root);
+      const config = resolve(root, 'openclaw.json5');
+      const secretRoot = resolve(root, 'secrets');
+      const configSecretRoot = secretRoot.replaceAll('\\', '/');
+      const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot);
+      writeFileSync(config, baseline, { mode: 0o600 });
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
+      expect(valid.status, valid.stderr).toBe(0);
+      writeFileSync(config, mutate(baseline), { mode: 0o600 });
+      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' }).status).not.toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+    const checkBlock = readFileSync(installer, 'utf8').split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
+    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"');
   });
 
   it('non-live acceptance emits exactly 32 criterion records with live work not verified', () => {

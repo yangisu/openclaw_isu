@@ -5,35 +5,25 @@ const { createHash } = require('node:crypto');
 const { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } = require('node:fs');
 const { isAbsolute, join, relative, resolve } = require('node:path');
 
-const PROTOCOL_VERSION = 2;
-const PRODUCER = 'openclaw-personal-assistant-live-probe/v2';
-const TEST_PRODUCER = 'openclaw-personal-assistant-live-probe-test-adapter/v2';
+const PROTOCOL_VERSION = 3;
+const PRODUCER = 'openclaw-personal-assistant-live-probe/v3';
+const TEST_PRODUCER = 'openclaw-personal-assistant-live-probe-test-adapter/v3';
 const MAX_EVIDENCE_BYTES = 1024 * 1024;
 const MAX_RAW_BYTES = 1024 * 1024;
 
+const unsupportedIds = ['AC-02', 'AC-03', 'AC-07', 'AC-08', 'AC-13', 'AC-14', 'AC-15', 'AC-23', 'AC-25', 'AC-26', 'AC-27', 'AC-32'];
 const requirements = {
-  'AC-01': { phases: ['single'], probeId: 'ocpa-live-ac01-v2', source: { ubuntuVersion: '24.04', pid1: 'systemd', gatewayState: 'active' }, observations: { ubuntuVersion: '24.04', systemdPid1: true, gatewayActive: true } },
-  'AC-02': { phases: ['model-call'], probeId: 'ocpa-live-ac02-v2', source: { provider: 'openai', modelResult: 'response_observed' }, observations: { provider: 'openai', modelResponseObserved: true } },
-  'AC-03': { phases: ['owner-request', 'owner-response'], phaseKeys: { 'owner-request': ['ownerRequest', 'messageId'], 'owner-response': ['ownerResponse', 'messageId'] }, probeId: 'ocpa-live-ac03-v2', source: { ownerRequest: 'received', ownerResponse: 'observed', messageId: 'id' }, observations: { ownerMessageReceived: true, ownerResponseObserved: true } },
-  'AC-07': { phases: ['caldav-read'], probeId: 'ocpa-live-ac07-v2', source: { authentication: 'accepted', existingEvent: 'read', eventId: 'id' }, observations: { caldavAuthenticated: true, existingEventRead: true } },
-  'AC-08': { phases: ['before-create', 'after-create', 'after-user-delete'], phaseKeys: { 'before-create': ['confirmation', 'eventId'], 'after-create': ['createdCount', 'duplicateCount', 'eventId'], 'after-user-delete': ['userDeletion', 'eventId'] }, probeId: 'ocpa-live-ac08-v2', source: { confirmation: 'observed', createdCount: 1, duplicateCount: 0, userDeletion: 'observed', eventId: 'id' }, observations: { confirmationObserved: true, createdCount: 1, duplicateCount: 0, deletedByUser: true } },
-  'AC-12': { phases: ['before-restart', 'after-restart'], phaseKeys: { 'before-restart': ['windowsBootId', 'wslBootId'], 'after-restart': ['windowsBootId', 'wslBootId', 'windowsRecovery', 'wslRecovery', 'gatewayState'] }, probeId: 'ocpa-live-ac12-v2', source: { windowsBootId: 'id', wslBootId: 'id', windowsRecovery: 'observed', wslRecovery: 'observed', gatewayState: 'active' }, observations: { windowsRestartRecovered: true, wslRestartRecovered: true, gatewayActive: true } },
-  'AC-13': { phases: ['backup', 'isolated-restore'], phaseKeys: { backup: ['archiveFormat', 'archiveId'], 'isolated-restore': ['restoreMode', 'manifestResult', 'archiveId'] }, probeId: 'ocpa-live-ac13-v2', source: { archiveFormat: 'age', restoreMode: 'isolated', manifestResult: 'verified', archiveId: 'id' }, observations: { ageEncrypted: true, isolatedRestore: true, manifestVerified: true } },
-  'AC-14': { phases: ['canary-scan'], probeId: 'ocpa-live-ac14-v2', source: { trackedScan: 'clean', logScan: 'clean', archiveScan: 'clean' }, observations: { trackedFilesClean: true, logsClean: true, encryptedArchiveClean: true } },
-  'AC-15': { phases: ['caldav-shapes', 'failure-injection'], phaseKeys: { 'caldav-shapes': ['authentication', 'calendars', 'singleEvent', 'allDayEvent', 'recurringEvent', 'crossTimezoneEvent'], 'failure-injection': ['failureMode'] }, probeId: 'ocpa-live-ac15-v2', source: { authentication: 'accepted', calendars: 'listed', singleEvent: 'read', allDayEvent: 'read', recurringEvent: 'read', crossTimezoneEvent: 'read', failureMode: 'calendar_limited' }, observations: { authenticated: true, listedCalendars: true, singleEventRead: true, allDayRead: true, recurringRead: true, crossTimezoneRead: true, limitedModeOnFailure: true } },
-  'AC-23': { phases: ['observe-0800', 'observe-2200', 'observe-2300', 'after-wake'], phaseKeys: { 'observe-0800': ['run0800', 'messageId'], 'observe-2200': ['run2200', 'messageId'], 'observe-2300': ['run2300'], 'after-wake': ['catchUpReplay'] }, probeId: 'ocpa-live-ac23-v2', source: { run0800: 'observed', run2200: 'observed', run2300: 'not_observed', catchUpReplay: 'not_observed', messageId: 'id' }, observations: { observed0800: true, observed2200: true, observed2300: false, catchUpReplayObserved: false } },
-  'AC-25': { phases: ['before-reboot', 'after-reboot-idle'], phaseKeys: { 'before-reboot': ['windowsBootId'], 'after-reboot-idle': ['windowsBootId', 'idleMinutes', 'interactiveLogin', 'wslState', 'gatewayState', 'telegramResponse', 'messageId'] }, probeId: 'ocpa-live-ac25-v2', source: { windowsBootId: 'id', idleMinutes: 30, interactiveLogin: 'not_observed', wslState: 'active', gatewayState: 'active', telegramResponse: 'observed', messageId: 'id' }, observations: { windowsRebooted: true, idleMinutes: 30, noInteractiveLogin: true, wslActive: true, gatewayActive: true, telegramResponseObserved: true } },
-  'AC-26': { phases: ['gateway-call', 'telegram-call', 'refresh-failure', 'revocation'], phaseKeys: { 'gateway-call': ['gatewayCall'], 'telegram-call': ['telegramCall', 'messageId'], 'refresh-failure': ['refreshFailure'], revocation: ['revocation'] }, probeId: 'ocpa-live-ac26-v2', source: { gatewayCall: 'observed', telegramCall: 'observed', refreshFailure: 'closed', revocation: 'closed', messageId: 'id' }, observations: { gatewayModelCall: true, telegramModelCall: true, refreshFailureClosed: true, revocationClosed: true } },
-  'AC-27': { phases: ['state-rejection', 'create', 'refresh', 'revoke'], phaseKeys: { 'state-rejection': ['invalidState', 'expiredState', 'reusedState'], create: ['create', 'eventId'], refresh: ['refresh'], revoke: ['revoke', 'postRevoke'] }, probeId: 'ocpa-live-ac27-v2', source: { invalidState: 'rejected', expiredState: 'rejected', reusedState: 'rejected', create: 'observed', refresh: 'observed', revoke: 'observed', postRevoke: 'failed', eventId: 'id' }, observations: { invalidStateRejected: true, expiredStateRejected: true, reusedStateRejected: true, eventCreated: true, tokenRefreshed: true, tokenRevoked: true, postRevocationFailed: true } },
-  'AC-32': { phases: ['monthly-restore'], probeId: 'ocpa-live-ac32-v2', source: { sha256: 'verified', git: 'verified', markdown: 'verified', sqlite: 'verified', fullRestore: 'verified', monthlyRecord: 'recorded', archiveId: 'id' }, observations: { sha256Verified: true, gitVerified: true, markdownVerified: true, sqliteVerified: true, fullRestoreVerified: true, monthlyEvidenceRecorded: true } },
+  'AC-01': { supported: true, phases: ['single'], probeId: 'ocpa-live-ac01-v3', adapter: 'system-health-v1', commands: ['os-release', 'pid1', 'gateway-active'] },
+  'AC-12': { supported: true, phases: ['before-restart', 'after-restart'], probeId: 'ocpa-live-ac12-v3', adapter: 'restart-health-v1', commands: ['windows-boot-id', 'wsl-boot-id', 'gateway-active'] },
+  ...Object.fromEntries(unsupportedIds.map(id => [id, { supported: false, phases: [], probeId: `ocpa-live-${id.toLowerCase().replace('-', '')}-v3`, adapter: 'unsupported' }])),
 };
 
 const targetImplementationSha256 = sha256(readFileSync(join(__dirname, 'live-probe-target.js')));
 
 const PROBES = Object.fromEntries(Object.entries(requirements).map(([criterionId, value]) => {
   const command = { executable: 'node', argv: ['scripts/wsl/live-probe-target.js', '--criterion', criterionId, '--phase', '<phase>'] };
-  const base = { criterionId, probeId: value.probeId, phases: value.phases, phaseKeys: value.phaseKeys ?? null,
-    command, targetImplementationSha256, source: value.source, observations: value.observations };
+  const base = { criterionId, probeId: value.probeId, supported: value.supported, adapter: value.adapter,
+    phases: value.phases, commands: value.commands ?? [], command, targetImplementationSha256 };
   return [criterionId, { ...value, command, digest: sha256(canonical(base)) }];
 }));
 
@@ -85,7 +75,7 @@ function assertPosixPrivate(info, directory) {
   if ((info.mode & 0o777) !== (directory ? 0o700 : 0o600)) throw new Error('mode_invalid');
 }
 
-const forbiddenKey = /^(?:token|access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|apikey|authorization|password|telegram[_-]?token|bearer|basic|oauth[_-]?(?:code|state|verifier)|code|state|verifier|cookie|credential|private[_-]?key)$/i;
+const forbiddenKey = /^(?:token|secret|secret[_-]?value|access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|apikey|authorization|password|password[_-]?hash|telegram[_-]?token|bearer|basic|oauth[_-]?(?:code|state|verifier)|code|state|verifier|cookie|credential|private[_-]?key)$/i;
 const forbiddenValue = /(?:\b(?:Basic|Bearer)\s+\S+|\b\d{6,12}:[A-Za-z0-9_-]{20,}\b|\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-|ghp_|AIza)[A-Za-z0-9_-]{8,}\b|https?:\/\/[^\s/@]+:[^\s/@]+@|https?:\/\/[^\s]+[?&](?:token|code|state|secret|key|api[_-]?key|password|verifier)=[^&#\s]*)/iu;
 
 function validateSafeValue(value, canaries = [], state = { nodes: 0, strings: 0 }, depth = 0) {
@@ -109,65 +99,84 @@ function validateSafeValue(value, canaries = [], state = { nodes: 0, strings: 0 
   for (const key of keys) {
     const normalizedKey = key.replace(/[^A-Za-z0-9]/g, '').toLowerCase();
     if (key.length > 128 || forbiddenKey.test(key)
-      || /^(?:token|accesstoken|refreshtoken|clientsecret|apikey|authorization|password|telegramtoken|bearer|basic|oauthcode|oauthstate|oauthverifier|code|state|verifier|cookie|credentials?|privatekey)$/.test(normalizedKey)) throw new Error('secret_key');
+      || /^(?:token|secret|secretvalue|accesstoken|refreshtoken|clientsecret|apikey|authorization|password|passwordhash|telegramtoken|bearer|basic|oauthcode|oauthstate|oauthverifier|code|state|verifier|cookie|credentials?|privatekey)$/.test(normalizedKey)) throw new Error('secret_key');
     validateSafeValue(value[key], canaries, state, depth + 1);
   }
 }
 
 function validateRaw(criterionId, phase, raw, canaries = []) {
   const probe = PROBES[criterionId];
-  if (!probe || !probe.phases.includes(phase)) throw new Error('probe_invalid');
+  if (!probe || !probe.supported) throw new Error('probe_unsupported');
+  if (!probe.phases.includes(phase)) throw new Error('probe_invalid');
   validateSafeValue(raw, canaries);
-  const keys = ['capturedAt', 'phase', 'probeId', 'target'];
+  const keys = ['adapter', 'capturedAt', 'commandResults', 'phase', 'probeId'];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).sort().join('\0') !== keys.join('\0')
     || raw.probeId !== probe.probeId || raw.phase !== phase || !fresh(raw.capturedAt)
-    || !raw.target || typeof raw.target !== 'object' || Array.isArray(raw.target)) throw new Error('raw_invalid');
-  const expectedKeys = [...(probe.phaseKeys?.[phase] ?? Object.keys(probe.source))].sort();
-  if (Object.keys(raw.target).sort().join('\0') !== expectedKeys.join('\0')) throw new Error('raw_schema_invalid');
-  for (const key of expectedKeys) {
-    const expected = probe.source[key];
-    const actual = raw.target[key];
-    if (expected === 'id') {
-      if (typeof actual !== 'string' || !/^[A-Za-z0-9._:-]{6,128}$/.test(actual)) throw new Error('identifier_invalid');
-    } else if (key === 'idleMinutes') {
-      if (!Number.isInteger(actual) || actual < expected || actual > 1440) throw new Error('idle_invalid');
-    } else if (actual !== expected) throw new Error('observation_invalid');
+    || raw.adapter !== probe.adapter || !Array.isArray(raw.commandResults)
+    || raw.commandResults.length !== probe.commands.length) throw new Error('raw_invalid');
+  for (let index = 0; index < probe.commands.length; index += 1) {
+    const result = raw.commandResults[index];
+    if (!result || typeof result !== 'object' || Array.isArray(result)
+      || Object.keys(result).sort().join('\0') !== 'commandId\0exitCode\0stdoutLines'
+      || result.commandId !== probe.commands[index] || result.exitCode !== 0
+      || !Array.isArray(result.stdoutLines) || result.stdoutLines.length < 1 || result.stdoutLines.length > 128
+      || result.stdoutLines.some(line => typeof line !== 'string' || line.length > 4096)) throw new Error('command_result_invalid');
   }
   return raw;
 }
 
 function deriveObservations(criterionId, rawByPhase) {
   const probe = PROBES[criterionId];
-  if (!probe || Object.keys(rawByPhase).sort().join('\0') !== [...probe.phases].sort().join('\0')) throw new Error('phases_incomplete');
+  if (!probe || !probe.supported) throw new Error('probe_unsupported');
+  if (Object.keys(rawByPhase).sort().join('\0') !== [...probe.phases].sort().join('\0')) throw new Error('phases_incomplete');
   for (const phase of probe.phases) validateRaw(criterionId, phase, rawByPhase[phase]);
-  if (criterionId === 'AC-08') {
-    const ids = probe.phases.map(phase => rawByPhase[phase].target.eventId);
-    if (new Set(ids).size !== 1) throw new Error('event_identity_mismatch');
+  if (criterionId === 'AC-01') {
+    const commands = commandMap(rawByPhase.single);
+    const release = parseOsRelease(commands.get('os-release'));
+    const observations = {
+      ubuntuVersion: release.VERSION_ID,
+      systemdPid1: commands.get('pid1').trim() === 'systemd',
+      gatewayActive: commands.get('gateway-active').trim() === 'active',
+    };
+    if (release.ID !== 'ubuntu' || observations.ubuntuVersion !== '24.04'
+      || !observations.systemdPid1 || !observations.gatewayActive) throw new Error('criterion_not_observed');
+    return observations;
   }
   if (criterionId === 'AC-12') {
-    const before = rawByPhase['before-restart'].target; const after = rawByPhase['after-restart'].target;
-    if (before.windowsBootId === after.windowsBootId || before.wslBootId === after.wslBootId) throw new Error('restart_not_observed');
+    const before = commandMap(rawByPhase['before-restart']); const after = commandMap(rawByPhase['after-restart']);
+    const observations = {
+      windowsRestartRecovered: before.get('windows-boot-id').trim() !== after.get('windows-boot-id').trim(),
+      wslRestartRecovered: before.get('wsl-boot-id').trim() !== after.get('wsl-boot-id').trim(),
+      gatewayActive: after.get('gateway-active').trim() === 'active',
+    };
+    if (![before.get('windows-boot-id'), after.get('windows-boot-id'), before.get('wsl-boot-id'), after.get('wsl-boot-id')]
+      .every(value => /^[A-Za-z0-9._:-]{6,128}\s*$/.test(value)) || !Object.values(observations).every(Boolean)) throw new Error('restart_not_observed');
+    return observations;
   }
-  if (criterionId === 'AC-23') {
-    assertSeoulHour(rawByPhase['observe-0800'].capturedAt, 8);
-    assertSeoulHour(rawByPhase['observe-2200'].capturedAt, 22);
-    assertSeoulHour(rawByPhase['observe-2300'].capturedAt, 23);
-  }
-  if (criterionId === 'AC-25') {
-    const before = rawByPhase['before-reboot']; const after = rawByPhase['after-reboot-idle'];
-    if (before.target.windowsBootId === after.target.windowsBootId
-      || new Date(after.capturedAt).valueOf() - new Date(before.capturedAt).valueOf() < 30 * 60_000) throw new Error('reboot_idle_not_observed');
-  }
-  const observations = { ...probe.observations };
-  if (criterionId === 'AC-25') observations.idleMinutes = rawByPhase['after-reboot-idle'].target.idleMinutes;
-  return observations;
+  throw new Error('probe_unsupported');
 }
 
-function assertSeoulHour(value, expected) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).formatToParts(new Date(value)).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
-  if (Number(parts.hour) !== expected || Number(parts.minute) !== 0) throw new Error('cron_time_invalid');
+function commandMap(raw) { return new Map(raw.commandResults.map(result => [result.commandId, result.stdoutLines.join('\n')])); }
+function parseOsRelease(text) {
+  return Object.fromEntries(text.split(/\r?\n/).filter(line => line.includes('=')).map(line => {
+    const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1).replace(/^"|"$/g, '')];
+  }));
+}
+
+function parseOpenClawAuditPage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('audit_invalid');
+  const keys = Object.keys(value).sort().join('\0');
+  if (keys !== 'events' && keys !== 'events\0nextCursor') throw new Error('audit_invalid');
+  if (!Array.isArray(value.events) || value.events.length > 500
+    || (value.nextCursor !== undefined && !/^[1-9][0-9]*$/.test(value.nextCursor))) throw new Error('audit_invalid');
+  for (const event of value.events) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)
+      || !Number.isSafeInteger(event.occurredAt) || typeof event.action !== 'string'
+      || !['agent_run', 'tool_action'].includes(event.kind)
+      || !['started', 'succeeded', 'failed', 'cancelled', 'timed_out', 'blocked', 'unknown'].includes(event.status)
+      || event.redaction !== 'metadata_only') throw new Error('audit_invalid');
+  }
+  return value.events;
 }
 
 function fresh(value) {
@@ -178,5 +187,5 @@ function fresh(value) {
 
 module.exports = {
   MAX_EVIDENCE_BYTES, MAX_RAW_BYTES, PRODUCER, PROBES, PROTOCOL_VERSION, TEST_PRODUCER,
-  canonical, deriveObservations, fresh, secureReadFile, sha256, validateRaw, validateSafeValue, within,
+  canonical, deriveObservations, fresh, parseOpenClawAuditPage, secureReadFile, sha256, validateRaw, validateSafeValue, within,
 };

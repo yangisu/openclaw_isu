@@ -22,6 +22,10 @@ function main() {
   const outputDir = required(options, 'output-dir');
   const probe = PROBES[criterionId];
   if (!probe || !isAbsolute(outputDir) || resolve(outputDir) !== outputDir) throw coded('probe_usage');
+  if (!probe.supported) {
+    process.stdout.write(`${JSON.stringify({ status: 'NOT_VERIFIED', criterionId, reason: 'probe_unsupported' })}\n`);
+    process.exit(125);
+  }
   ensurePrivateRoot(outputDir);
   const phase = options.get('phase') ?? (probe.phases.length === 1 ? probe.phases[0] : undefined);
   if (!phase || !probe.phases.includes(phase)) throw coded('probe_phase_required');
@@ -31,6 +35,10 @@ function main() {
   const canaries = loadCanaries(outputDir);
   const startedAt = new Date().toISOString();
   const result = testMode ? runTestAdapter(adapter) : runFixedAdapter(criterionId, phase);
+  if (result.status === 125 && !result.signal && !result.error) {
+    process.stdout.write(`${JSON.stringify({ status: 'NOT_VERIFIED', criterionId, reason: 'target_not_verified' })}\n`);
+    process.exit(125);
+  }
   if (result.status !== 0 || result.signal || result.error || Buffer.byteLength(result.stdout ?? '', 'utf8') > MAX_RAW_BYTES) throw coded('probe_command_failed');
   let raw;
   try { raw = JSON.parse(result.stdout); } catch { throw coded('probe_output_invalid'); }
