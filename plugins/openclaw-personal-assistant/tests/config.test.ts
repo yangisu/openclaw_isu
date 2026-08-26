@@ -70,8 +70,8 @@ describe('loadConfig', () => {
     ])).toThrow(/calendarMappings/);
   });
 
-  it('rejects an unbounded calendar mapping array', () => {
-    expect(() => loadCalendarMappings('https://caldav.example.test/', Array.from({ length: 101 }, (_, index) => ({
+  it('rejects more than ten calendar mappings before runtime request multiplication', () => {
+    expect(() => loadCalendarMappings('https://caldav.example.test/', Array.from({ length: 11 }, (_, index) => ({
       apiCalendarId: `api-${index}`,
       caldavHref: `/collections/${index}/`,
     })))).toThrow(/calendarMappings/);

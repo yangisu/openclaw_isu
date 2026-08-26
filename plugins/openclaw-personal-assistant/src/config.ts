@@ -37,7 +37,7 @@ export function canonicalizeCalDavHref(baseUrl: string | URL, rawHref: string): 
 }
 
 export function loadCalendarMappings(baseUrl: string, raw: unknown): CalendarCollectionMapping[] {
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 100) throw new Error('invalid calendarMappings');
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 10) throw new Error('invalid calendarMappings');
   const base = new URL(baseUrl);
   if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash) {
     throw new Error('invalid calendarMappings');

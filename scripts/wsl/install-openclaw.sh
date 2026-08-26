@@ -187,7 +187,7 @@ if [[ "$MODE" == check ]]; then
   validate_runtime_tools
   "$OPENCLAW" config validate
   validate_active_config
-  node "$PLUGIN_ROOT/dist/cli.js" oauth status --client-file "$SECRET_DIR/naver-oauth-client" --token-file "$SECRET_DIR/naver-oauth-token"
+  node "$PLUGIN_ROOT/dist/cli.js" oauth status --client-file "$SECRET_DIR/naver-oauth-client" --token-file "$SECRET_DIR/naver-oauth-token" --state "$OPENCLAW_HOME/state/openclaw-personal-assistant"
   node "$PLUGIN_ROOT/dist/cli.js" maintenance check --config "$MAINTENANCE_CONFIG_FILE"
   systemctl --user is-enabled --quiet openclaw-gateway.service
   systemctl --user is-active --quiet openclaw-gateway.service
@@ -210,7 +210,7 @@ if [[ "$PHASE" == prepare ]]; then
   say "node '$PLUGIN_ROOT/dist/cli.js' oauth configure --client-file '$SECRET_DIR/naver-oauth-client' < /absolute/owner-private/naver-client-input.json"
   say "node '$PLUGIN_ROOT/dist/cli.js' oauth begin --client-file '$SECRET_DIR/naver-oauth-client' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
   say "node '$PLUGIN_ROOT/dist/cli.js' oauth callback --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' < /absolute/owner-private/naver-callback.json"
-  say "node '$PLUGIN_ROOT/dist/cli.js' oauth status --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' oauth status --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
   say "node '$PLUGIN_ROOT/dist/cli.js' doctor --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' --naver-client-file '$SECRET_DIR/naver-oauth-client' --naver-token-file '$SECRET_DIR/naver-oauth-token'"
   say "Edit '$MAINTENANCE_CONFIG_FILE' locally: set this user's workspace/state/restore paths, mounted offline-media identity path, and approved age recipient; never paste the identity into chat or argv."
   say "node '$PLUGIN_ROOT/dist/cli.js' maintenance check --config '$MAINTENANCE_CONFIG_FILE'"

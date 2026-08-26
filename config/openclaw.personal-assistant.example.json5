@@ -42,6 +42,7 @@
           telegramUserId: '123456789',
           timezone: 'Asia/Seoul',
           calendar: {
+            caldavReadEnabled: false,
             caldavBaseUrl: 'https://caldav.calendar.naver.com',
             caldavSecretFile: '/home/user/.openclaw/secrets/naver-caldav',
             naverOAuthClientFile: '/home/user/.openclaw/secrets/naver-oauth-client',

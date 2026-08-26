@@ -8,7 +8,10 @@ import {
 } from '../tools/trust.js';
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
-const DEFAULT_MAX_PER_CYCLE = 20;
+// One reconciliation may fan out across every mapped collection. Keep the
+// service-wide network cycle to one pending request so a backlog cannot
+// multiply the CalDAV request budget.
+const DEFAULT_MAX_PER_CYCLE = 1;
 const MAX_INTERVAL_MS = 60 * 60_000;
 
 interface RecoveryOutbox {
@@ -25,6 +28,7 @@ export interface CalendarRecoveryDependencies {
   openOutbox?: (
     config: AssistantToolConfig,
     warn: (warning: CalendarOutboxWarning) => void | Promise<void>,
+    signal: AbortSignal,
   ) => RecoveryOutbox;
   schedule?: (callback: () => void, delayMs: number) => unknown;
   cancel?: (handle: unknown) => void;
@@ -35,7 +39,7 @@ export function createCalendarRecoveryService(
   dependencies: CalendarRecoveryDependencies = {},
 ): OpenClawPluginService {
   const intervalMs = boundedPositive(dependencies.intervalMs ?? DEFAULT_INTERVAL_MS, 'intervalMs', MAX_INTERVAL_MS);
-  const maxPerCycle = boundedPositive(dependencies.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE, 'maxPerCycle', 100);
+  const maxPerCycle = boundedPositive(dependencies.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE, 'maxPerCycle', 1);
   const schedule = dependencies.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
   const cancel = dependencies.cancel ?? (handle => clearTimeout(handle as NodeJS.Timeout));
   let stopped = true;
@@ -44,6 +48,7 @@ export function createCalendarRecoveryService(
   let timer: unknown;
   let cycle: Promise<void> | undefined;
   let consecutiveFailures = 0;
+  let activeController: AbortController | undefined;
 
   const requestTarget = (requestId: string) => `calendar-reconcile:${requestId}`;
   const safeReport = (entry: Parameters<SubsystemHealthJournal['report']>[0]) => {
@@ -103,8 +108,18 @@ export function createCalendarRecoveryService(
       let config: AssistantToolConfig;
       try {
         config = loadConfigFromApi(api);
+        activeController = new AbortController();
         health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
-        outbox = (dependencies.openOutbox ?? openRecoveryOutbox)(config, reportWarning);
+        try { requireCalendarReadConfig(config); }
+        catch (error) {
+          if (error && typeof error === 'object' && 'code' in error && error.code === 'caldav_read_disabled') {
+            health.report({ target: 'naver-caldav', errorCode: 'caldav_read_disabled',
+              message: 'Calendar reads are disabled pending authorized live validation' });
+            return;
+          }
+          throw error;
+        }
+        outbox = (dependencies.openOutbox ?? openRecoveryOutbox)(config, reportWarning, activeController.signal);
         cycle = runCycle();
         await cycle;
         cycle = undefined;
@@ -124,6 +139,7 @@ export function createCalendarRecoveryService(
     },
     async stop() {
       stopped = true;
+      activeController?.abort();
       if (timer !== undefined) {
         cancel(timer);
         timer = undefined;
@@ -134,6 +150,7 @@ export function createCalendarRecoveryService(
       health?.close();
       outbox = undefined;
       health = undefined;
+      activeController = undefined;
     },
   };
 }
@@ -141,12 +158,14 @@ export function createCalendarRecoveryService(
 function openRecoveryOutbox(
   config: AssistantToolConfig,
   warn: (warning: CalendarOutboxWarning) => void | Promise<void>,
+  signal: AbortSignal,
 ): CalendarOutbox {
   const calendar = requireCalendarReadConfig(config);
   const caldav = new CalDavClient({
     baseUrl: calendar.caldavBaseUrl,
     secretFile: calendar.caldavSecretFile,
     calendarMappings: calendar.calendarMappings,
+    signal,
   });
   return new CalendarOutbox({
     stateDir: config.stateDir,

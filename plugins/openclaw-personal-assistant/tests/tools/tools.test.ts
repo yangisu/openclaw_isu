@@ -304,6 +304,50 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(closeAlerts).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps CalDAV disabled before credentials or network while local query and briefing continue with warning', async () => {
+    const fetch = vi.fn();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    const active: Array<{ errorCode: string; target: string; message: string }> = [];
+    const health = {
+      report(error: typeof active[number]) { active.splice(0, active.length, error); },
+      recover: vi.fn(), listActive: () => [...active], close: vi.fn(),
+    };
+    const gatedApi = api({ calendar: {
+      caldavReadEnabled: false,
+      caldavBaseUrl: 'https://caldav.example.test/',
+      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+      calendarMappings: [{ apiCalendarId: 'personal', caldavHref: 'https://caldav.example.test/personal/' }],
+    } });
+    try {
+      const query = createQueryTool(gatedApi, ownerContext, {
+        openRepository: () => ({ async query() { return []; }, close() {} }), openHealth: () => health,
+      });
+      await expect(query.execute('disabled-calendar-query', {
+        kind: 'calendar', from: '2026-08-25T00:00:00+09:00', to: '2026-08-26T00:00:00+09:00',
+      })).rejects.toMatchObject({ code: 'caldav_read_disabled' });
+      await expect(query.execute('local-record-query', { kind: 'records', recordType: 'task' }))
+        .resolves.toMatchObject({ details: { kind: 'records', items: [] } });
+      let text = '';
+      const briefing = createBriefingTool(gatedApi, briefingOwnerContext, {
+        now: () => new Date('2026-08-25T09:00:00+09:00'),
+        openRepository: () => ({ async query() { return []; }, close() {} }), openHealth: () => health,
+        openAlerts: () => ({
+          claimAndRender: (errors, renderer) => ({ result: renderer(errors) }),
+          acknowledgePayloads: vi.fn(), close() {},
+        }),
+        send: async params => {
+          text = params.payloads.map(payload => payload.text ?? '').join('\n');
+          return { status: 'sent', payloadOutcomes: params.payloads.map((_p, index) => ({ index, status: 'sent' as const })) };
+        },
+      });
+      await briefing.execute('disabled-calendar-briefing', {});
+      expect(text).toContain('caldav_read_disabled (naver-caldav)');
+      expect(fetch).not.toHaveBeenCalled();
+      expect(health.recover).not.toHaveBeenCalledWith('naver-caldav');
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
   it('reads durable subsystem errors and clears CalDAV health only after a successful read', async () => {
     const stateDir = `/tmp/openclaw-tool-health-${randomUUID()}`;
     temporaryStateDirs.push(stateDir);
@@ -353,11 +397,12 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       kind: 'timed' as const, status: 'CONFIRMED',
     }]);
     const openCalendar = vi.fn(() => ({ listEvents }));
-    const query = createQueryTool(api(), ownerContext, { openCalendar });
+    const query = createQueryTool(api({ calendar: { caldavReadEnabled: true } }), ownerContext, { openCalendar });
 
+    const controller = new AbortController();
     const result = await query.execute('call-2', {
       kind: 'calendar', from: '2026-08-25T00:00:00+09:00', to: '2026-08-26T00:00:00+09:00',
-    });
+    }, controller.signal);
 
     expect(result.details).toMatchObject({
       kind: 'calendar', trust: 'quoted_untrusted_data',
@@ -368,7 +413,16 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(openCalendar).toHaveBeenCalledTimes(1);
     expect(listEvents).toHaveBeenCalledWith({
       start: '2026-08-25T00:00:00+09:00', end: '2026-08-26T00:00:00+09:00',
-    });
+    }, controller.signal);
+  });
+
+  it('rejects a calendar query over 31 days before opening the calendar reader', async () => {
+    const openCalendar = vi.fn();
+    const query = createQueryTool(api({ calendar: { caldavReadEnabled: true } }), ownerContext, { openCalendar });
+    await expect(query.execute('long-calendar-query', {
+      kind: 'calendar', from: '2026-01-01T00:00:00Z', to: '2026-02-02T00:00:00Z',
+    })).rejects.toMatchObject({ code: 'invalid_calendar_range' });
+    expect(openCalendar).not.toHaveBeenCalled();
   });
 
   it.each([

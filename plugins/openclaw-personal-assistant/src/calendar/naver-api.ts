@@ -1,4 +1,8 @@
+import { BoundedBodyError, readBoundedJson } from './bounded-json.js';
+
 const CREATE_SCHEDULE_ENDPOINT = 'https://openapi.naver.com/calendar/createSchedule.json';
+const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_RESPONSE_FIELD_LENGTH = 1_024;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -74,22 +78,17 @@ export class NaverCalendarApi {
       throw new NaverCalendarError('request_maybe_sent', 'Naver Calendar request outcome is unknown');
     }
 
-    let body: string;
-    try {
-      body = await response.text();
-    } catch {
-      const classified = classifyHttp(response.status);
-      if (classified) throw classified;
-      throw new NaverCalendarError('request_maybe_sent', 'Naver Calendar response was not received completely');
-    }
     const httpError = classifyHttp(response.status);
     if (httpError) throw httpError;
 
     let decoded: unknown;
     try {
-      decoded = JSON.parse(body) as unknown;
-    } catch {
-      throw new NaverCalendarError('naver_invalid_response', 'Naver Calendar returned invalid JSON');
+      decoded = await readBoundedJson(response, MAX_RESPONSE_BYTES);
+    } catch (error) {
+      if (error instanceof BoundedBodyError && ['invalid_json', 'invalid_shape'].includes(error.code)) {
+        throw new NaverCalendarError('naver_invalid_response', 'Naver Calendar returned an invalid response');
+      }
+      throw new NaverCalendarError('request_maybe_sent', 'Naver Calendar response was not received completely');
     }
     const envelope = objectValue(decoded);
     const returnValue = objectValue(envelope.returnValue);
@@ -141,5 +140,5 @@ function objectValue(value: unknown): Record<string, unknown> {
 }
 
 function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_RESPONSE_FIELD_LENGTH ? value : undefined;
 }

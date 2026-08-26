@@ -16,6 +16,7 @@ const config = {
   workspaceDir: '/tmp/assistant-workspace', stateDir: '/tmp/assistant-state',
   backupDir: '/tmp/assistant-backup', telegramUserId: OWNER, timezone: 'Asia/Seoul',
   calendar: {
+    caldavReadEnabled: true,
     caldavBaseUrl: 'https://caldav.example.test/',
     caldavSecretFile: '/tmp/assistant-secrets/caldav',
     calendarMappings: [{ apiCalendarId: 'personal', caldavHref: 'https://caldav.example.test/personal/' }],
@@ -51,8 +52,8 @@ function prepare(outbox: CalendarOutbox, draft: CalendarEventDraft & { requestId
   });
 }
 
-function apiFor(state: string) {
-  return { config: {}, pluginConfig: { ...config, stateDir: state } } as never;
+function apiFor(state: string, calendar: Record<string, unknown> = config.calendar) {
+  return { config: {}, pluginConfig: { ...config, stateDir: state, calendar } } as never;
 }
 
 function serviceContext(state: string) {
@@ -60,6 +61,26 @@ function serviceContext(state: string) {
 }
 
 describe('calendar recovery plugin service', () => {
+  it('reports durable limited mode and performs zero network work while CalDAV reads are disabled', async () => {
+    const state = await stateDir();
+    const fetch = vi.fn();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    const service = createCalendarRecoveryService(apiFor(state, { ...config.calendar, caldavReadEnabled: false }));
+    try {
+      await service.start(serviceContext(state));
+      const health = new SubsystemHealthStore(state);
+      expect(health.listActive()).toContainEqual({
+        target: 'naver-caldav', errorCode: 'caldav_read_disabled',
+        message: 'Calendar reads are disabled pending authorized live validation',
+      });
+      health.close();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      await service.stop?.(serviceContext(state));
+      globalThis.fetch = originalFetch;
+    }
+  });
   it('recovers a stale submitting request and reconciles an exact CalDAV match without create', async () => {
     const state = await stateDir();
     const draft = event('11111111-1111-4111-8111-111111111111');
@@ -237,6 +258,21 @@ describe('calendar recovery plugin service', () => {
     await service.stop?.(serviceContext(state));
   });
 
+  it('caps recovery reconciliation to one request per network cycle', async () => {
+    const state = await stateDir();
+    const reconcile = vi.fn(async (requestId: string) => [{ requestId, status: 'pending' }]);
+    const pendingReconcileIds = vi.fn((limit: number) => Array.from({ length: limit }, (_, index) => `pending-${index}`));
+    const service = createCalendarRecoveryService(apiFor(state), {
+      openHealth: () => ({ report() {}, recover() {}, listActive: () => [], close() {} }),
+      openOutbox: () => ({ async recover() { return []; }, pendingReconcileIds, reconcile, close() {} }),
+      schedule() { return undefined; }, cancel() {},
+    });
+    await service.start(serviceContext(state));
+    await service.stop?.(serviceContext(state));
+    expect(pendingReconcileIds).toHaveBeenCalledWith(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
   it('waits for an active periodic cycle before closing resources', async () => {
     const state = await stateDir();
     let queued: (() => void) | undefined;
@@ -265,6 +301,33 @@ describe('calendar recovery plugin service', () => {
     release?.();
     await stopping;
     expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts an active reconciliation cycle promptly when the service stops', async () => {
+    const state = await stateDir();
+    let observedSignal: AbortSignal | undefined;
+    let queued: (() => void) | undefined;
+    let cycle = 0;
+    const service = createCalendarRecoveryService(apiFor(state, { ...config.calendar, caldavReadEnabled: true }), {
+      intervalMs: 10,
+      openHealth: () => ({ report() {}, recover() {}, listActive: () => [], close() {} }),
+      openOutbox: (_config, _warn, signal) => ({
+        async recover() { cycle += 1; },
+        pendingReconcileIds: () => cycle > 1 ? ['pending'] : [],
+        async reconcile() {
+          observedSignal = signal;
+          await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+          return [];
+        },
+        close() {},
+      }),
+      schedule(callback) { queued = callback; return callback; }, cancel() {},
+    });
+    await service.start(serviceContext(state));
+    queued?.();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(service.stop?.(serviceContext(state))).resolves.toBeUndefined();
+    expect(observedSignal?.aborted).toBe(true);
   });
 
   it('reports and closes a startup failure without rejecting service start', async () => {

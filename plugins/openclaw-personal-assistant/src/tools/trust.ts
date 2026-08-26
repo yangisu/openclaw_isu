@@ -10,6 +10,7 @@ import {
 import { normalizeTelegramUserId } from '../telegram-user-id.js';
 
 export interface CalendarToolConfig {
+  caldavReadEnabled?: boolean;
   caldavBaseUrl?: string;
   caldavSecretFile?: string;
   naverOAuthClientFile?: string;
@@ -36,11 +37,17 @@ export function loadConfigFromApi(api: OpenClawPluginApi): AssistantToolConfig {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration must be an object');
   }
   const value = rawCalendar as Record<string, unknown>;
-  const allowed = new Set(['caldavBaseUrl', 'caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile', 'calendarMappings']);
+  const allowed = new Set(['caldavReadEnabled', 'caldavBaseUrl', 'caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile', 'calendarMappings']);
   if (Object.keys(value).some(key => !allowed.has(key))) {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration contains an unknown field');
   }
   const calendar: CalendarToolConfig = {};
+  if (value.caldavReadEnabled !== undefined) {
+    if (typeof value.caldavReadEnabled !== 'boolean') {
+      throw new AssistantToolError('invalid_calendar_config', 'Invalid caldavReadEnabled');
+    }
+    calendar.caldavReadEnabled = value.caldavReadEnabled;
+  }
   for (const key of ['caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile'] as const) {
     const path = value[key];
     if (path !== undefined) {
@@ -116,7 +123,10 @@ export function requireCalendarReadConfig(config: AssistantToolConfig): {
   caldavSecretFile: string;
   calendarMappings: CalendarCollectionMapping[];
 } {
-  const { caldavBaseUrl, caldavSecretFile, calendarMappings } = config.calendar ?? {};
+  const { caldavReadEnabled, caldavBaseUrl, caldavSecretFile, calendarMappings } = config.calendar ?? {};
+  if (caldavReadEnabled !== true) {
+    throw new AssistantToolError('caldav_read_disabled', 'CalDAV reads are disabled pending authorized live validation');
+  }
   if (!caldavBaseUrl || !caldavSecretFile || !calendarMappings?.length) {
     throw new AssistantToolError('calendar_not_configured', 'CalDAV read access is not configured');
   }

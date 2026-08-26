@@ -513,7 +513,7 @@ describe('NaverOAuth token lifecycle', () => {
     expect(`${error.message} ${error.stack ?? ''}`).not.toMatch(/access-secret|private-body|authorization|bearer/i);
   });
 
-  it('invalidates local tokens when a successful revoke body read fails', async () => {
+  it('retains local tokens when a successful revoke response body cannot be verified', async () => {
     const files = await fixture();
     const tokens: NaverTokenSet = { version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' };
     await files.tokenStore.write(tokens);
@@ -523,10 +523,10 @@ describe('NaverOAuth token lifecycle', () => {
       ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
     });
     await expect(oauth.revoke()).rejects.toMatchObject({ code: 'oauth_request_failed' });
-    await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+    await expect(files.tokenStore.read()).resolves.toEqual(tokens);
   });
 
-  it('invalidates the local token even when remote revoke fails', async () => {
+  it('retains the local token for a retry when remote revoke returns an uncertain server failure', async () => {
     const files = await fixture();
     files.tokenStore.value = {
       version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
@@ -538,8 +538,8 @@ describe('NaverOAuth token lifecycle', () => {
     });
 
     await expect(oauth.revoke()).rejects.toMatchObject({ code: 'oauth_server' });
-    expect(files.tokenStore.value).toBeUndefined();
-    await expect(oauth.getValidAccessToken()).rejects.toMatchObject({ code: 'oauth_token_invalid' });
+    expect(files.tokenStore.value).toMatchObject({ accessToken: 'access-old', refreshToken: 'refresh-old' });
+    await expect(oauth.getValidAccessToken()).resolves.toBe('access-old');
   });
 
   it.each([
@@ -588,6 +588,22 @@ describe('NaverOAuth token lifecycle', () => {
 
     await expect(oauth.handleCallback({ code: 'code', state })).rejects.toMatchObject({ code: 'oauth_invalid_response' });
     await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+  });
+
+  it('rejects an oversized chunked token response and overlong token fields without persistence', async () => {
+    for (const body of [
+      JSON.stringify({ access_token: 'x'.repeat(70_000), refresh_token: 'r', token_type: 'bearer', expires_in: 3600 }),
+      JSON.stringify({ access_token: 'x'.repeat(5000), refresh_token: 'r', token_type: 'bearer', expires_in: 3600 }),
+    ]) {
+      const files = await fixture();
+      const oauth = new NaverOAuth({
+        clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+        ...files, fetch: vi.fn().mockResolvedValue(new Response(body, { status: 200 })),
+      });
+      const { state } = oauth.authorize();
+      await expect(oauth.handleCallback({ code: 'code', state })).rejects.toMatchObject({ code: 'oauth_invalid_response' });
+      await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+    }
   });
 
   it('maps an expires_in date overflow to oauth_invalid_response', async () => {

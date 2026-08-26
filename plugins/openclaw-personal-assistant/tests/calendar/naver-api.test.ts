@@ -85,11 +85,11 @@ describe('NaverCalendarApi.createSchedule', () => {
     let requestSignal: AbortSignal | null = null;
     const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
       requestSignal = init?.signal ?? null;
-      return {
-        ok: true,
-        status: 200,
-        text: () => new Promise((_resolve, reject) => requestSignal!.addEventListener('abort', () => reject(requestSignal!.reason))),
-      } as Response;
+      return new Response(new ReadableStream({
+        start(controller) {
+          requestSignal!.addEventListener('abort', () => controller.error(requestSignal!.reason));
+        },
+      }), { status: 200 });
     });
     const api = new NaverCalendarApi({ accessToken: 'access-secret', fetch, timeoutMs: 10 });
     const pending = api.createSchedule(request);
@@ -106,5 +106,16 @@ describe('NaverCalendarApi.createSchedule', () => {
     const exposed = `${error.name} ${error.message} ${error.stack ?? ''}`;
     expect(error.code).toBe('naver_auth');
     expect(exposed).not.toMatch(/access-secret|private-body|authorization|bearer/i);
+  });
+
+  it('rejects oversized chunked JSON and overlong response fields with stable redacted outcomes', async () => {
+    const oversized = new Response(JSON.stringify({ value: 'x'.repeat(70_000) }), { status: 200 });
+    const hugeField = apiResponse(200, {
+      result: 'success', returnValue: { processType: 'create', calendarId: 'x'.repeat(5000), icalUid: 'uid-1' },
+    });
+    for (const [response, code] of [[oversized, 'request_maybe_sent'], [hugeField, 'naver_invalid_response']] as const) {
+      const api = new NaverCalendarApi({ accessToken: 'access-secret', fetch: vi.fn().mockResolvedValue(response) });
+      await expect(api.createSchedule(request)).rejects.toMatchObject({ code });
+    }
   });
 });

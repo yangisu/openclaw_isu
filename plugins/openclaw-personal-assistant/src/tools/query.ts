@@ -11,6 +11,7 @@ import { CalDavClient } from '../calendar/caldav.js';
 import type { CalendarEvent } from '../calendar/ical.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
 import { WorkspaceRepository } from '../workspace/repository.js';
+import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
 import {
   AssistantToolError,
   assertOwner,
@@ -49,12 +50,13 @@ export interface QueryRepository {
 }
 
 export interface CalendarReader {
-  listEvents(range: { start: string; end: string }): Promise<CalendarEvent[]>;
+  listEvents(range: { start: string; end: string }, signal?: AbortSignal): Promise<CalendarEvent[]>;
 }
 
 export interface QueryToolDependencies {
   openRepository?: (config: AssistantToolConfig) => QueryRepository;
   openCalendar?: (config: AssistantToolConfig) => CalendarReader;
+  openHealth?: (config: AssistantToolConfig) => SubsystemHealthJournal;
 }
 
 interface QueryResult {
@@ -83,8 +85,20 @@ export function createQueryTool(
 
       if (params.kind === 'calendar') {
         validateRange(params.from, params.to);
-        const calendar = (dependencies.openCalendar ?? openCalendar)(config);
-        const items = await calendar.listEvents({ start: params.from, end: params.to });
+        let calendar: CalendarReader;
+        try {
+          calendar = (dependencies.openCalendar ?? openCalendar)(config);
+        } catch (error) {
+          if (error instanceof AssistantToolError && error.code === 'caldav_read_disabled') {
+            const health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
+            try {
+              health.report({ target: 'naver-caldav', errorCode: error.code,
+                message: 'Calendar reads are disabled pending authorized live validation' });
+            } finally { health.close(); }
+          }
+          throw error;
+        }
+        const items = await calendar.listEvents({ start: params.from, end: params.to }, signal);
         return jsonResult({ kind: 'calendar', trust: 'quoted_untrusted_data', items });
       }
 
@@ -114,13 +128,13 @@ function openCalendar(config: AssistantToolConfig): CalendarReader {
     secretFile: calendar.caldavSecretFile,
     calendarMappings: calendar.calendarMappings,
   });
-  return { listEvents: range => client.listMappedEvents(range) };
+  return { listEvents: (range, signal) => client.listMappedEvents(range, signal) };
 }
 
 function validateRange(from: string, to: string): void {
   const start = Date.parse(from);
   const end = Date.parse(to);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end || end - start > 31 * 86_400_000) {
     throw new AssistantToolError('invalid_calendar_range', 'Calendar range must contain valid increasing timestamps');
   }
 }

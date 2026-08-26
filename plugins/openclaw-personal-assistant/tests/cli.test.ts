@@ -106,9 +106,7 @@ describe('operational CLI', () => {
     }));
     expect(await runCli(['oauth', 'callback', ...common], completed.io, dependencies)).toBe(0);
     expect(await runCli(['oauth', 'refresh', ...common], capture().io, dependencies)).toBe(0);
-    expect(await runCli([
-      'oauth', 'status', '--client-file', clientFile, '--token-file', tokenFile,
-    ], capture().io, dependencies)).toBe(0);
+    expect(await runCli(['oauth', 'status', ...common], capture().io, dependencies)).toBe(0);
     const revoked = capture();
     expect(await runCli(['oauth', 'revoke', ...common], revoked.io, dependencies)).toBe(0);
 
@@ -117,6 +115,33 @@ describe('operational CLI', () => {
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(tokenStore.value).toBeUndefined();
     expect(common.join(' ')).not.toMatch(/canary|code|secret/i);
+  });
+
+  it('refreshes an expired but refreshable token during operational OAuth status without printing it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-status-'));
+    const state = join(root, 'state'); await mkdir(state);
+    const clientFile = join(root, 'client.json'); const tokenFile = join(root, 'token.json');
+    const credentials = new CliMemoryStore<unknown>({
+      version: 1, clientId: 'client', clientSecret: 'private-client-secret',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    });
+    const tokens = new CliMemoryStore<unknown>({
+      version: 1, accessToken: 'expired-access', refreshToken: 'private-refresh',
+      expiresAt: '2029-12-31T23:00:00.000Z',
+    });
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'fresh-private-access', token_type: 'bearer', expires_in: 3600,
+    }), { status: 200 }));
+    const output = capture();
+    expect(await runCli([
+      'oauth', 'status', '--client-file', clientFile, '--token-file', tokenFile, '--state', state,
+    ], output.io, {
+      credentialStore: () => credentials, tokenStore: () => tokens as never, oauthFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+    })).toBe(0);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(output.stdout.join('\n')).not.toMatch(/private|refresh|access/i);
+    expect(JSON.parse(output.stdout[0]!)).toMatchObject({ status: 'open', redactedErrorCode: null });
   });
 
   it('rejects a callback whose exact redirect query contains an unapproved field before exchange', async () => {

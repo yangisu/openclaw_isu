@@ -32,6 +32,15 @@ export interface CalDavClientOptions {
   /** Defaults to the fixed production request bound of 15 seconds. */
   timeoutMs?: number;
   calendarMappings?: readonly CalDavCalendarMapping[];
+  signal?: AbortSignal;
+}
+
+interface CycleBudget {
+  remainingBytes: number;
+  remainingRequests: number;
+  events: number;
+  deadline: number;
+  signal?: AbortSignal;
 }
 
 const DAV_HEADERS = { 'content-type': 'application/xml; charset=utf-8' };
@@ -46,6 +55,8 @@ const CALDAV_ICAL_MAX_CALENDARS = 8;
 const CALDAV_ICAL_MAX_EVENTS = 1_000;
 const CALDAV_ICAL_UID_MAX_BYTES = 1_024;
 const CALDAV_ICAL_TEXT_MAX_BYTES = 16_384;
+const CALDAV_MAX_RANGE_MS = 31 * 86_400_000;
+const CALDAV_MAX_REQUESTS_PER_CYCLE = 11;
 
 export class CalDavClient {
   readonly #baseUrl: URL;
@@ -53,6 +64,7 @@ export class CalDavClient {
   readonly #fetch: FetchLike;
   readonly #timeoutMs: number;
   readonly #calendarMappings: ReadonlyMap<string, URL>;
+  readonly #signal?: AbortSignal;
 
   constructor(options: CalDavClientOptions) {
     this.#baseUrl = new URL(options.baseUrl);
@@ -62,6 +74,7 @@ export class CalDavClient {
     this.#secretFile = options.secretFile;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
+    this.#signal = options.signal;
     try {
       const mappings = options.calendarMappings === undefined
         ? [] : loadCalendarMappings(this.#baseUrl.href, options.calendarMappings);
@@ -74,12 +87,16 @@ export class CalDavClient {
     }
   }
 
-  async listCalendars(): Promise<CalDavCalendar[]> {
+  async listCalendars(signal?: AbortSignal): Promise<CalDavCalendar[]> {
+    return this.#listCalendars(this.#budget(signal));
+  }
+
+  async #listCalendars(budget: CycleBudget): Promise<CalDavCalendar[]> {
     const body = `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop><d:displayname/><d:resourcetype/></d:prop>
 </d:propfind>`;
-    const xml = await this.#request('PROPFIND', body, '1');
+    const xml = await this.#request('PROPFIND', body, '1', this.#baseUrl, budget);
     const responses = responseList(parseXml(xml));
     return responses.flatMap(response => {
       const prop = successfulProperty(response);
@@ -97,11 +114,16 @@ export class CalDavClient {
     });
   }
 
-  async validateCalendarMappings(): Promise<CalDavCalendar[]> {
+  async validateCalendarMappings(signal?: AbortSignal): Promise<CalDavCalendar[]> {
     if (this.#calendarMappings.size === 0) {
       throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
     }
-    const discovered = await this.listCalendars();
+    const discovered = await this.#listCalendars(this.#budget(signal));
+    this.#assertCalendarMappings(discovered);
+    return discovered;
+  }
+
+  #assertCalendarMappings(discovered: readonly CalDavCalendar[]): void {
     for (const target of this.#calendarMappings.values()) {
       const ambiguous = discovered.some(calendar => calendar.href !== target.href && (
         new URL(calendar.href).pathname.startsWith(target.pathname) ||
@@ -111,25 +133,35 @@ export class CalDavClient {
         throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping did not match discovery');
       }
     }
-    return discovered;
   }
 
-  async listMappedEvents(range: EventRange): Promise<CalendarEvent[]> {
-    const events: CalendarEvent[] = [];
-    for (const apiCalendarId of this.#calendarMappings.keys()) {
-      events.push(...await this.listEvents(range, apiCalendarId));
-    }
+  async listMappedEvents(range: EventRange, signal?: AbortSignal): Promise<CalendarEvent[]> {
+    assertRange(range);
     if (this.#calendarMappings.size === 0) {
       throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
+    }
+    const budget = this.#budget(signal);
+    this.#assertCalendarMappings(await this.#listCalendars(budget));
+    const events: CalendarEvent[] = [];
+    for (const [apiCalendarId, target] of this.#calendarMappings) {
+      events.push(...await this.#listEventsValidated(range, apiCalendarId, target, budget));
     }
     return events;
   }
 
-  async listEvents(range: EventRange, apiCalendarId: string): Promise<CalendarEvent[]> {
+  async listEvents(range: EventRange, apiCalendarId: string, signal?: AbortSignal): Promise<CalendarEvent[]> {
+    assertRange(range);
     const mappedApiCalendarId = apiCalendarId;
     const target = this.#calendarMappings.get(mappedApiCalendarId);
     if (!target) throw new CalDavError('CALDAV_MAPPING', 'CalDAV calendar mapping is unavailable');
-    await this.validateCalendarMappings();
+    const budget = this.#budget(signal);
+    this.#assertCalendarMappings(await this.#listCalendars(budget));
+    return this.#listEventsValidated(range, mappedApiCalendarId, target, budget);
+  }
+
+  async #listEventsValidated(
+    range: EventRange, mappedApiCalendarId: string, target: URL, budget: CycleBudget,
+  ): Promise<CalendarEvent[]> {
     const start = calDavTimestamp(range.start);
     const end = calDavTimestamp(range.end);
     const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -139,7 +171,7 @@ export class CalDavClient {
     <c:time-range start="${start}" end="${end}"/>
   </c:comp-filter></c:comp-filter></c:filter>
 </c:calendar-query>`;
-    const xml = await this.#request('REPORT', body, '1', target);
+    const xml = await this.#request('REPORT', body, '1', target, budget);
     const events: CalendarEvent[] = [];
     const seenIdentities = new Set<string>();
     for (const response of responseList(parseXml(xml))) {
@@ -154,7 +186,7 @@ export class CalDavClient {
         throw new CalDavError('CALDAV_XML', 'CalDAV response contains invalid iCalendar data');
       }
       for (const event of parsed) {
-        if (events.length >= CALDAV_ICAL_MAX_EVENTS) {
+        if (events.length >= CALDAV_ICAL_MAX_EVENTS || budget.events >= CALDAV_ICAL_MAX_EVENTS) {
           throw new CalDavError('CALDAV_XML_LIMIT', 'CalDAV iCalendar exceeded structural limits');
         }
         assertEventFieldsBounded(event);
@@ -164,14 +196,34 @@ export class CalDavClient {
         }
         seenIdentities.add(identity);
         events.push(event);
+        budget.events += 1;
       }
     }
     return events;
   }
 
-  async #request(method: 'PROPFIND' | 'REPORT', body: string, depth: string, target = this.#baseUrl): Promise<string> {
+  #budget(signal?: AbortSignal): CycleBudget {
+    return {
+      remainingBytes: CALDAV_RESPONSE_MAX_BYTES,
+      remainingRequests: CALDAV_MAX_REQUESTS_PER_CYCLE,
+      events: 0,
+      deadline: Date.now() + this.#timeoutMs,
+      ...((signal ?? this.#signal) ? { signal: signal ?? this.#signal } : {}),
+    };
+  }
+
+  async #request(
+    method: 'PROPFIND' | 'REPORT', body: string, depth: string, target: URL, budget: CycleBudget,
+  ): Promise<string> {
+    const remainingMs = budget.deadline - Date.now();
+    if (remainingMs <= 0 || budget.signal?.aborted) throw new CalDavError('CALDAV_TIMEOUT', 'CalDAV request timed out');
+    if (budget.remainingRequests < 1) {
+      throw new CalDavError('CALDAV_REQUEST_LIMIT', 'CalDAV request budget was exhausted');
+    }
+    budget.remainingRequests -= 1;
     const credentials = await readCalDavCredentials(this.#secretFile);
-    const signal = AbortSignal.timeout(this.#timeoutMs);
+    const timeout = AbortSignal.timeout(remainingMs);
+    const signal = budget.signal ? AbortSignal.any([timeout, budget.signal]) : timeout;
     let response: Response;
     try {
       response = await this.#fetch(target, {
@@ -197,12 +249,24 @@ export class CalDavClient {
       throw new CalDavError('CALDAV_RESPONSE_TOO_LARGE', 'CalDAV response exceeded the allowed size');
     }
     try {
-      return await readBoundedResponseBody(response, CALDAV_RESPONSE_MAX_BYTES);
+      const { text, byteLength } = await readBoundedResponseBody(
+        response, Math.min(CALDAV_RESPONSE_MAX_BYTES, budget.remainingBytes),
+      );
+      budget.remainingBytes -= byteLength;
+      return text;
     } catch (error) {
       if (error instanceof CalDavError) throw error;
       if (signal.aborted) throw new CalDavError('CALDAV_TIMEOUT', 'CalDAV request timed out');
       throw new CalDavError('CALDAV_HTTP', 'CalDAV response body failed');
     }
+  }
+}
+
+function assertRange(range: EventRange): void {
+  const start = range.start instanceof Date ? range.start.valueOf() : Date.parse(range.start);
+  const end = range.end instanceof Date ? range.end.valueOf() : Date.parse(range.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end || end - start > CALDAV_MAX_RANGE_MS) {
+    throw new CalDavError('CALDAV_RANGE', 'CalDAV query range is invalid or too large');
   }
 }
 
@@ -228,8 +292,10 @@ function assertIcalStructureBounded(source: string): void {
   }
 }
 
-async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<string> {
-  if (!response.body) return '';
+async function readBoundedResponseBody(
+  response: Response, maxBytes: number,
+): Promise<{ text: string; byteLength: number }> {
+  if (!response.body) return { text: '', byteLength: 0 };
   const reader = response.body.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let total = 0;
@@ -237,7 +303,7 @@ async function readBoundedResponseBody(response: Response, maxBytes: number): Pr
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) return result + decoder.decode();
+      if (done) return { text: result + decoder.decode(), byteLength: total };
       total += value.byteLength;
       if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);

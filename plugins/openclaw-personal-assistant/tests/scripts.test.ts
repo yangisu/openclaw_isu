@@ -277,6 +277,15 @@ describe('deployment scripts', () => {
     expect(checkBlock).not.toMatch(/run plugin:validate|run (?:plugin:)?build/);
   });
 
+  it('keeps the installed manifest CalDAV activation and fan-out bounds aligned with runtime config', () => {
+    const manifest = JSON.parse(readFileSync(resolve(repo, 'plugins/openclaw-personal-assistant/openclaw.plugin.json'), 'utf8')) as {
+      configSchema: { properties: { calendar: { properties: Record<string, { type?: string; maxItems?: number }> } } };
+    };
+    const calendar = manifest.configSchema.properties.calendar.properties;
+    expect(calendar.caldavReadEnabled).toEqual({ type: 'boolean' });
+    expect(calendar.calendarMappings?.maxItems).toBe(10);
+  });
+
   it('suppresses OpenClaw startup catch-up outside an exact Seoul hour', () => {
     const source = readFileSync(installer, 'utf8');
     const trigger = resolve(repo, 'scripts/wsl/briefing-cron-trigger.js');
@@ -452,6 +461,7 @@ describe('deployment scripts', () => {
 
   it.each([
     ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
+    ['CalDAV read enabled before live PoC', (text: string) => text.replace('caldavReadEnabled: false', 'caldavReadEnabled: true')],
     ['wrong CalDAV secret path', (text: string) => text.replace('/naver-caldav', '/wrong-caldav')],
     ['wrong Naver client path', (text: string) => text.replace('/naver-oauth-client', '/wrong-client')],
     ['wrong Naver token path', (text: string) => text.replace('/naver-oauth-token', '/wrong-token')],

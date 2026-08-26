@@ -48,9 +48,9 @@ The following observations are still required by the approved design. They are m
 
 The local test evidence covers the remaining safe component contracts, including owner authorization, outbox state transitions, untrusted-content isolation, warning deduplication, Markdown round trips, exact one-byte backup corruption, and retention boundaries. Component tests are diagnostic evidence only when the acceptance criterion also requires production wiring. In particular, a green unit test cannot promote these rows:
 
-- `AC-18` remains `NOT_VERIFIED` until the built plugin's production startup path recovers and reconciles the durable calendar outbox, with an owner warning sink, without duplicate creation or premature success.
+- `AC-18` remains `NOT_VERIFIED`: component and built-runtime tests exercise recovery and the durable owner-warning sink, but the complete production behavior has not yet been attested by an acceptance boundary.
 - `AC-20` remains `NOT_VERIFIED` until the built plugin runtime connects OAuth refresh and CalDAV failures to the durable calendar-only gate and owner-facing reason while local functions stay available.
-- `AC-29` remains `NOT_VERIFIED` until the built plugin's production startup path invokes stale-submission recovery without replay and confirmation consumption is bound to that runtime flow.
+- `AC-29` remains `NOT_VERIFIED`: component and built-runtime tests exercise stale-submission recovery and confirmation consumption, but restart/no-replay behavior has not yet been attested by an acceptance boundary.
 
 `AC-05` is a safe local PASS only when its narrowly selected production tests all succeed: the mutation tool derives the trusted source for task, note, preference, normal-memory, and study adds; the real repository adds and queries all five types; sensitive memory remains fail-closed; and the public schema rejects inbox/daily adds. A generic suite or source grep is not accepted as evidence. `AC-09` remains `NOT_VERIFIED`: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded, so both confirmation entry points remain non-writing and no single-use confirmation can be consumed. Review each artifact rather than relying only on summary counts.
 

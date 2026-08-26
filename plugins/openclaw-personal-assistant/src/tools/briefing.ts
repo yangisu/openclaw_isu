@@ -34,7 +34,7 @@ interface BriefingRepository {
 }
 
 interface BriefingCalendar {
-  listEvents(range: { start: string; end: string }): Promise<CalendarEvent[]>;
+  listEvents(range: { start: string; end: string }, signal?: AbortSignal): Promise<CalendarEvent[]>;
 }
 
 export interface BriefingToolDependencies {
@@ -81,13 +81,15 @@ export function createBriefingTool(
           events = await calendar.listEvents({
             start: now.toISOString(),
             end: new Date(now.valueOf() + 7 * 86_400_000).toISOString(),
-          });
+          }, signal);
           health.recover('naver-caldav');
         } catch (error) {
           health.report({
             errorCode: publicErrorCode(error),
             target: 'naver-caldav',
-            message: 'Calendar synchronization is unavailable',
+            message: publicErrorCode(error) === 'caldav_read_disabled'
+              ? 'Calendar reads are disabled pending authorized live validation'
+              : 'Calendar synchronization is unavailable',
           });
         }
 
@@ -132,7 +134,7 @@ function openCalendar(config: AssistantToolConfig): BriefingCalendar {
     secretFile: calendar.caldavSecretFile,
     calendarMappings: calendar.calendarMappings,
   });
-  return { listEvents: range => client.listMappedEvents(range) };
+  return { listEvents: (range, signal) => client.listMappedEvents(range, signal) };
 }
 
 function taskFromRecord(record: ParsedRecord): BriefingTask[] {

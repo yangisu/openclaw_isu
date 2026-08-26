@@ -137,7 +137,7 @@ node plugins/openclaw-personal-assistant/dist/cli.js doctor \
 
 `doctor` verifies the real versioned Naver app store and token freshness read-only. `naver-create` remains unknown until authoritative production integration evidence exists; arbitrary `poc --evidence` cannot change it. OpenAI model authentication is inspected with the package-local OpenClaw commands and live Gateway behavior, not claimed as plugin-controlled. Consequently `doctor` remains nonzero while any required gate is unknown, closed, or expired.
 
-Use explicit refresh or revoke locally when required. Neither command accepts a token, code, or secret argument. Revoke attempts the remote request and always invalidates the local token; a remote failure therefore remains fail-closed and requires a new authorization before calendar creation.
+Use explicit refresh or revoke locally when required. Neither command accepts a token, code, or secret argument. Revoke deletes the local token only after a verified successful remote response. Timeout, transport loss, or a non-success response retains the private token store for an explicit retry, records degraded OAuth health, and keeps calendar creation closed.
 
 ```bash
 node plugins/openclaw-personal-assistant/dist/cli.js oauth refresh \
@@ -151,6 +151,8 @@ node plugins/openclaw-personal-assistant/dist/cli.js oauth revoke \
 ```
 
 There is no automated create PoC while the confirmation boundary is fail-closed. If a future approved OpenClaw release provides direct, non-forwarded owner provenance and the production boundary is implemented and reviewed, create exactly one clearly named test event after the single-use confirmation, verify there is no duplicate, and delete that one event yourself in the Naver app. The assistant does not modify or delete Naver events.
+
+CalDAV reads are independently fail-closed at initial installation: `calendar.caldavReadEnabled` must remain `false`, and query, briefing, and recovery perform no credential read or network request while it is false. The installer and its check mode reject an initially enabled config. Only after the authorized live CalDAV PoC has been performed and recorded by the operator may the owner deliberately change this field in the active config. That live activation remains `NOT_VERIFIED` to automation; a legacy `poc --evidence` report cannot change the runtime flag. On failure, return the field to `false`; local query and briefing functions continue and expose the durable limited-mode reason.
 
 ## 6. Backup and restore boundary
 

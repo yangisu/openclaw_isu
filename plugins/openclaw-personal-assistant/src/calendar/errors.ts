@@ -9,7 +9,9 @@ export type CalDavErrorCode =
   | 'CALDAV_HTTP'
   | 'CALDAV_RESPONSE_TOO_LARGE'
   | 'CALDAV_XML_LIMIT'
-  | 'CALDAV_MAPPING';
+  | 'CALDAV_MAPPING'
+  | 'CALDAV_REQUEST_LIMIT'
+  | 'CALDAV_RANGE';
 
 export class CalDavError extends Error {
   constructor(public readonly code: CalDavErrorCode, message: string) {

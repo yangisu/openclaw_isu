@@ -209,7 +209,7 @@ The standalone non-live run exited 0 with exactly 32 unique rows: 16 PASS, 0 FAI
 
 ## Phase 1A acceptance honesty
 
-The acceptance result was reconciled against the production wiring review. `AC-18`, `AC-20`, and `AC-29` no longer treat green component/state-machine tests as evidence that the built plugin performs startup outbox reconciliation, runtime OAuth/CalDAV gate propagation and owner warning, or restart recovery without replay. The runner still executes the focused component tests, but a successful command is deliberately recorded as `NOT_VERIFIED` with exit code 125 until those production paths and built-plugin integration evidence exist. A component failure remains a real `FAIL`.
+The acceptance result was reconciled against the production wiring review. `AC-18`, `AC-20`, and `AC-29` no longer treat green component/state-machine tests as sufficient acceptance evidence. The runner still executes focused diagnostics, but a successful command is deliberately recorded as `NOT_VERIFIED` with exit code 125 until the complete built/runtime behaviors are attested through an approved acceptance boundary. A component failure remains a real `FAIL`.
 
 TDD RED was observed before changing the runner:
 
@@ -243,3 +243,31 @@ One production orchestrator now owns daily order: create, exact verify, isolated
 The CLI exposes deterministic `maintenance daily|monthly --config <absolute-private-path>` JSON results plus read-only `maintenance check`. The owner-private config contains only public recipient and paths; the age identity value is never accepted in argv/config/output. The identity is revalidated as a direct private stable file immediately before decrypt. The installer creates/checks the private template, requires the offline medium before finish, declares and validates both exact jobs in addition to briefing, and keeps the Gateway start behind config validation. Real age, offline media, NTFS ACL/durability, and scheduled target execution remain live `NOT_VERIFIED`.
 
 TDD RED evidence was observed for the missing maintenance module, missing monthly path, missing config runner, missing CLI commands, absent trigger/cron validator, and absent installer wiring. GREEN focused verification: maintenance orchestration 8/8; maintenance CLI 3/3; cron/installer contracts 2/2; integrated maintenance/CLI/deployment scripts 88/88 in 185.59 seconds; typecheck and build passed. No live state, secret, scheduler, service, or external API was touched.
+
+## Phase 4B CalDAV activation, budgets, and OAuth response safety
+
+CalDAV access is now a separate fail-closed runtime capability. The example, installed manifest, runtime schema, hardened active-config validator, query, briefing, and recovery service all agree on `caldavReadEnabled`. Initial install/check requires `false`; an absent or false value is disabled. Query, briefing, and recovery check the gate before credential discovery or network access, write the durable `caldav_read_disabled` limited-mode reason, and keep local records/briefing available. A legacy PoC report cannot alter the flag. Operator activation after an authorized live PoC remains live `NOT_VERIFIED` and is documented as a deliberate active-config action, not an automated attestation.
+
+One `listMappedEvents` operation now owns a global budget: one discovery, at most ten approved mappings/eleven total requests, 31 days, 1,000 events, 2 MiB of actual streamed response bytes, and one wall-clock deadline. The external abort signal is combined with each request timeout. The recovery service propagates its stop signal, aborts an active fetch before closing, and reconciles at most one pending request per cycle so a backlog cannot multiply the mapping fan-out. This intentionally trades recovery throughput for a strict aggregate network bound.
+
+OAuth revoke now retains its owner-private token store when remote outcome is timeout, transport loss, response-body uncertainty, or non-success; only a verified successful response deletes it. This supports an explicit retry while health remains degraded and calendar creation remains closed. Operational `oauth status` now requires client, token, and state paths and calls the same cross-process `getValidAccessToken` provider, so a normal expired-but-refreshable token is refreshed without exposing it. Installer check uses that operational status path.
+
+OAuth and Naver create responses no longer use unbounded `Response.text()`. A shared streaming reader rejects oversized declared/chunked bodies, malformed UTF-8/JSON, excessive nesting/node/key/string shapes, and caller-specific overlong token/calendar fields with stable redacted errors. The installed runtime exposed one additional RED: the manifest rejected the new flag as an additional property. Its schema was aligned and mapping `maxItems` was reduced to ten before the final runtime inspection.
+
+Observed TDD REDs included: disabled query reporting `invalid_calendar_config` and no health warning; recovery opening without a disabled warning; eleven mappings accepted; two mapping discoveries; a 32-day request reaching fetch; multi-mapping byte overflow accepted; service stop waiting on an un-aborted cycle; default recovery selecting 20 pending requests; failed revoke deleting the retry token; operational status rejecting `--state`; oversized token persistence; oversized Naver response misclassification; and actual OpenClaw runtime manifest rejection. GREEN focused evidence:
+
+```text
+oauth + naver-api: 62/62
+caldav: 43/43
+recovery service: 11/11
+tools + config + CLI: 97/97
+deployment scripts: 55/55, plus the added manifest regression 1/1
+npm run typecheck: exit 0
+npm run build: exit 0
+npm run plugin:validate: {"status":"valid","optionalToolCount":5}
+isolated OpenClaw 2026.7.1 runtime validator: PASS, five optional tools exactly
+```
+
+A final signal/range audit added direct tool-signal propagation and pre-open rejection of queries longer than 31 days; its three selected query/gate tests passed, followed by fresh typecheck and build exits 0. Root integration owns the later full-suite run.
+
+The five runtime tools remained `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. `AC-18` and `AC-29` remain NV125 for lack of acceptance attestation of the complete built/runtime behavior, rather than claiming their production path is absent. The isolated runtime state was removed. No real OpenClaw config/state, credential, service, scheduler, Telegram, CalDAV, Naver, or other live endpoint was accessed.

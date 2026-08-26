@@ -68,6 +68,7 @@ describe('CalDavClient', () => {
     const discovery = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/collections/personal/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/collections/work/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
     const report = await fixture('report.xml');
     const reportUrls: string[] = [];
+    let discoveries = 0;
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
       calendarMappings: [
@@ -75,7 +76,7 @@ describe('CalDavClient', () => {
         { apiCalendarId: 'api-work', caldavHref: '/collections/work/' },
       ],
       fetch: async (url, init) => {
-        if (init?.method === 'PROPFIND') return new Response(discovery, { status: 207 });
+        if (init?.method === 'PROPFIND') { discoveries += 1; return new Response(discovery, { status: 207 }); }
         reportUrls.push(String(url));
         return new Response(report, { status: 207 });
       },
@@ -88,7 +89,74 @@ describe('CalDavClient', () => {
       'https://caldav.example.test/collections/personal/',
       'https://caldav.example.test/collections/work/',
     ]);
+    expect(discoveries).toBe(1);
     expect(new Set(events.map(event => event.calendarId))).toEqual(new Set(['api-personal', 'api-work']));
+  });
+
+  it('rejects a calendar query longer than 31 days before credentials or network', async () => {
+    const fetch = vi.fn();
+    const client = new CalDavClient({
+      baseUrl: 'https://caldav.example.test/', secretFile: 'must-not-read',
+      calendarMappings: defaultCalendarMappings, fetch,
+    });
+    await expect(client.listMappedEvents({
+      start: '2026-01-01T00:00:00Z', end: '2026-02-02T00:00:00Z',
+    })).rejects.toMatchObject({ code: 'CALDAV_RANGE' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('enforces one global response-byte budget across every mapped collection', async () => {
+    const discovery = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/collections/a/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/collections/b/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const report = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><!--${'x'.repeat(1_100_000)}--></d:multistatus>`;
+    const client = new CalDavClient({
+      baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
+      calendarMappings: [
+        { apiCalendarId: 'a', caldavHref: '/collections/a/' },
+        { apiCalendarId: 'b', caldavHref: '/collections/b/' },
+      ],
+      fetch: async (_url, init) => new Response(init?.method === 'PROPFIND' ? discovery : report, { status: 207 }),
+    });
+    await expect(client.listMappedEvents({
+      start: '2026-08-25T00:00:00Z', end: '2026-08-26T00:00:00Z',
+    })).rejects.toMatchObject({ code: 'CALDAV_RESPONSE_TOO_LARGE' });
+  });
+
+  it('enforces one global event budget across every mapped collection', async () => {
+    const discovery = `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/collections/a/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/collections/b/</d:href><d:propstat><d:prop><d:resourcetype><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    const report = (prefix: string) => {
+      const events = Array.from({ length: 501 }, (_, index) => `BEGIN:VEVENT\r\nUID:${prefix}-${index}\r\nDTSTART:20260825T000000Z\r\nDTEND:20260825T010000Z\r\nSUMMARY:Event\r\nEND:VEVENT\r\n`).join('');
+      return `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:propstat><d:prop><c:calendar-data><![CDATA[BEGIN:VCALENDAR\r\nVERSION:2.0\r\n${events}END:VCALENDAR\r\n]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
+    };
+    const client = new CalDavClient({
+      baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
+      calendarMappings: [
+        { apiCalendarId: 'a', caldavHref: '/collections/a/' },
+        { apiCalendarId: 'b', caldavHref: '/collections/b/' },
+      ],
+      fetch: async (url, init) => new Response(init?.method === 'PROPFIND' ? discovery : report(String(url).includes('/a/') ? 'a' : 'b'), { status: 207 }),
+    });
+    await expect(client.listMappedEvents({
+      start: '2026-08-25T00:00:00Z', end: '2026-08-26T00:00:00Z',
+    })).rejects.toMatchObject({ code: 'CALDAV_XML_LIMIT' });
+  });
+
+  it('uses one wall-clock deadline for discovery and every mapped REPORT', async () => {
+    let clock = 0;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => { clock += 6; return clock; });
+    let requests = 0;
+    const client = new CalDavClient({
+      baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(), timeoutMs: 10,
+      calendarMappings: defaultCalendarMappings,
+      fetch: async () => { requests += 1; return new Response(defaultDiscovery, { status: 207 }); },
+    });
+    try {
+      await expect(client.listMappedEvents({
+        start: '2026-08-25T00:00:00Z', end: '2026-08-26T00:00:00Z',
+      })).rejects.toMatchObject({ code: 'CALDAV_TIMEOUT' });
+      expect(requests).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it.each([
@@ -409,7 +477,7 @@ describe('CalDavClient', () => {
       fetch: afterDiscovery(async () => new Response(await fixture('recurrence-exceptions.xml'), { status: 207 })),
     });
     const events = await client.listEvents(
-      { start: '2026-08-25T00:00:00Z', end: '2026-09-30T00:00:00Z' }, DEFAULT_API_CALENDAR_ID,
+      { start: '2026-08-25T00:00:00Z', end: '2026-09-20T00:00:00Z' }, DEFAULT_API_CALENDAR_ID,
     );
     expect(events.map(event => [event.uid, event.recurrenceId, event.status])).toEqual([
       ['series-1', undefined, 'CONFIRMED'],
@@ -427,7 +495,7 @@ describe('CalDavClient', () => {
       fetch: afterDiscovery(async () => new Response(xml, { status: 207 })),
     });
     const events = await client.listEvents(
-      { start: '2026-01-01T00:00:00Z', end: '2027-01-01T00:00:00Z' }, DEFAULT_API_CALENDAR_ID,
+      { start: '2026-03-01T00:00:00Z', end: '2026-03-31T00:00:00Z' }, DEFAULT_API_CALENDAR_ID,
     );
     expect(events.map(event => event.dtstart)).toEqual([
       '2026-03-08T07:30:00.000Z',

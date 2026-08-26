@@ -26,6 +26,7 @@ try {
     || config.commands?.bash !== false || config.commands?.config !== false || config.commands?.mcp !== false || config.commands?.plugins !== false
     || config.tools?.elevated?.enabled !== false || JSON.stringify([...(config.tools?.allow ?? [])].sort()) !== JSON.stringify(expectedTools)
     || plugin?.enabled !== true || plugin?.config?.timezone !== 'Asia/Seoul'
+    || calendar?.caldavReadEnabled !== false
     || calendar?.caldavSecretFile !== join(secretDir, 'naver-caldav').replaceAll('\\', '/')
     || calendar?.naverOAuthClientFile !== join(secretDir, 'naver-oauth-client').replaceAll('\\', '/')
     || calendar?.naverTokenFile !== join(secretDir, 'naver-oauth-token').replaceAll('\\', '/')
@@ -47,7 +48,7 @@ function validCalendarMappings(calendar) {
     const base = new URL(calendar?.caldavBaseUrl);
     const mappings = calendar?.calendarMappings;
     if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash
-      || !Array.isArray(mappings) || mappings.length < 1 || mappings.length > 100) return false;
+      || !Array.isArray(mappings) || mappings.length < 1 || mappings.length > 10) return false;
     const apiIds = new Set();
     const hrefs = [];
     for (const mapping of mappings) {

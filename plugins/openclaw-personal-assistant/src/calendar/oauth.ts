@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 
 import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
+import { BoundedBodyError, readBoundedBody, readBoundedJson } from './bounded-json.js';
 
 const AUTHORIZE_ENDPOINT = 'https://nid.naver.com/oauth2.0/authorize';
 const TOKEN_ENDPOINT = 'https://nid.naver.com/oauth2.0/token';
@@ -16,6 +17,9 @@ const TOKEN_SAFETY_WINDOW_MS = 60_000;
 const REFRESH_LEASE_MS = 45_000;
 const REFRESH_WAIT_MS = 25;
 const REFRESH_FAILURE_COOLDOWN_MS = 5_000;
+const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
+const MAX_REVOKE_RESPONSE_BYTES = 16 * 1024;
+const MAX_TOKEN_FIELD_LENGTH = 4_096;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -208,41 +212,40 @@ export class NaverOAuth {
       this.#reportOAuthFailure(error);
       throw error;
     }
-      let failure: unknown;
+    let failure: unknown;
+    try {
+      const signal = AbortSignal.timeout(this.#timeoutMs);
+      let response: Response;
       try {
-        const signal = AbortSignal.timeout(this.#timeoutMs);
-        let response: Response;
-        try {
-          response = await this.#fetch(REVOKE_ENDPOINT, {
-            method: 'POST',
-            headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-            body: new URLSearchParams({
-              client_id: this.#clientId,
-              client_secret: this.#clientSecret,
-              token: existing.refreshToken,
-              token_type_hint: 'refresh_token',
-            }),
-            signal,
-          });
-        } catch {
-          if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-          throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
-        }
-        if (!response.ok) throw oauthHttpError(response.status);
-        try {
-          await response.text();
-        } catch {
-          if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-          throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
-        }
-      } catch (error) {
-        failure = error;
+        response = await this.#fetch(REVOKE_ENDPOINT, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: new URLSearchParams({
+            client_id: this.#clientId,
+            client_secret: this.#clientSecret,
+            token: existing.refreshToken,
+            token_type_hint: 'refresh_token',
+          }),
+          signal,
+        });
+      } catch {
+        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
       }
+      if (!response.ok) throw oauthHttpError(response.status);
       try {
-        await this.#tokenStore.delete();
-      } catch (error) {
-        if (failure === undefined) failure = error;
+        if (response.body !== null) await readBoundedBody(response, MAX_REVOKE_RESPONSE_BYTES);
+      } catch {
+        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
       }
+    } catch (error) {
+      failure = error;
+    }
+    if (failure === undefined) {
+      try { await this.#tokenStore.delete(); }
+      catch (error) { failure = error; }
+    }
     if (failure !== undefined) {
       this.#reportOAuthFailure(failure);
       throw failure;
@@ -394,17 +397,14 @@ export class NaverOAuth {
         throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
       }
       if (!response.ok) throw oauthHttpError(response.status);
-      let body: string;
       try {
-        body = await response.text();
-      } catch {
+        return await readBoundedJson(response, MAX_TOKEN_RESPONSE_BYTES);
+      } catch (error) {
         if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+        if (error instanceof BoundedBodyError && error.code !== 'body_failed') {
+          throw new NaverOAuthError('oauth_invalid_response', 'Naver OAuth returned an invalid response');
+        }
         throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
-      }
-      try {
-        return JSON.parse(body) as unknown;
-      } catch {
-        throw new NaverOAuthError('oauth_invalid_response', 'Naver OAuth returned an invalid response');
       }
     }
     throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
@@ -533,7 +533,7 @@ function objectValue(value: unknown): Record<string, unknown> {
 }
 
 function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_TOKEN_FIELD_LENGTH ? value : undefined;
 }
 
 const PROVEN_PRE_SEND_CODES = new Set([

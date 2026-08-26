@@ -37,6 +37,9 @@
       "calendar": {
         "type": "object",
         "properties": {
+          "caldavReadEnabled": {
+            "type": "boolean"
+          },
           "caldavBaseUrl": {
             "type": "string",
             "pattern": "^https://"
@@ -76,7 +79,7 @@
               "additionalProperties": false
             },
             "minItems": 1,
-            "maxItems": 100
+            "maxItems": 10
           }
         },
         "additionalProperties": false
