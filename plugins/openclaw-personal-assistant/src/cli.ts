@@ -90,21 +90,20 @@ async function oauth(args: readonly string[], io: CliIo, dependencies: CliDepend
     const options = parseOptions(optionArgs, ['client-file', 'token-file', 'state']);
     const tokenFile = requiredAbsolute(options, 'token-file');
     const clientFile = requiredAbsolute(options, 'client-file');
-    const stateDir = requiredAbsolute(options, 'state');
-    const credentials = validateNaverOAuthClientCredentials(await (
-      dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384)
-    ).read());
-    const tokenStore = openTokenStore(tokenFile, dependencies);
-    const client = new NaverOAuth({
-      clientId: credentials.clientId, clientSecret: credentials.clientSecret,
-      redirectUri: credentials.redirectUri, stateDbPath: join(stateDir, 'naver-oauth-state.sqlite3'), tokenStore,
-      ...(dependencies.oauthFetch === undefined ? {} : { fetch: dependencies.oauthFetch }),
-      ...(dependencies.now === undefined ? {} : { now: dependencies.now }), healthStateDir: stateDir,
-    });
-    await client.getValidAccessToken();
-    const tokens = validateStoredToken(await tokenStore.read());
-    io.stdout(JSON.stringify({ status: 'open', expiresAt: tokens.expiresAt, redactedErrorCode: null }));
-    return EXIT.ok;
+    requiredAbsolute(options, 'state');
+    try {
+      validateNaverOAuthClientCredentials(await (
+        dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384)
+      ).read());
+      const tokens = validateStoredToken(await openTokenStore(tokenFile, dependencies).read());
+      const now = dependencies.now?.() ?? Date.now();
+      const status = Date.parse(tokens.expiresAt) - now > 60_000 ? 'fresh' : 'refreshable';
+      io.stdout(JSON.stringify({ status, expiresAt: tokens.expiresAt, redactedErrorCode: null }));
+      return EXIT.ok;
+    } catch (error) {
+      io.stdout(JSON.stringify({ status: 'unusable', expiresAt: null, redactedErrorCode: safeErrorCode(error) }));
+      return EXIT.gateClosed;
+    }
   }
   const allowed = action === 'begin' ? ['client-file', 'state'] : ['client-file', 'token-file', 'state'];
   if (!['begin', 'callback', 'refresh', 'revoke'].includes(String(action))) throw usageError('unsupported OAuth action');

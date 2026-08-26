@@ -17,6 +17,7 @@ export async function readBoundedBody(response: Response, maxBytes: number): Pro
   if (declared !== null && declared !== undefined) {
     const length = Number(declared);
     if (!Number.isSafeInteger(length) || length < 0 || length > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
       throw new BoundedBodyError('response_too_large');
     }
   }

@@ -81,6 +81,63 @@ describe('calendar recovery plugin service', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('recovers a real stale submission and records its durable warning while disabled without network', async () => {
+    const state = await stateDir();
+    const draft = event('44444444-4444-4444-8444-444444444444');
+    const initial = new CalendarOutbox({
+      stateDir: state, now: () => START,
+      api: { async createSchedule() { throw new Error('create must not run'); } },
+      caldav: { async listEvents() { throw new Error('CalDAV must not run'); } },
+      checkpoint(phase) { if (phase === 'afterAcquire') throw new Error('simulated crash'); },
+    });
+    const request = prepare(initial, draft);
+    await expect(initial.confirmAndSubmit(request.requestId, OWNER, request.payloadHash)).rejects.toThrow('simulated crash');
+    initial.close();
+    const fetch = vi.fn();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    const service = createCalendarRecoveryService(apiFor(state, {
+      ...config.calendar, caldavReadEnabled: false, caldavSecretFile: '/must-not-read/caldav',
+    }));
+    try {
+      await service.start(serviceContext(state));
+      const inspect = new CalendarOutbox({
+        stateDir: state,
+        api: { async createSchedule() { throw new Error('create must not run'); } },
+        caldav: { async listEvents() { throw new Error('CalDAV must not run'); } },
+      });
+      expect(inspect.get(request.requestId)).toMatchObject({ status: 'pending_reconcile', errorCode: 'stale_submitting' });
+      inspect.close();
+      const health = new SubsystemHealthStore(state);
+      expect(health.listActive()).toContainEqual({
+        target: `calendar-reconcile:${request.requestId}`,
+        errorCode: 'stale_submitting',
+        message: 'Calendar reconciliation requires owner attention',
+      });
+      health.close();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      await service.stop?.(serviceContext(state));
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('closes health when the disabled local outbox cannot be opened', async () => {
+    const state = await stateDir();
+    const report = vi.fn();
+    const close = vi.fn();
+    const service = createCalendarRecoveryService(apiFor(state, { ...config.calendar, caldavReadEnabled: false }), {
+      openHealth: () => ({ report, recover() {}, listActive: () => [], close }),
+      openOutbox() { throw new Error('local outbox unavailable'); },
+    });
+    await expect(service.start(serviceContext(state))).resolves.toBeUndefined();
+    expect(report).toHaveBeenCalledWith({
+      target: 'calendar-recovery', errorCode: 'recovery_start_failed',
+      message: 'Calendar recovery service is unavailable',
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
   it('recovers a stale submitting request and reconciles an exact CalDAV match without create', async () => {
     const state = await stateDir();
     const draft = event('11111111-1111-4111-8111-111111111111');
@@ -312,7 +369,7 @@ describe('calendar recovery plugin service', () => {
       intervalMs: 10,
       openHealth: () => ({ report() {}, recover() {}, listActive: () => [], close() {} }),
       openOutbox: (_config, _warn, signal) => ({
-        async recover() { cycle += 1; },
+        async recover() { cycle += 1; return []; },
         pendingReconcileIds: () => cycle > 1 ? ['pending'] : [],
         async reconcile() {
           observedSignal = signal;

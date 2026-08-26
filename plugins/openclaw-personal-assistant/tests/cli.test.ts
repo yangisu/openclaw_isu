@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -117,9 +117,11 @@ describe('operational CLI', () => {
     expect(common.join(' ')).not.toMatch(/canary|code|secret/i);
   });
 
-  it('refreshes an expired but refreshable token during operational OAuth status without printing it', async () => {
+  it('classifies an expired token as refreshable without network or any store, lease, health, or tree mutation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-status-'));
     const state = join(root, 'state'); await mkdir(state);
+    const sentinel = join(state, 'owner-sentinel');
+    await writeFile(sentinel, 'unchanged\n');
     const clientFile = join(root, 'client.json'); const tokenFile = join(root, 'token.json');
     const credentials = new CliMemoryStore<unknown>({
       version: 1, clientId: 'client', clientSecret: 'private-client-secret',
@@ -129,9 +131,10 @@ describe('operational CLI', () => {
       version: 1, accessToken: 'expired-access', refreshToken: 'private-refresh',
       expiresAt: '2029-12-31T23:00:00.000Z',
     });
-    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      access_token: 'fresh-private-access', token_type: 'bearer', expires_in: 3600,
-    }), { status: 200 }));
+    const fetch = vi.fn();
+    const beforeToken = JSON.stringify(tokens.value);
+    const beforeEntries = await readdir(state);
+    const beforeSentinel = { bytes: await readFile(sentinel, 'utf8'), mtimeMs: (await stat(sentinel)).mtimeMs };
     const output = capture();
     expect(await runCli([
       'oauth', 'status', '--client-file', clientFile, '--token-file', tokenFile, '--state', state,
@@ -139,9 +142,46 @@ describe('operational CLI', () => {
       credentialStore: () => credentials, tokenStore: () => tokens as never, oauthFetch: fetch,
       now: () => Date.parse('2030-01-01T00:00:00.000Z'),
     })).toBe(0);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(output.stdout.join('\n')).not.toMatch(/private|refresh|access/i);
-    expect(JSON.parse(output.stdout[0]!)).toMatchObject({ status: 'open', redactedErrorCode: null });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(JSON.stringify(tokens.value)).toBe(beforeToken);
+    expect(await readdir(state)).toEqual(beforeEntries);
+    expect({ bytes: await readFile(sentinel, 'utf8'), mtimeMs: (await stat(sentinel)).mtimeMs }).toEqual(beforeSentinel);
+    expect(output.stdout.join('\n')).not.toMatch(/private-client-secret|expired-access|private-refresh/);
+    expect(JSON.parse(output.stdout[0]!)).toEqual({
+      status: 'refreshable', expiresAt: '2029-12-31T23:00:00.000Z', redactedErrorCode: null,
+    });
+  });
+
+  it('reports fresh and unusable OAuth stores deterministically without network', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-status-state-'));
+    const state = join(root, 'state');
+    const credentials = new CliMemoryStore<unknown>({
+      version: 1, clientId: 'client', clientSecret: 'private-client-secret',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    });
+    const tokens = new CliMemoryStore<unknown>({
+      version: 1, accessToken: 'private-access', refreshToken: 'private-refresh',
+      expiresAt: '2030-01-01T01:00:00.000Z',
+    });
+    const fetch = vi.fn();
+    const dependencies = {
+      credentialStore: () => credentials, tokenStore: () => tokens as never, oauthFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+    };
+    const args = ['oauth', 'status', '--client-file', join(root, 'client'), '--token-file', join(root, 'token'), '--state', state];
+    const fresh = capture();
+    expect(await runCli(args, fresh.io, dependencies)).toBe(0);
+    expect(JSON.parse(fresh.stdout[0]!)).toEqual({
+      status: 'fresh', expiresAt: '2030-01-01T01:00:00.000Z', redactedErrorCode: null,
+    });
+    tokens.value = { version: 1, accessToken: 'private-access', refreshToken: '', expiresAt: '2030-01-01T01:00:00.000Z' };
+    const unusable = capture();
+    expect(await runCli(args, unusable.io, dependencies)).toBe(1);
+    expect(JSON.parse(unusable.stdout[0]!)).toEqual({
+      status: 'unusable', expiresAt: null, redactedErrorCode: 'oauth_token_invalid',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(unusable.stdout.join('\n')).not.toMatch(/private-client-secret|private-access|private-refresh/);
   });
 
   it('rejects a callback whose exact redirect query contains an unapproved field before exchange', async () => {

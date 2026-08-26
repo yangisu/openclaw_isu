@@ -80,10 +80,13 @@ node plugins/openclaw-personal-assistant/dist/cli.js oauth callback \
   < /absolute/owner-private/naver-callback.json
 node plugins/openclaw-personal-assistant/dist/cli.js oauth status \
   --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --token-file "$HOME/.openclaw/secrets/naver-oauth-token"
+  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. The production token provider validates and refreshes these stores, but calendar creation is currently disabled: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded. Neither `/assistant-confirm` nor the `assistant_calendar_confirm` tool can perform an external write, and `AC-09` remains `NOT_VERIFIED`.
+`oauth status` is strictly read-only. It reads the hardened app/token stores and reports `fresh`, `refreshable`, or `unusable`; it does not contact Naver, refresh a token, create a lease/health database, or rewrite either store. `refreshable` includes an expired or near-expiry token with a valid refresh token and is healthy for installer checks. Use the explicit `oauth refresh` command when mutation and network access are intended.
+
+Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. The production token provider refreshes tokens only for an actual calendar operation or explicit refresh, but calendar creation is currently disabled: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded. Neither `/assistant-confirm` nor the `assistant_calendar_confirm` tool can perform an external write, and `AC-09` remains `NOT_VERIFIED`.
 
 ## 4. Finish installation
 
@@ -152,7 +155,15 @@ node plugins/openclaw-personal-assistant/dist/cli.js oauth revoke \
 
 There is no automated create PoC while the confirmation boundary is fail-closed. If a future approved OpenClaw release provides direct, non-forwarded owner provenance and the production boundary is implemented and reviewed, create exactly one clearly named test event after the single-use confirmation, verify there is no duplicate, and delete that one event yourself in the Naver app. The assistant does not modify or delete Naver events.
 
-CalDAV reads are independently fail-closed at initial installation: `calendar.caldavReadEnabled` must remain `false`, and query, briefing, and recovery perform no credential read or network request while it is false. The installer and its check mode reject an initially enabled config. Only after the authorized live CalDAV PoC has been performed and recorded by the operator may the owner deliberately change this field in the active config. That live activation remains `NOT_VERIFIED` to automation; a legacy `poc --evidence` report cannot change the runtime flag. On failure, return the field to `false`; local query and briefing functions continue and expose the durable limited-mode reason.
+CalDAV reads are independently fail-closed at initial installation: `calendar.caldavReadEnabled` must remain `false`, and query, briefing, and recovery perform no credential read or network request while it is false. Disabled recovery still opens the local outbox, converts stale `submitting` rows to `pending_reconcile`, records the durable owner warning, and then remains idle without reconciliation. The default installer/finish and ordinary `--check` reject an initially enabled config.
+
+Only after the authorized live CalDAV PoC has been performed and recorded by the operator may the owner deliberately change `calendar.caldavReadEnabled` to `true` in the private active config. Then use the explicit post-live read-only check:
+
+```bash
+bash scripts/wsl/install-openclaw.sh --check --caldav-enabled
+```
+
+This flag only selects the expected hardened value; it never changes config or imports evidence. Ordinary `--check` continues to require `false`, while `--check --caldav-enabled` requires `true`. Reversed, additional, or unsupported flags fail. Live activation remains `NOT_VERIFIED` to automation, and legacy `poc --evidence` cannot change the runtime flag. On failure, return the field to `false`; local query and briefing functions continue and expose the durable limited-mode reason.
 
 ## 6. Backup and restore boundary
 

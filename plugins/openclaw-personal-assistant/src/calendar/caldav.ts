@@ -246,6 +246,7 @@ export class CalDavClient {
     if (!response.ok) throw new CalDavError('CALDAV_HTTP', `CalDAV request failed with HTTP ${response.status}`);
     const declaredLength = response.headers.get('content-length');
     if (declaredLength !== null && /^\d+$/.test(declaredLength) && Number(declaredLength) > CALDAV_RESPONSE_MAX_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
       throw new CalDavError('CALDAV_RESPONSE_TOO_LARGE', 'CalDAV response exceeded the allowed size');
     }
     try {

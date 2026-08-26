@@ -453,7 +453,7 @@ describe('deployment scripts', () => {
         .replace("bind: 'loopback'", "bind: 'lan'");
       writeFileSync(config, unsafe, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
+      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('active_config_not_hardened');
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -490,15 +490,44 @@ describe('deployment scripts', () => {
         .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal');
       writeFileSync(config, baseline, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
+      const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
       expect(valid.status, valid.stderr).toBe(0);
       writeFileSync(config, mutate(baseline), { mode: 0o600 });
-      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' }).status).not.toBe(0);
+      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' }).status).not.toBe(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
     const checkBlock = readFileSync(installer, 'utf8').split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
     expect(checkBlock).toContain('validate_config_file "$ACTIVE_CONFIG_FILE"');
-    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"');
+    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" "$CALDAV_EXPECTATION"');
     expect(checkBlock).not.toMatch(/config patch|gateway install|cron add|mkdir/);
+  });
+
+  it('requires the explicit initial or post-live CalDAV mode without accepting flag reordering', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-caldav-mode-'));
+    try {
+      privateDirectory(root);
+      const config = resolve(root, 'openclaw.json5');
+      const secretRoot = resolve(root, 'secrets');
+      const configSecretRoot = secretRoot.replaceAll('\\', '/');
+      const disabled = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
+        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
+        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal');
+      const enabled = disabled.replace('caldavReadEnabled: false', 'caldavReadEnabled: true');
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const validate = (source: string, mode: string) => {
+        writeFileSync(config, source, { mode: 0o600 });
+        return spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, mode], { encoding: 'utf8' }).status;
+      };
+      expect(validate(disabled, 'disabled')).toBe(0);
+      expect(validate(disabled, 'enabled')).not.toBe(0);
+      expect(validate(enabled, 'enabled')).toBe(0);
+      expect(validate(enabled, 'disabled')).not.toBe(0);
+      expect(validate(disabled, 'anything')).not.toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+
+    expect(spawnSync(gitBash, [installer, '--caldav-enabled', '--check'], { cwd: repo }).status).toBe(64);
+    expect(spawnSync(gitBash, [installer, '--check', '--caldav-enabled', '--extra'], { cwd: repo }).status).toBe(64);
+    expect(spawnSync(gitBash, [installer, '--check', '--caldav-enabled'], { cwd: repo }).status).not.toBe(64);
   });
 
   it('non-live acceptance emits exactly 32 criterion records with live work not verified', () => {

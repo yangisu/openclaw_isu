@@ -118,4 +118,14 @@ describe('NaverCalendarApi.createSchedule', () => {
       await expect(api.createSchedule(request)).rejects.toMatchObject({ code });
     }
   });
+
+  it('best-effort cancels a body rejected by its declared response length', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const response = {
+      ok: true, status: 200, headers: new Headers({ 'content-length': '65537' }), body: { cancel },
+    } as unknown as Response;
+    const api = new NaverCalendarApi({ accessToken: 'access-secret', fetch: vi.fn().mockResolvedValue(response) });
+    await expect(api.createSchedule(request)).rejects.toMatchObject({ code: 'request_maybe_sent' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
 });

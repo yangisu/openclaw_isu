@@ -6,8 +6,9 @@ const { dirname, isAbsolute, join, resolve } = require('node:path');
 const { secureReadFile, validateSafeValue } = require('./live-probe-contract.js');
 
 try {
-  const [openclawBin, configPath, secretDir] = process.argv.slice(2);
-  if (process.argv.length !== 5 || !isAbsolute(openclawBin) || !isAbsolute(configPath) || !isAbsolute(secretDir)
+  const [openclawBin, configPath, secretDir, caldavMode] = process.argv.slice(2);
+  if (process.argv.length !== 6 || !['disabled', 'enabled'].includes(caldavMode)
+    || !isAbsolute(openclawBin) || !isAbsolute(configPath) || !isAbsolute(secretDir)
     || resolve(configPath) !== configPath || resolve(secretDir) !== secretDir) throw new Error('usage');
   const bytes = secureReadFile(configPath, { root: resolve(configPath, '..'), maxBytes: 1024 * 1024 });
   const requireFromOpenClaw = createRequire(join(dirname(openclawBin), '..', 'openclaw', 'package.json'));
@@ -26,7 +27,7 @@ try {
     || config.commands?.bash !== false || config.commands?.config !== false || config.commands?.mcp !== false || config.commands?.plugins !== false
     || config.tools?.elevated?.enabled !== false || JSON.stringify([...(config.tools?.allow ?? [])].sort()) !== JSON.stringify(expectedTools)
     || plugin?.enabled !== true || plugin?.config?.timezone !== 'Asia/Seoul'
-    || calendar?.caldavReadEnabled !== false
+    || calendar?.caldavReadEnabled !== (caldavMode === 'enabled')
     || calendar?.caldavSecretFile !== join(secretDir, 'naver-caldav').replaceAll('\\', '/')
     || calendar?.naverOAuthClientFile !== join(secretDir, 'naver-oauth-client').replaceAll('\\', '/')
     || calendar?.naverTokenFile !== join(secretDir, 'naver-oauth-token').replaceAll('\\', '/')

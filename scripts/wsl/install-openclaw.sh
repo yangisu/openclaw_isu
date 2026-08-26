@@ -4,12 +4,20 @@ IFS=$'\n\t'
 
 MODE="install"
 PHASE="prepare"
-case "${1:-}" in
-  --dry-run) MODE="dry-run" ;;
-  --check) MODE="check" ;;
-  --finish) PHASE="finish" ;;
-  "") ;;
-  *) printf '%s\n' 'usage: install-openclaw.sh [--dry-run|--check|--finish]' >&2; exit 64 ;;
+CALDAV_EXPECTATION="disabled"
+usage() { printf '%s\n' 'usage: install-openclaw.sh [--dry-run|--check [--caldav-enabled]|--finish]' >&2; exit 64; }
+case "$#" in
+  0) ;;
+  1) case "$1" in
+    --dry-run) MODE="dry-run" ;;
+    --check) MODE="check" ;;
+    --finish) PHASE="finish" ;;
+    *) usage ;;
+  esac ;;
+  2) [[ "$1" == --check && "$2" == --caldav-enabled ]] || usage
+    MODE="check"
+    CALDAV_EXPECTATION="enabled" ;;
+  *) usage ;;
 esac
 
 EXPECTED_OPENCLAW="2026.7.1"
@@ -179,7 +187,7 @@ if [[ "$MODE" == check ]]; then
   validate_secret_tree
   validate_config_file "$ACTIVE_CONFIG_FILE"
   validate_active_config_path
-  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
+  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" "$CALDAV_EXPECTATION"
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck
@@ -221,7 +229,7 @@ fi
 
 validate_secret_tree
 validate_config_file "$CONFIG_FILE"
-node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR" disabled
 "$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
 
 run npm --prefix "$PLUGIN_ROOT" ci
@@ -230,7 +238,7 @@ run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
 run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 validate_config_file "$ACTIVE_CONFIG_FILE"
 validate_active_config_path
-node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" disabled
 run "$OPENCLAW" config validate
 validate_active_config
 OWNER_ID="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.config.telegramUserId | tr -d '"[:space:]')"

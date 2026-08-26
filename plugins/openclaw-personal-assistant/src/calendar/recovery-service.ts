@@ -15,7 +15,7 @@ const DEFAULT_MAX_PER_CYCLE = 1;
 const MAX_INTERVAL_MS = 60 * 60_000;
 
 interface RecoveryOutbox {
-  recover(): Promise<unknown[]>;
+  recover(): Promise<Array<{ requestId: string }>>;
   pendingReconcileIds(limit: number): string[];
   reconcile(requestId: string): Promise<Array<{ requestId: string; status: string }>>;
   close(): void;
@@ -62,8 +62,19 @@ export function createCalendarRecoveryService(
     });
   };
 
+  const recoverLocalState = async () => {
+    const recovered = await outbox!.recover();
+    for (const request of recovered) {
+      safeReport({
+        target: requestTarget(request.requestId),
+        errorCode: 'stale_submitting',
+        message: 'Calendar reconciliation requires owner attention',
+      });
+    }
+  };
+
   const runCycle = async () => {
-    await outbox!.recover();
+    await recoverLocalState();
     const requestIds = outbox!.pendingReconcileIds(maxPerCycle);
     for (const requestId of requestIds) {
       try {
@@ -110,19 +121,27 @@ export function createCalendarRecoveryService(
         config = loadConfigFromApi(api);
         activeController = new AbortController();
         health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
+        let calendarEnabled = true;
         try { requireCalendarReadConfig(config); }
         catch (error) {
           if (error && typeof error === 'object' && 'code' in error && error.code === 'caldav_read_disabled') {
-            health.report({ target: 'naver-caldav', errorCode: 'caldav_read_disabled',
-              message: 'Calendar reads are disabled pending authorized live validation' });
-            return;
+            calendarEnabled = false;
+          } else {
+            throw error;
           }
-          throw error;
         }
-        outbox = (dependencies.openOutbox ?? openRecoveryOutbox)(config, reportWarning, activeController.signal);
-        cycle = runCycle();
+        outbox = (dependencies.openOutbox ?? (calendarEnabled ? openRecoveryOutbox : openLocalRecoveryOutbox))(
+          config, reportWarning, activeController.signal,
+        );
+        cycle = calendarEnabled ? runCycle() : recoverLocalState();
         await cycle;
         cycle = undefined;
+        if (!calendarEnabled) {
+          health.report({ target: 'naver-caldav', errorCode: 'caldav_read_disabled',
+            message: 'Calendar reads are disabled pending authorized live validation' });
+          health.recover('calendar-recovery');
+          return;
+        }
         queueNext();
       } catch {
         safeReport({
@@ -153,6 +172,18 @@ export function createCalendarRecoveryService(
       activeController = undefined;
     },
   };
+}
+
+function openLocalRecoveryOutbox(
+  config: AssistantToolConfig,
+  warn: (warning: CalendarOutboxWarning) => void | Promise<void>,
+): CalendarOutbox {
+  return new CalendarOutbox({
+    stateDir: config.stateDir,
+    api: { async createSchedule() { throw new Error('calendar_recovery_write_forbidden'); } },
+    caldav: { async listEvents() { throw new Error('caldav_read_disabled'); } },
+    warn,
+  });
 }
 
 function openRecoveryOutbox(

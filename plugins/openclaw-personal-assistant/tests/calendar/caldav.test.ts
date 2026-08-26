@@ -307,18 +307,21 @@ describe('CalDavClient', () => {
 
   it('rejects an oversized declared response before reading its body', async () => {
     let bodyRead = false;
+    const cancel = vi.fn().mockResolvedValue(undefined);
     const client = new CalDavClient({
       baseUrl: 'https://caldav.example.test/', secretFile: await secretFile(),
       fetch: async () => ({
         ok: true,
         status: 207,
         headers: new Headers({ 'content-length': '2097153' }),
+        body: { cancel },
         text: async () => { bodyRead = true; throw new Error('body must not be read'); },
       }) as Response,
     });
 
     await expect(client.listCalendars()).rejects.toMatchObject({ code: 'CALDAV_RESPONSE_TOO_LARGE' });
     expect(bodyRead).toBe(false);
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('cancels a chunked response as soon as its streamed bytes exceed the bound', async () => {

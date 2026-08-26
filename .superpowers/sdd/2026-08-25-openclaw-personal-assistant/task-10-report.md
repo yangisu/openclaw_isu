@@ -250,7 +250,7 @@ CalDAV access is now a separate fail-closed runtime capability. The example, ins
 
 One `listMappedEvents` operation now owns a global budget: one discovery, at most ten approved mappings/eleven total requests, 31 days, 1,000 events, 2 MiB of actual streamed response bytes, and one wall-clock deadline. The external abort signal is combined with each request timeout. The recovery service propagates its stop signal, aborts an active fetch before closing, and reconciles at most one pending request per cycle so a backlog cannot multiply the mapping fan-out. This intentionally trades recovery throughput for a strict aggregate network bound.
 
-OAuth revoke now retains its owner-private token store when remote outcome is timeout, transport loss, response-body uncertainty, or non-success; only a verified successful response deletes it. This supports an explicit retry while health remains degraded and calendar creation remains closed. Operational `oauth status` now requires client, token, and state paths and calls the same cross-process `getValidAccessToken` provider, so a normal expired-but-refreshable token is refreshed without exposing it. Installer check uses that operational status path.
+OAuth revoke now retains its owner-private token store when remote outcome is timeout, transport loss, response-body uncertainty, or non-success; only a verified successful response deletes it. This supports an explicit retry while health remains degraded and calendar creation remains closed. The production calendar operation uses the cross-process `getValidAccessToken` provider; Phase 5 supersedes the earlier status behavior by making `oauth status` and installer check strictly read-only.
 
 OAuth and Naver create responses no longer use unbounded `Response.text()`. A shared streaming reader rejects oversized declared/chunked bodies, malformed UTF-8/JSON, excessive nesting/node/key/string shapes, and caller-specific overlong token/calendar fields with stable redacted errors. The installed runtime exposed one additional RED: the manifest rejected the new flag as an additional property. Its schema was aligned and mapping `maxItems` was reduced to ten before the final runtime inspection.
 
@@ -271,3 +271,27 @@ isolated OpenClaw 2026.7.1 runtime validator: PASS, five optional tools exactly
 A final signal/range audit added direct tool-signal propagation and pre-open rejection of queries longer than 31 days; its three selected query/gate tests passed, followed by fresh typecheck and build exits 0. Root integration owns the later full-suite run.
 
 The five runtime tools remained `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. `AC-18` and `AC-29` remain NV125 for lack of acceptance attestation of the complete built/runtime behavior, rather than claiming their production path is absent. The isolated runtime state was removed. No real OpenClaw config/state, credential, service, scheduler, Telegram, CalDAV, Naver, or other live endpoint was accessed.
+
+## Phase 5 final review fixes
+
+Disabled CalDAV startup now still opens the local outbox and health stores, performs crash recovery, and records a request-specific durable warning for every stale `submitting` row moved to `pending_reconcile`. It then remains idle: it does not read calendar credentials, discover calendars, fetch events, or reconcile externally. Stop closes local resources, and local startup failures close the recovery health gate without enabling network activity.
+
+`oauth status` is now strictly read-only. It validates only the hardened client and token stores and returns the deterministic redacted classification `fresh`, `refreshable`, or `unusable`; it does not invoke the token provider, fetch, refresh, acquire a lease, create state/health files, or mutate store bytes or timestamps. An expired or near-expiry schema-valid token with a refresh token is `refreshable` and exits 0, while missing, malformed, or revoked state is `unusable` and exits nonzero. `oauth refresh` remains the explicit mutating command.
+
+Initial installation, finish, and ordinary `--check` continue to require `caldavReadEnabled: false`. The exact post-live command `install-openclaw.sh --check --caldav-enabled` is read-only and instead requires `true`, while applying the same full active-config validation. It does not enable CalDAV or import evidence, and unsupported, extra, or reordered flags fail usage validation. The runbook documents the deliberate private-config activation step only after an authorized live PoC; that live result remains NOT_VERIFIED.
+
+The shared bounded JSON reader and CalDAV reader now make a best-effort `body.cancel()` before rejecting an oversized declared `Content-Length`, avoiding an unnecessary unread response stream while preserving the same stable redacted failure. The OAuth runbook status example now supplies its required absolute `--state` argument.
+
+TDD RED evidence was observed before implementation: two recovery tests failed because disabled startup skipped local recovery and warnings; OAuth status attempted a refresh and returned exit 70 for an expired token; the post-live hardened-validator mode was unsupported; and both declared-length oversize tests observed zero body cancellations. GREEN verification:
+
+```text
+recovery service: 13/13
+focused recovery/oauth/caldav/naver-api/CLI: 147/147 in 45.88 seconds
+deployment scripts: 57/57 in 148.17 seconds
+npm run typecheck: exit 0
+npm run build: exit 0
+npm run plugin:validate: {"status":"valid","optionalToolCount":5}
+isolated OpenClaw 2026.7.1 runtime validator: PASS, five optional tools exactly
+```
+
+The isolated runtime exposed exactly `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. Its temporary state was removed after inspection. No real OpenClaw state/config, credential, service, scheduler, CalDAV/Naver endpoint, or other live system was accessed. Root integration owns the subsequent full-suite run.
