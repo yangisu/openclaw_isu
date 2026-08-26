@@ -116,7 +116,7 @@ function assertBoolean(value: unknown): asserts value is boolean {
 }
 
 function assertInteger(value: unknown, code = 'invalid_integer'): asserts value is number {
-  if (!Number.isInteger(value)) invalid(code, 'value must be a decimal integer');
+  if (!Number.isSafeInteger(value)) invalid(code, 'value must be a safe decimal integer');
 }
 
 function assertEnum(value: unknown, allowed: readonly string[], code: string): asserts value is string {

@@ -95,6 +95,15 @@ function dailyDocument(id: string, title: string, entryAt: string): string {
   ].join('\n');
 }
 
+function memoryDocument(id: string, sensitivity: 'normal' | 'sensitive'): string {
+  return [
+    '# Memory', '', `### ${id} Existing memory`, '- type: "memory"', '- active: true',
+    `- sensitivity: ${sensitivity}`, '- created_at: 2026-08-25T09:03:00+09:00',
+    '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "manual"', '',
+    'Existing memory body', '',
+  ].join('\n');
+}
+
 function repositoryUrlForChild(): string {
   if (childRepositoryUrl !== undefined) return childRepositoryUrl;
   const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
@@ -637,6 +646,84 @@ describe('WorkspaceRepository', () => {
     expect(git(workspace, 'status', '--short')).toBe('');
   });
 
+  it('does not reuse a trailer commit that touched an extra ordinary path', async () => {
+    let interrupt = true;
+    const operationId = 'extra-ordinary-path-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    await writeFile(join(workspace, 'ordinary-candidate.txt'), 'candidate-only change\n');
+    git(workspace, 'add', '--', 'ordinary-candidate.txt');
+    git(workspace, 'commit', '--quiet', '--amend', '--no-edit');
+    const extraPathCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'user-staged.txt'), 'preserve staged user change\n');
+    git(workspace, 'add', '--', 'user-staged.txt');
+    await writeFile(join(workspace, 'user-untracked.txt'), 'preserve untracked user change\n');
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).not.toBe(extraPathCandidate);
+    expect(git(workspace, 'show', '--format=', '--name-only', recovered.gitCommit!)).toBe('');
+    expect(git(workspace, 'status', '--short')).toBe([
+      'A  user-staged.txt',
+      '?? user-untracked.txt',
+    ].join('\n'));
+  });
+
+  it('reuses one semantic recovery proof after crashing during extra-path fallback', async () => {
+    let initialInterrupt = true;
+    const operationId = 'extra-path-second-crash';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && initialInterrupt) throw new Error('crash:initial-commit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:initial-commit');
+    await writeFile(join(workspace, 'ordinary-candidate.txt'), 'candidate-only change\n');
+    git(workspace, 'add', '--', 'ordinary-candidate.txt');
+    git(workspace, 'commit', '--quiet', '--amend', '--no-edit');
+    const rejectedCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'user-staged.txt'), 'preserve staged user change\n');
+    git(workspace, 'add', '--', 'user-staged.txt');
+    await writeFile(join(workspace, 'user-untracked.txt'), 'preserve untracked user change\n');
+    initialInterrupt = false;
+
+    repo.close();
+    repositories.splice(repositories.indexOf(repo), 1);
+    let fallbackInterrupt = true;
+    const recovering = await openRepository(config, {
+      now: fixedNow,
+      checkpoint(phase) {
+        if (phase === 'afterGitCommit' && fallbackInterrupt) throw new Error('crash:fallback-commit');
+      },
+    });
+    repositories.push(recovering);
+    await expect(recovering.addTask(operationId, taskInput(1))).rejects
+      .toThrow('crash:fallback-commit');
+    const recoveryProof = git(workspace, 'rev-parse', 'HEAD');
+    expect(recoveryProof).not.toBe(rejectedCandidate);
+    expect(recovering.ledger.get(operationId)?.phase).toBe('applied');
+    fallbackInterrupt = false;
+
+    const restarted = await restart(config, recovering);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+    expect(recovered).toMatchObject({ gitCommit: recoveryProof, replayed: true });
+    expect(git(workspace, 'merge-base', '--is-ancestor', recovered.gitCommit!, 'HEAD')).toBe('');
+    expect(git(workspace, 'log', '--format=%B', '--all').split(
+      `Assistant-Operation-Id: ${operationId}`,
+    )).toHaveLength(3);
+    expect(git(workspace, 'status', '--short')).toBe([
+      'A  user-staged.txt',
+      '?? user-untracked.txt',
+    ].join('\n'));
+
+    const restartedAgain = await restart(config, restarted);
+    expect(await restartedAgain.addTask(operationId, taskInput(1)))
+      .toMatchObject({ gitCommit: recoveryProof, replayed: true });
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(recoveryProof);
+  });
+
   it('does not reuse either commit when an exact operation trailer is ambiguous', async () => {
     let interrupt = true;
     const operationId = 'ambiguous-trailer-candidate';
@@ -993,6 +1080,140 @@ describe('WorkspaceRepository', () => {
     expect(settledBeforeRelease).toBe(false);
     expect(records).toHaveLength(1);
     expect(records[0].fields.status).toBe('archived');
+  });
+
+  it.each([
+    ['title structural injection', 'invalid_title', 'task', {
+      title: 'Changed\n### T-20260825-999 Injected',
+    }],
+    ['body structural injection', 'invalid_body', 'task', {
+      body: 'Normal\n### T-20260825-999 Injected\n- type: "task"\n',
+    }],
+    ['oversized body', 'input_too_long', 'task', { body: 'x'.repeat(16_001) }],
+    ['strict timestamp', 'invalid_timestamp', 'task', {
+      fields: { due_at: '2026-04-31T09:00:00+09:00' },
+    }],
+    ['invalid status', 'invalid_status', 'task', { fields: { status: 'pending' } }],
+    ['progress above target', 'invalid_progress', 'study', { fields: { progress: 11 } }],
+    ['unsafe progress integer', 'invalid_progress', 'study', { fields: { progress: 1e21 } }],
+    ['invalid target date', 'invalid_date', 'study', { fields: { target_date: '2026-02-29' } }],
+    ['wrong-kind field combination', 'invalid_patch_fields', 'study', {
+      fields: { priority: 'high' },
+    }],
+  ] as const)(
+    'rejects an invalid update with %s before ledger, file, or Git mutation',
+    async (_label, code, kind, patch) => {
+      const { repo, workspace } = await fixture();
+      const added = kind === 'task'
+        ? await repo.addTask(`invalid-update-seed-${code}`, taskInput(1))
+        : await repo.addRecord(`invalid-update-seed-${code}`, {
+          kind: 'study', title: 'Study', source: 'telegram', subject: 'Math',
+          targetAmount: 10, unit: 'pages', progress: 2,
+        });
+      const operationId = `invalid-update-${code}`;
+      const relativePath = kind === 'task' ? 'TASKS.md' : 'STUDY.md';
+      const before = await readFile(join(workspace, relativePath), 'utf8');
+      const head = git(workspace, 'rev-parse', 'HEAD');
+
+      await expect(repo.updateRecord(operationId, added.id, patch as never))
+        .rejects.toMatchObject({ code });
+
+      expect(repo.ledger.get(operationId)).toBeUndefined();
+      expect(await readFile(join(workspace, relativePath), 'utf8')).toBe(before);
+      expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+      expect(git(workspace, 'status', '--short')).toBe('');
+    },
+  );
+
+  it('round-trips a valid update as one typed record while preserving unknown fields and order', async () => {
+    const { repo, workspace } = await fixture();
+    const original = [
+      '# Notes', '', '### N-20260825-001 Existing note', '- type: "note"',
+      '- custom_field: "keep-me"', '- status: active',
+      '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "manual"', '',
+      'Existing body', '',
+    ].join('\n');
+    await writeFile(join(workspace, 'NOTES.md'), original);
+    git(workspace, 'add', '--', 'NOTES.md');
+    git(workspace, 'commit', '--quiet', '-m', 'seed note update invariant');
+
+    await repo.updateRecord('valid-note-roundtrip', 'N-20260825-001', {
+      title: 'Updated note', body: 'Updated body\n',
+      fields: { url: 'https://example.test/updated', tags: ['one', 'two'] },
+    });
+
+    const text = await readFile(join(workspace, 'NOTES.md'), 'utf8');
+    const parsed = parseDocument('note', text);
+    expect(parsed.records).toHaveLength(1);
+    expect(parsed.records[0]).toMatchObject({
+      id: 'N-20260825-001', title: 'Updated note', body: 'Updated body\n',
+      fields: {
+        type: 'note', custom_field: 'keep-me', status: 'active',
+        url: 'https://example.test/updated', tags: ['one', 'two'],
+      },
+    });
+    expect(text.indexOf('- custom_field: "keep-me"')).toBeLessThan(text.indexOf('- status: active'));
+    expect(await repo.query({ kind: 'note', id: 'N-20260825-001' })).toEqual(parsed.records);
+  });
+
+  it.each([
+    ['body-only patch', { body: 'Changed body\n' }],
+    ['fields-only downgrade patch', { fields: { sensitivity: 'normal' } }],
+  ] as const)(
+    'rejects a mutation of an existing sensitive memory for a %s',
+    async (_label, patch) => {
+      const { repo, workspace } = await fixture();
+      const text = memoryDocument('M-20260825-001', 'sensitive');
+      await writeFile(join(workspace, 'MEMORY.md'), text);
+      git(workspace, 'add', '--', 'MEMORY.md');
+      git(workspace, 'commit', '--quiet', '-m', 'seed sensitive memory');
+      const operationId = `existing-sensitive-${_label.replaceAll(' ', '-')}`;
+      const head = git(workspace, 'rev-parse', 'HEAD');
+
+      await expect(repo.updateRecord(operationId, 'M-20260825-001', patch as never))
+        .rejects.toMatchObject({ code: 'confirmation_unavailable' });
+
+      expect(repo.ledger.get(operationId)).toBeUndefined();
+      expect(await readFile(join(workspace, 'MEMORY.md'), 'utf8')).toBe(text);
+      expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+      expect(git(workspace, 'status', '--short')).toBe('');
+    },
+  );
+
+  it('rejects an update that would make a normal memory sensitive before state mutation', async () => {
+    const { repo, workspace } = await fixture();
+    const added = await repo.addRecord('normal-memory-seed', {
+      kind: 'memory', title: 'Normal memory', source: 'telegram', sensitivity: 'normal',
+    });
+    const before = await readFile(join(workspace, 'MEMORY.md'), 'utf8');
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.updateRecord('become-sensitive', added.id, {
+      fields: { sensitivity: 'sensitive' },
+    })).rejects.toMatchObject({ code: 'confirmation_unavailable' });
+
+    expect(repo.ledger.get('become-sensitive')).toBeUndefined();
+    expect(await readFile(join(workspace, 'MEMORY.md'), 'utf8')).toBe(before);
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('rejects archiving an existing sensitive memory before state mutation', async () => {
+    const { repo, workspace } = await fixture();
+    const text = memoryDocument('M-20260825-001', 'sensitive');
+    await writeFile(join(workspace, 'MEMORY.md'), text);
+    git(workspace, 'add', '--', 'MEMORY.md');
+    git(workspace, 'commit', '--quiet', '-m', 'seed sensitive memory for archive');
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.archiveRecord('archive-sensitive', 'M-20260825-001', 'cleanup'))
+      .rejects.toMatchObject({ code: 'confirmation_unavailable' });
+
+    expect(repo.ledger.get('archive-sensitive')).toBeUndefined();
+    expect(await readFile(join(workspace, 'MEMORY.md'), 'utf8')).toBe(text);
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
   });
 
   it('updates, queries, and archives a record without losing its body', async () => {

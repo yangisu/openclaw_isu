@@ -207,6 +207,15 @@ function cloneRecord(record: ParsedRecord): ParsedRecord {
   };
 }
 
+function recordSemantics(record: ParsedRecord): unknown {
+  return {
+    id: record.id,
+    title: record.title,
+    fields: record.fields,
+    body: record.body,
+  };
+}
+
 function isPrepared(value: unknown): value is PreparedMutation {
   if (value === null || typeof value !== 'object') return false;
   const candidate = value as Partial<PreparedMutation>;
@@ -271,6 +280,141 @@ function validateOperationId(operationId: string): void {
       'operation ID must be 1-128 safe ASCII characters',
     );
   }
+}
+
+const UPDATE_FIELDS: Readonly<Record<RecordKind, ReadonlySet<string>>> = {
+  task: new Set(['type', 'created_at', 'source', 'status', 'priority', 'due_at', 'completed_at']),
+  study: new Set([
+    'type', 'created_at', 'source', 'status', 'subject', 'target_amount', 'unit', 'progress',
+    'target_date', 'recurrence', 'review_dates',
+  ]),
+  note: new Set(['type', 'created_at', 'source', 'status', 'url', 'tags']),
+  preference: new Set(['type', 'created_at', 'source', 'active', 'supersedes']),
+  memory: new Set(['type', 'created_at', 'source', 'active', 'supersedes', 'sensitivity']),
+  inbox: new Set([
+    'type', 'created_at', 'source', 'status', 'reason', 'original_text', 'resolved_at', 'target_id',
+  ]),
+  daily: new Set(['type', 'created_at', 'source', 'entry_at', 'related_ids']),
+};
+
+/** Validates patch-only constraints that do not depend on the current record. */
+export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void {
+  if (typeof patch !== 'object' || patch === null) {
+    throw new WorkspaceRepositoryError('invalid_patch', 'record patch must be an object');
+  }
+  if (patch.title !== undefined) {
+    if (typeof patch.title !== 'string' || patch.title.length === 0
+      || /[\r\n\u0000-\u001f\u007f]/.test(patch.title)) {
+      throw new WorkspaceRepositoryError('invalid_title', 'record title must be one printable line');
+    }
+    if (patch.title.length > 500) {
+      throw new WorkspaceRepositoryError('input_too_long', 'record title exceeds 500 characters');
+    }
+  }
+  if (patch.body !== undefined) {
+    if (typeof patch.body !== 'string') {
+      throw new WorkspaceRepositoryError('invalid_body', 'record body must be text');
+    }
+    if (patch.body.length > 16_000) {
+      throw new WorkspaceRepositoryError('input_too_long', 'record body exceeds 16000 characters');
+    }
+    if (/[\r\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(patch.body)
+      || /(?:^|\n)### [^\n]*/.test(patch.body)) {
+      throw new WorkspaceRepositoryError(
+        'invalid_body',
+        'record body cannot contain carriage returns, controls, or level-three record headings',
+      );
+    }
+  }
+  if (patch.fields !== undefined) {
+    if (typeof patch.fields !== 'object' || patch.fields === null || Array.isArray(patch.fields)) {
+      throw new WorkspaceRepositoryError('invalid_patch_fields', 'patch fields must be an object');
+    }
+    const fields = patch.fields as Record<string, unknown>;
+    const unexpected = Object.keys(fields).filter(key => !UPDATE_FIELDS[kind].has(key));
+    if (unexpected.length > 0) {
+      throw new WorkspaceRepositoryError(
+        'invalid_patch_fields',
+        `fields are not mutable for ${kind}: ${unexpected.join(', ')}`,
+      );
+    }
+    if ('source' in fields
+      && (typeof fields.source !== 'string'
+        || !/^[a-z][a-z0-9_-]{0,99}$/.test(fields.source))) {
+      throw new WorkspaceRepositoryError('invalid_source', 'record source is invalid');
+    }
+    for (const [key, value] of [
+      ['target_amount', fields.target_amount],
+      ['progress', fields.progress],
+    ] as const) {
+      if (value !== undefined && !Number.isSafeInteger(value)) {
+        throw new WorkspaceRepositoryError(
+          key === 'progress' ? 'invalid_progress' : 'invalid_target_amount',
+          `${key} must be a safe decimal integer`,
+        );
+      }
+    }
+    for (const key of ['due_at', 'completed_at', 'resolved_at', 'entry_at'] as const) {
+      const value = fields[key];
+      if (value !== undefined && !isStrictTimestamp(value)) {
+        throw new WorkspaceRepositoryError('invalid_timestamp', `${key} must be RFC 3339 with +09:00`);
+      }
+    }
+    if (fields.target_date !== undefined && !isStrictDate(fields.target_date)) {
+      throw new WorkspaceRepositoryError('invalid_date', 'target_date must be a valid YYYY-MM-DD value');
+    }
+    for (const [key, maximum, itemMaximum] of [
+      ['review_dates', 64, undefined],
+      ['tags', 64, 100],
+      ['related_ids', 64, undefined],
+    ] as const) {
+      const value = fields[key];
+      if (value !== undefined
+        && (!Array.isArray(value) || value.length > maximum || new Set(value).size !== value.length)) {
+        throw new WorkspaceRepositoryError(`invalid_${key}`, `${key} must contain unique items`);
+      }
+      if (Array.isArray(value) && itemMaximum !== undefined
+        && value.some(item => typeof item !== 'string' || item.length === 0 || item.length > itemMaximum)) {
+        throw new WorkspaceRepositoryError(`invalid_${key}`, `${key} contains an invalid item`);
+      }
+      if (key === 'review_dates' && Array.isArray(value)
+        && value.some(item => !isStrictDate(item))) {
+        throw new WorkspaceRepositoryError('invalid_date', 'review_dates must contain valid dates');
+      }
+    }
+    for (const [key, maximum] of [
+      ['subject', 500], ['unit', 100], ['url', 2_048], ['reason', 1_000], ['original_text', 4_000],
+    ] as const) {
+      const value = fields[key];
+      if (value !== undefined
+        && (typeof value !== 'string' || value.length === 0 || value.length > maximum)) {
+        throw new WorkspaceRepositoryError(
+          value !== undefined && typeof value === 'string' && value.length > maximum
+            ? 'input_too_long'
+            : 'invalid_string',
+          `${key} must be a non-empty string of at most ${maximum} characters`,
+        );
+      }
+    }
+  }
+}
+
+function isStrictDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  return month >= 1 && month <= 12 && day >= 1
+    && day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function isStrictTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\+09:00$/
+    .exec(value);
+  return match !== null && isStrictDate(`${match[1]}-${match[2]}-${match[3]}`);
 }
 
 function addRecordFields(input: AddRecordInput, timestamp: string): AssistantRecord {
@@ -564,43 +708,56 @@ export class WorkspaceRepository {
     return this.withLock(async () => {
       const index = await this.buildWorkspaceIdIndex();
       const existing = this.ledger.get<PreparedMutation>(operationId);
-      const operation = this.ledger.begin(
-        operationId,
-        this.config.telegramUserId,
-        operationPayloadHash(payload),
-      ) as LedgerOperation<PreparedMutation>;
-      if (operation.phase === 'committed' || operation.phase === 'replied') {
-        return this.replayedResult(operation);
-      }
-      const current = this.ledger.get<PreparedMutation>(operationId)!;
-      if (current.phase === 'committed' || current.phase === 'replied') {
-        return this.replayedResult(current);
-      }
-
       let prepared: PreparedMutation;
-      if (isPrepared(current.result)) {
-        prepared = current.result;
-        if (prepared.action !== action) {
-          throw new WorkspaceRepositoryError(
-            'operation_id_conflict',
-            `operation ${operationId} has different mutation metadata`,
-          );
-        }
-      } else {
-        try {
-          prepared = await prepare(index);
-        } catch (error) {
-          if (error instanceof WorkspaceRepositoryError && error.code === 'workspace_conflict') {
-            await this.appendConflictInbox(operationId, error.message).catch(nested => {
-              error.detail = { inboxAppendError: String(nested) };
-            });
-          }
-          throw error;
-        }
+      if (existing === undefined) {
+        prepared = await this.prepareMutation(operationId, index, prepare);
+        this.ledger.begin(
+          operationId,
+          this.config.telegramUserId,
+          operationPayloadHash(payload),
+        );
         this.ledger.setPreparedResult(operationId, prepared);
+      } else {
+        const operation = this.ledger.begin(
+          operationId,
+          this.config.telegramUserId,
+          operationPayloadHash(payload),
+        ) as LedgerOperation<PreparedMutation>;
+        if (operation.phase === 'committed' || operation.phase === 'replied') {
+          return this.replayedResult(operation);
+        }
+        if (isPrepared(operation.result)) {
+          prepared = operation.result;
+          if (prepared.action !== action) {
+            throw new WorkspaceRepositoryError(
+              'operation_id_conflict',
+              `operation ${operationId} has different mutation metadata`,
+            );
+          }
+        } else {
+          prepared = await this.prepareMutation(operationId, index, prepare);
+          this.ledger.setPreparedResult(operationId, prepared);
+        }
       }
       return this.reconcileOperation(operationId, prepared, existing !== undefined, false);
     }, operationId);
+  }
+
+  private async prepareMutation(
+    operationId: string,
+    index: WorkspaceIdIndex,
+    prepare: (index: WorkspaceIdIndex) => Promise<PreparedMutation>,
+  ): Promise<PreparedMutation> {
+    try {
+      return await prepare(index);
+    } catch (error) {
+      if (error instanceof WorkspaceRepositoryError && error.code === 'workspace_conflict') {
+        await this.appendConflictInbox(operationId, error.message).catch(nested => {
+          error.detail = { inboxAppendError: String(nested) };
+        });
+      }
+      throw error;
+    }
   }
 
   private async reconcileOperation(
@@ -723,6 +880,7 @@ export class WorkspaceRepository {
     index: WorkspaceIdIndex,
   ): Promise<PreparedMutation> {
     const kind = kindFromId(targetId);
+    validateRecordPatch(kind, patch);
     const relativePath = this.activeRecordPath(index, kind, targetId);
     this.assertGitPathClean(relativePath);
     const loaded = await this.readDocument(kind, relativePath);
@@ -737,11 +895,34 @@ export class WorkspaceRepository {
       && patch.fields.created_at !== record.fields.created_at) {
       throw new WorkspaceRepositoryError('immutable_created_at', 'created_at cannot be changed');
     }
+    if (kind === 'memory' && record.fields.sensitivity === 'sensitive') {
+      throw new WorkspaceRepositoryError(
+        'confirmation_unavailable',
+        'Sensitive memory confirmation is unavailable for direct mutations',
+      );
+    }
     if (patch.title !== undefined) record.title = patch.title;
     if (patch.body !== undefined) record.body = patch.body;
     Object.assign(record.fields, patch.fields ?? {});
     record.fields.updated_at = timestampInSeoul(this.now());
+    if (kind === 'memory' && record.fields.sensitivity === 'sensitive') {
+      throw new WorkspaceRepositoryError(
+        'confirmation_unavailable',
+        'Sensitive memory confirmation is unavailable for direct mutations',
+      );
+    }
+    validateRecord(record);
     const contents = serializeDocument(loaded.document);
+    const roundTrip = parseDocument(kind, contents);
+    const roundTripTargets = roundTrip.records.filter(candidate => candidate.id === targetId);
+    if (roundTrip.records.length !== loaded.document.records.length
+      || roundTripTargets.length !== 1
+      || stableJson(recordSemantics(roundTripTargets[0]!)) !== stableJson(recordSemantics(record))) {
+      throw new WorkspaceRepositoryError(
+        'update_roundtrip_failed',
+        `updated record ${targetId} did not survive Markdown round-trip`,
+      );
+    }
     return this.preparedMutation(operationId, 'update-record', record, [
       this.preparedFile(relativePath, loaded.text, contents),
     ]);
@@ -768,6 +949,13 @@ export class WorkspaceRepository {
     const recordIndex = active.document.records.findIndex(record => record.id === targetId);
     if (recordIndex < 0) {
       throw new WorkspaceRepositoryError('record_not_found', `record ${targetId} was not found`);
+    }
+    if (kind === 'memory'
+      && active.document.records[recordIndex]!.fields.sensitivity === 'sensitive') {
+      throw new WorkspaceRepositoryError(
+        'confirmation_unavailable',
+        'Sensitive memory confirmation is unavailable for direct mutations',
+      );
     }
     const [record] = active.document.records.splice(recordIndex, 1);
     record.fields.updated_at = timestampInSeoul(this.now());
@@ -1328,26 +1516,41 @@ export class WorkspaceRepository {
       `--grep=Assistant-Operation-Id: ${operationId}`,
     ]);
     const trailer = `Assistant-Operation-Id: ${operationId}`;
-    const candidates: string[] = [];
+    const recoveryProof = 'Assistant-Recovery-Proof: exact-tree';
+    const candidates: Array<{ commit: string; body: string }> = [];
     for (const entry of output.split('\x1e')) {
       const [commit, body = ''] = entry.trim().split('\x1f', 2);
-      if (commit && body.split(/\r?\n/).includes(trailer)) candidates.push(commit);
+      if (commit && body.split(/\r?\n/).includes(trailer)) candidates.push({ commit, body });
     }
-    if (candidates.length !== 1) return undefined;
-    const [candidate] = candidates;
-    try {
-      this.git(['merge-base', '--is-ancestor', candidate, 'HEAD']);
-      const preparedPaths = new Set(prepared.files.map(file => file.relativePath));
-      const changedPaths = new Set(this.git([
-        'diff-tree', '--no-commit-id', '--name-only', '-r', `${candidate}^!`,
-      ]).split(/\r?\n/).filter(Boolean));
-      if ([...preparedPaths].some(path => !changedPaths.has(path))) return undefined;
-      if ([...changedPaths].some(path => this.isManagedOperationPath(path)
-        && !preparedPaths.has(path))) return undefined;
-      for (const file of prepared.files) {
-        const contents = this.gitRaw(['show', `${candidate}:${file.relativePath}`]);
-        if (sha256(contents) !== file.afterHash) return undefined;
+    const preparedPaths = new Set(prepared.files.map(file => file.relativePath));
+    const validCandidates: string[] = [];
+    for (const candidate of candidates) {
+      try {
+        this.git(['merge-base', '--is-ancestor', candidate.commit, 'HEAD']);
+        const changedPaths = new Set(this.git([
+          'diff-tree', '--no-commit-id', '--name-only', '-r', `${candidate.commit}^!`,
+        ]).split(/\r?\n/).filter(Boolean));
+        const exactPreparedChange = changedPaths.size === preparedPaths.size
+          && [...preparedPaths].every(path => changedPaths.has(path));
+        const exactTreeRecoveryProof = changedPaths.size === 0
+          && candidate.body.split(/\r?\n/).includes(recoveryProof);
+        if (!exactPreparedChange && !exactTreeRecoveryProof) continue;
+        let blobsMatch = true;
+        for (const file of prepared.files) {
+          const contents = this.gitRaw(['show', `${candidate.commit}:${file.relativePath}`]);
+          if (sha256(contents) !== file.afterHash) {
+            blobsMatch = false;
+            break;
+          }
+        }
+        if (blobsMatch) validCandidates.push(candidate.commit);
+      } catch {
+        // Unreachable commits and missing/mismatched blobs are not valid recovery proof.
       }
+    }
+    if (validCandidates.length !== 1) return undefined;
+    const [candidate] = validCandidates;
+    try {
       const status = this.git([
         'status', '--porcelain=v1', '--untracked-files=all', '--', ...preparedPaths,
       ]);
@@ -1357,26 +1560,15 @@ export class WorkspaceRepository {
     }
   }
 
-  private isManagedOperationPath(relativePath: string): boolean {
-    return /^(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md$/.test(relativePath)
-      || /^archive\/(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md$/.test(relativePath)
-      || /^(?:memory|archive)\/\d{4}-\d{2}-\d{2}\.md$/.test(relativePath);
-  }
-
   private commitPrepared(operationId: string, prepared: PreparedMutation): string {
     const paths = prepared.files.map(file => file.relativePath);
     const status = this.git(['status', '--porcelain=v1', '--untracked-files=all', '--', ...paths]);
-    if (status.length === 0) {
-      throw new WorkspaceRepositoryError(
-        'operation_reconcile_conflict',
-        `operation ${operationId} has no exact-path Git change to commit`,
-      );
-    }
-    this.git(['add', '--', ...paths]);
+    if (status.length > 0) this.git(['add', '--', ...paths]);
     this.git([
-      'commit', '--quiet', '--only',
+      'commit', '--quiet', '--only', ...(status.length === 0 ? ['--allow-empty'] : []),
       '-m', `assistant: ${prepared.action} ${prepared.result.id}`,
       '-m', `Assistant-Operation-Id: ${operationId}`,
+      ...(status.length === 0 ? ['-m', 'Assistant-Recovery-Proof: exact-tree'] : []),
       '--', ...paths,
     ]);
     return this.git(['rev-parse', 'HEAD']);

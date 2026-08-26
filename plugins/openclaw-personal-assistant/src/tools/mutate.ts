@@ -14,6 +14,7 @@ import {
   type MutationResult,
   type RecordPatch,
   validateAddRecordInput,
+  validateRecordPatch,
 } from '../workspace/repository.js';
 import {
   AssistantToolError,
@@ -53,9 +54,9 @@ const taskFieldsSchema = Type.Object({
 const studyFieldsSchema = Type.Object({
   status: Type.Optional(workStatusSchema),
   subject: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
-  target_amount: Type.Optional(Type.Integer({ minimum: 1 })),
+  target_amount: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
   unit: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
-  progress: Type.Optional(Type.Integer({ minimum: 0 })),
+  progress: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
   target_date: Type.Optional(dateSchema),
   recurrence: Type.Optional(Type.Union([
     Type.Literal('none'), Type.Literal('daily'), Type.Literal('weekly'),
@@ -210,6 +211,7 @@ export function createMutationTool(
       }
       if (params.action !== 'add') assertTargetMatchesRecordType(params.targetId, params.recordType);
       let addInput: AddRecordInput | undefined;
+      let patch: RecordPatch | undefined;
       if (params.action === 'add') {
         addInput = addInputFromParameters(params);
         validateAddRecordInput(addInput);
@@ -219,6 +221,15 @@ export function createMutationTool(
             'Sensitive memory confirmation is unavailable for direct tool requests',
           );
         }
+      } else if (params.action === 'modify') {
+        patch = {
+          ...(params.title === undefined ? {} : { title: params.title }),
+          ...(params.body === undefined ? {} : { body: params.body }),
+          ...(params.fields === undefined
+            ? {}
+            : { fields: params.fields as Partial<AssistantRecord> }),
+        };
+        validateRecordPatch(params.recordType, patch);
       }
       signal?.throwIfAborted();
 
@@ -233,14 +244,7 @@ export function createMutationTool(
             result = await repository.addRecord(params.operationId, addInput!);
           }
         } else if (params.action === 'modify') {
-          const patch: RecordPatch = {
-            ...(params.title === undefined ? {} : { title: params.title }),
-            ...(params.body === undefined ? {} : { body: params.body }),
-            ...(params.fields === undefined
-              ? {}
-              : { fields: params.fields as Partial<AssistantRecord> }),
-          };
-          result = await repository.updateRecord(params.operationId, params.targetId, patch);
+          result = await repository.updateRecord(params.operationId, params.targetId, patch!);
         } else {
           result = await repository.archiveRecord(params.operationId, params.targetId, params.reason);
         }
