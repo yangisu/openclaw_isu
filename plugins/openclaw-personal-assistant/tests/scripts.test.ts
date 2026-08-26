@@ -61,6 +61,11 @@ describe('deployment scripts', () => {
     'AC-01', 'AC-02', 'AC-03', 'AC-07', 'AC-08', 'AC-12', 'AC-13',
     'AC-14', 'AC-15', 'AC-23', 'AC-25', 'AC-26', 'AC-27', 'AC-32',
   ];
+  const acceptanceNotVerifiedCriteria = [
+    ...liveCriteria,
+    'AC-05', 'AC-09',
+    'AC-18', 'AC-20', 'AC-29',
+  ].sort();
 
   it.each(liveCriteria)('keeps %s unsupported in both production producer and validator', criterionId => {
     const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-unsupported-'));
@@ -395,10 +400,7 @@ describe('deployment scripts', () => {
     const result = spawnSync(gitBash, [acceptance, '--non-live'], { cwd: repo, encoding: 'utf8', timeout: 200_000 });
     expect(result.status).toBe(0);
     const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-    expect(summary.total).toBe(32);
-    expect(summary.fail).toBe(0);
-    expect(summary.pass).toBeGreaterThan(0);
-    expect(summary.notVerified).toBeGreaterThan(0);
+    expect(summary).toMatchObject({ total: 32, pass: 13, fail: 0, notVerified: 19 });
     const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
     expect(index.criteria).toHaveLength(32);
     expect(index.criteria.every((item: Record<string, unknown>) =>
@@ -406,8 +408,17 @@ describe('deployment scripts', () => {
       && ['PASS', 'FAIL', 'NOT_VERIFIED'].includes(String(item.status))
       && /^[0-9a-f]{64}$/.test(String(item.stdoutSha256))
       && /^[0-9a-f]{64}$/.test(String(item.stderrSha256)))).toBe(true);
-    expect(index.criteria.filter((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED')
-      .every((item: Record<string, unknown>) => item.exitCode === 125)).toBe(true);
+    const notVerified = index.criteria.filter((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED');
+    expect(notVerified.map((item: Record<string, unknown>) => String(item.criterionId)).sort())
+      .toEqual(acceptanceNotVerifiedCriteria);
+    expect(notVerified.every((item: Record<string, unknown>) => item.exitCode === 125)).toBe(true);
+    expect(index.criteria.filter((item: Record<string, unknown>) =>
+      ['AC-18', 'AC-20', 'AC-29'].includes(String(item.criterionId))))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ criterionId: 'AC-18', status: 'NOT_VERIFIED', exitCode: 125 }),
+        expect.objectContaining({ criterionId: 'AC-20', status: 'NOT_VERIFIED', exitCode: 125 }),
+        expect.objectContaining({ criterionId: 'AC-29', status: 'NOT_VERIFIED', exitCode: 125 }),
+      ]));
     if (process.platform === 'win32') {
       const artifactDir = dirname(resolve(repo, summary.index)).replaceAll("'", "''");
       const acl = spawnSync('pwsh', ['-NoProfile', '-Command',
@@ -434,8 +445,11 @@ describe('deployment scripts', () => {
       });
       expect(result.status).toBe(2);
       const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-      expect(summary).toMatchObject({ total: 32, fail: 0, notVerified: 16 });
+      expect(summary).toMatchObject({ total: 32, pass: 13, fail: 0, notVerified: 19 });
       const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
+      expect(index.criteria.filter((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED')
+        .map((item: Record<string, unknown>) => String(item.criterionId)).sort())
+        .toEqual(acceptanceNotVerifiedCriteria);
       expect(index.criteria.filter((item: Record<string, unknown>) => liveCriteria.includes(String(item.criterionId))))
         .toHaveLength(14);
       expect(index.criteria.filter((item: Record<string, unknown>) => liveCriteria.includes(String(item.criterionId)))

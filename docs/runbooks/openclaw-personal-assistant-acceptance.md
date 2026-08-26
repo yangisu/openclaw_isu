@@ -10,7 +10,7 @@ From the repository root:
 bash scripts/wsl/run-acceptance.sh --non-live
 ```
 
-The runner creates an owner-private `artifacts/acceptance/<UTC>/` directory. `index.json` contains exactly `AC-01` through `AC-32`. Every criterion records a redacted command description, numeric exit code, `PASS|FAIL|NOT_VERIFIED`, SHA-256 for redacted stdout and stderr, an observed artifact path, and a timestamp. Raw command output is removed. A non-live run succeeds only when every safe check passes; all live-only rows remain `NOT_VERIFIED`, never `PASS`.
+The runner creates an owner-private `artifacts/acceptance/<UTC>/` directory. `index.json` contains exactly `AC-01` through `AC-32`. Every criterion records a redacted command description, numeric exit code, `PASS|FAIL|NOT_VERIFIED`, SHA-256 for redacted stdout and stderr, an observed artifact path, and a timestamp. Raw command output is removed. A non-live run succeeds only when every executed check passes; live-only rows and known production-integration gaps remain `NOT_VERIFIED`, never `PASS`.
 
 Generated acceptance artifacts are intentionally Git-ignored. Treat them as local audit material and move the final redacted evidence bundle to an owner-controlled location if it must survive checkout cleanup.
 
@@ -46,7 +46,13 @@ The following observations are still required by the approved design. They are m
 - `AC-23`: actual observations at Asia/Seoul 08:00 and 22:00, absence at 23:00, `staggerMs: 0`, and no catch-up/replay after sleep.
 - `AC-31` is a non-live retention contract: only verified archives older than 30 days are eligible, at least two recovery points remain, and symlink/junction targets are rejected. Separately record protected NTFS ACL, current-user plus Administrators only, production same-open-handle deletion, device identity, and physical-media availability before enabling retention on the target.
 
-The local test evidence covers the remaining safe criteria, including owner authorization, crash recovery, outbox state transitions, untrusted-content isolation, warning deduplication, Markdown round trips, exact one-byte backup corruption, and retention boundaries. `AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: update/delete tools are absent, but an executable response path has not yet proven the exact Naver-app guidance. Review each artifact rather than relying only on summary counts.
+The local test evidence covers the remaining safe component contracts, including owner authorization, outbox state transitions, untrusted-content isolation, warning deduplication, Markdown round trips, exact one-byte backup corruption, and retention boundaries. Component tests are diagnostic evidence only when the acceptance criterion also requires production wiring. In particular, a green unit test cannot promote these rows:
+
+- `AC-18` remains `NOT_VERIFIED` until the built plugin's production startup path recovers and reconciles the durable calendar outbox, with an owner warning sink, without duplicate creation or premature success.
+- `AC-20` remains `NOT_VERIFIED` until the built plugin runtime connects OAuth refresh and CalDAV failures to the durable calendar-only gate and owner-facing reason while local functions stay available.
+- `AC-29` remains `NOT_VERIFIED` until the built plugin's production startup path invokes stale-submission recovery without replay and confirmation consumption is bound to that runtime flow.
+
+`AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: update/delete tools are absent, but an executable response path has not yet proven the exact Naver-app guidance. Review each artifact rather than relying only on summary counts.
 
 ## Final gate
 

@@ -56,11 +56,11 @@ Earlier isolated package-local runtime inspection linked the built plugin into a
 
 The latest safe acceptance evidence contained exactly 32 stable IDs (`AC-01` through `AC-32`):
 
-- PASS: 16 non-live criteria
+- PASS: 13 non-live criteria
 - FAIL: 0
-- NOT_VERIFIED: 16 criteria (14 live-only criteria and 2 honestly unverified product gaps)
+- NOT_VERIFIED: 19 criteria (14 live-only criteria and 5 honestly unverified production gaps)
 
-All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-05 and AC-09 also remain NOT_VERIFIED because the current product does not implement every mutation kind or executable-response boundary those criteria require. The runner always records all 14 live rows as NOT_VERIFIED/125; `--all`, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, and arbitrary evidence cannot promote them. Generated `artifacts/acceptance/*` directories are deleted after verification and remain ignored.
+All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-05 and AC-09 also remain NOT_VERIFIED because the current product does not implement every mutation kind or executable-response boundary those criteria require. AC-18, AC-20, and AC-29 remain NOT_VERIFIED because passing component state-machine tests do not prove the missing built-plugin startup reconciliation, runtime OAuth/CalDAV gate, warning, and no-replay wiring. The runner always records all 14 live rows as NOT_VERIFIED/125; `--all`, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, and arbitrary evidence cannot promote them. Generated `artifacts/acceptance/*` directories are deleted after verification and remain ignored.
 
 ## Security and operational notes
 
@@ -73,7 +73,7 @@ All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Tele
 
 ## Concerns / deferred evidence
 
-There are no known non-live test failures. All 14 live acceptance criteria remain automated-unsupported and cannot be accepted by the runner until authoritative product commands or an attestation API are implemented. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
+There are no known non-live test failures in completed verification. AC-05, AC-09, AC-18, AC-20, and AC-29 remain explicit non-live production gaps rather than false PASS results. All 14 live acceptance criteria remain automated-unsupported and cannot be accepted by the runner until authoritative product commands or an attestation API are implemented. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
 
 ## Review fix round 1
 
@@ -206,3 +206,24 @@ npm run typecheck; npm run build; npm test
 Exit 0; typecheck and build passed; 21/21 test files and 408/408 tests passed in 313.73 seconds. The full suite includes the hostile `--all` regression.
 
 The standalone non-live run exited 0 with exactly 32 unique rows: 16 PASS, 0 FAIL, and 16 NOT_VERIFIED; all NOT_VERIFIED rows used exit 125 and every live row was NV125. Package-local OpenClaw 2026.7.1 plugin validation passed. Fresh isolated runtime inspection again exposed exactly five optional tools: `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. No live state or external service was used.
+
+## Phase 1A acceptance honesty
+
+The acceptance result was reconciled against the production wiring review. `AC-18`, `AC-20`, and `AC-29` no longer treat green component/state-machine tests as evidence that the built plugin performs startup outbox reconciliation, runtime OAuth/CalDAV gate propagation and owner warning, or restart recovery without replay. The runner still executes the focused component tests, but a successful command is deliberately recorded as `NOT_VERIFIED` with exit code 125 until those production paths and built-plugin integration evidence exist. A component failure remains a real `FAIL`.
+
+TDD RED was observed before changing the runner:
+
+```text
+npm test -- tests/scripts.test.ts -t "non-live acceptance emits exactly 32 criterion records"
+```
+
+The current runner returned 32 rows with 16 PASS and 16 NOT_VERIFIED, so the new exact expectation of 13 PASS and 19 NOT_VERIFIED failed. After the fail-closed change, the same focused test passed, and the hostile `--all` focused test also passed. The complete deployment-script suite passed 44/44 tests in 138.23 seconds.
+
+Integrated acceptance verification:
+
+```text
+C:\Program Files\Git\bin\bash.exe scripts/wsl/run-acceptance.sh --non-live
+C:\Program Files\Git\bin\bash.exe scripts/wsl/run-acceptance.sh --all
+```
+
+Both runs produced exactly 32 ordered criterion rows: 13 PASS, 0 FAIL, and 19 NOT_VERIFIED. Every NOT_VERIFIED row used exit code 125. The NOT_VERIFIED set is the 14 automated-unsupported live criteria plus `AC-05`, `AC-09`, `AC-18`, `AC-20`, and `AC-29`. `--non-live` exited 0 because no executed check failed; `--all` exited 2 because unresolved rows remain. No live state, credentials, services, configuration, or external system was touched.
