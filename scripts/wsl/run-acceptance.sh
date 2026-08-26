@@ -75,10 +75,11 @@ not_verified() {
 
 run_live_evidence() {
   local id="$1" title="$2" evidence_dir="${LIVE_EVIDENCE_DIR:-}" raw_out raw_err out err code=125 status=NOT_VERIFIED observed
-  if [[ "$MODE" != --all || "${LIVE_TEST:-0}" != 1 || -z "$evidence_dir" ]]; then
-    not_verified "$id" "$title" 'LIVE_TEST=1 and an absolute private LIVE_EVIDENCE_DIR with explicit target evidence are required.'
+  if [[ "$MODE" != --all || "${LIVE_TEST:-0}" != 1 ]]; then
+    not_verified "$id" "$title" 'Automated live PASS is unsupported pending an authoritative product result or attestation API.'
     return
   fi
+  evidence_dir="${evidence_dir:-$ARTIFACT_DIR}"
   raw_out="$ARTIFACT_DIR/$id.stdout.raw"; raw_err="$ARTIFACT_DIR/$id.stderr.raw"
   out="$ARTIFACT_DIR/$id.stdout.redacted"; err="$ARTIFACT_DIR/$id.stderr.redacted"
   : >"$raw_out"; : >"$raw_err"
@@ -87,11 +88,11 @@ run_live_evidence() {
     code=0
     observed="$(node -e 'const fs=require("node:fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.observedArtifactPath)' "$raw_out")"
   else
-    printf '%s\n' "explicit evidence missing or invalid for $id" >"$raw_out"
+    printf '%s\n' "authoritative live attestation unavailable for $id" >"$raw_out"
     observed="$ARTIFACT_REL/$id.stdout.redacted"
   fi
   redact_file "$raw_out" "$out"; redact_file "$raw_err" "$err"; rm -f -- "$raw_out" "$raw_err"
-  write_record "$id" "$title" '[criterion-specific live evidence validation; target command and credentials redacted]' "$code" "$status" "$out" "$err" "$observed"
+  write_record "$id" "$title" '[fail-closed live attestation gate; automated PASS unsupported]' "$code" "$status" "$out" "$err" "$observed"
 }
 
 # Target, credential, time-bound, reboot, and physical-media checks are live-only.

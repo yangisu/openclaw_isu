@@ -1,39 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-const { createHash } = require('node:crypto');
-const { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } = require('node:fs');
-const { isAbsolute, join, relative, resolve } = require('node:path');
-
-const PROTOCOL_VERSION = 3;
-const PRODUCER = 'openclaw-personal-assistant-live-probe/v3';
-const TEST_PRODUCER = 'openclaw-personal-assistant-live-probe-test-adapter/v3';
-const MAX_EVIDENCE_BYTES = 1024 * 1024;
-const MAX_RAW_BYTES = 1024 * 1024;
-
-const unsupportedIds = ['AC-02', 'AC-03', 'AC-07', 'AC-08', 'AC-13', 'AC-14', 'AC-15', 'AC-23', 'AC-25', 'AC-26', 'AC-27', 'AC-32'];
-const requirements = {
-  'AC-01': { supported: true, phases: ['single'], probeId: 'ocpa-live-ac01-v3', adapter: 'system-health-v1', commands: ['os-release', 'pid1', 'gateway-active'] },
-  'AC-12': { supported: true, phases: ['before-restart', 'after-restart'], probeId: 'ocpa-live-ac12-v3', adapter: 'restart-health-v1', commands: ['windows-boot-id', 'wsl-boot-id', 'gateway-active'] },
-  ...Object.fromEntries(unsupportedIds.map(id => [id, { supported: false, phases: [], probeId: `ocpa-live-${id.toLowerCase().replace('-', '')}-v3`, adapter: 'unsupported' }])),
-};
-
-const targetImplementationSha256 = sha256(readFileSync(join(__dirname, 'live-probe-target.js')));
-
-const PROBES = Object.fromEntries(Object.entries(requirements).map(([criterionId, value]) => {
-  const command = { executable: 'node', argv: ['scripts/wsl/live-probe-target.js', '--criterion', criterionId, '--phase', '<phase>'] };
-  const base = { criterionId, probeId: value.probeId, supported: value.supported, adapter: value.adapter,
-    phases: value.phases, commands: value.commands ?? [], command, targetImplementationSha256 };
-  return [criterionId, { ...value, command, digest: sha256(canonical(base)) }];
-}));
-
-function canonical(value) {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
-  return JSON.stringify(value);
-}
-
-function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
+const { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } = require('node:fs');
+const { isAbsolute, relative, resolve } = require('node:path');
 
 function within(root, path) {
   const rel = relative(resolve(root), resolve(path));
@@ -104,88 +73,6 @@ function validateSafeValue(value, canaries = [], state = { nodes: 0, strings: 0 
   }
 }
 
-function validateRaw(criterionId, phase, raw, canaries = []) {
-  const probe = PROBES[criterionId];
-  if (!probe || !probe.supported) throw new Error('probe_unsupported');
-  if (!probe.phases.includes(phase)) throw new Error('probe_invalid');
-  validateSafeValue(raw, canaries);
-  const keys = ['adapter', 'capturedAt', 'commandResults', 'phase', 'probeId'];
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).sort().join('\0') !== keys.join('\0')
-    || raw.probeId !== probe.probeId || raw.phase !== phase || !fresh(raw.capturedAt)
-    || raw.adapter !== probe.adapter || !Array.isArray(raw.commandResults)
-    || raw.commandResults.length !== probe.commands.length) throw new Error('raw_invalid');
-  for (let index = 0; index < probe.commands.length; index += 1) {
-    const result = raw.commandResults[index];
-    if (!result || typeof result !== 'object' || Array.isArray(result)
-      || Object.keys(result).sort().join('\0') !== 'commandId\0exitCode\0stdoutLines'
-      || result.commandId !== probe.commands[index] || result.exitCode !== 0
-      || !Array.isArray(result.stdoutLines) || result.stdoutLines.length < 1 || result.stdoutLines.length > 128
-      || result.stdoutLines.some(line => typeof line !== 'string' || line.length > 4096)) throw new Error('command_result_invalid');
-  }
-  return raw;
-}
-
-function deriveObservations(criterionId, rawByPhase) {
-  const probe = PROBES[criterionId];
-  if (!probe || !probe.supported) throw new Error('probe_unsupported');
-  if (Object.keys(rawByPhase).sort().join('\0') !== [...probe.phases].sort().join('\0')) throw new Error('phases_incomplete');
-  for (const phase of probe.phases) validateRaw(criterionId, phase, rawByPhase[phase]);
-  if (criterionId === 'AC-01') {
-    const commands = commandMap(rawByPhase.single);
-    const release = parseOsRelease(commands.get('os-release'));
-    const observations = {
-      ubuntuVersion: release.VERSION_ID,
-      systemdPid1: commands.get('pid1').trim() === 'systemd',
-      gatewayActive: commands.get('gateway-active').trim() === 'active',
-    };
-    if (release.ID !== 'ubuntu' || observations.ubuntuVersion !== '24.04'
-      || !observations.systemdPid1 || !observations.gatewayActive) throw new Error('criterion_not_observed');
-    return observations;
-  }
-  if (criterionId === 'AC-12') {
-    const before = commandMap(rawByPhase['before-restart']); const after = commandMap(rawByPhase['after-restart']);
-    const observations = {
-      windowsRestartRecovered: before.get('windows-boot-id').trim() !== after.get('windows-boot-id').trim(),
-      wslRestartRecovered: before.get('wsl-boot-id').trim() !== after.get('wsl-boot-id').trim(),
-      gatewayActive: after.get('gateway-active').trim() === 'active',
-    };
-    if (![before.get('windows-boot-id'), after.get('windows-boot-id'), before.get('wsl-boot-id'), after.get('wsl-boot-id')]
-      .every(value => /^[A-Za-z0-9._:-]{6,128}\s*$/.test(value)) || !Object.values(observations).every(Boolean)) throw new Error('restart_not_observed');
-    return observations;
-  }
-  throw new Error('probe_unsupported');
-}
-
-function commandMap(raw) { return new Map(raw.commandResults.map(result => [result.commandId, result.stdoutLines.join('\n')])); }
-function parseOsRelease(text) {
-  return Object.fromEntries(text.split(/\r?\n/).filter(line => line.includes('=')).map(line => {
-    const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1).replace(/^"|"$/g, '')];
-  }));
-}
-
-function parseOpenClawAuditPage(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('audit_invalid');
-  const keys = Object.keys(value).sort().join('\0');
-  if (keys !== 'events' && keys !== 'events\0nextCursor') throw new Error('audit_invalid');
-  if (!Array.isArray(value.events) || value.events.length > 500
-    || (value.nextCursor !== undefined && !/^[1-9][0-9]*$/.test(value.nextCursor))) throw new Error('audit_invalid');
-  for (const event of value.events) {
-    if (!event || typeof event !== 'object' || Array.isArray(event)
-      || !Number.isSafeInteger(event.occurredAt) || typeof event.action !== 'string'
-      || !['agent_run', 'tool_action'].includes(event.kind)
-      || !['started', 'succeeded', 'failed', 'cancelled', 'timed_out', 'blocked', 'unknown'].includes(event.status)
-      || event.redaction !== 'metadata_only') throw new Error('audit_invalid');
-  }
-  return value.events;
-}
-
-function fresh(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return false;
-  const time = new Date(value).valueOf();
-  return Number.isFinite(time) && Date.now() - time <= 24 * 3_600_000 && time - Date.now() <= 5 * 60_000;
-}
-
 module.exports = {
-  MAX_EVIDENCE_BYTES, MAX_RAW_BYTES, PRODUCER, PROBES, PROTOCOL_VERSION, TEST_PRODUCER,
-  canonical, deriveObservations, fresh, parseOpenClawAuditPage, secureReadFile, sha256, validateRaw, validateSafeValue, within,
+  secureReadFile, validateSafeValue,
 };

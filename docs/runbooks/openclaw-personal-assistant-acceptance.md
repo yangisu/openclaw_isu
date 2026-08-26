@@ -16,39 +16,27 @@ Generated acceptance artifacts are intentionally Git-ignored. Treat them as loca
 
 ## Live evidence rules
 
-Live work must be performed on the target PC. Never hand-write or edit an `AC-XX.json` envelope. The only authorized producer is `scripts/wsl/run-live-probe.js`, which executes a supported fixed criterion/phase command, derives observations from bounded structured command output, and writes the raw records, stateful ledger, hashes, target identity, and final evidence. The validator independently reopens nothing by path after its bounded no-follow read, verifies stable file identity and privacy, checks the fixed probe ID/digest, and re-derives every observation from the raw records.
+All 14 live criteria (`AC-01`, `AC-02`, `AC-03`, `AC-07`, `AC-08`, `AC-12`, `AC-13`, `AC-14`, `AC-15`, `AC-23`, `AC-25`, `AC-26`, `AC-27`, and `AC-32`) are currently unsupported for automated PASS. Installed OpenClaw 2026.7.1 has no authoritative criterion-result or attestation API. Its audit page is metadata-only (`{events,nextCursor?}` with fields such as `action`, `toolName`, and `occurredAt`) and cannot prove command output, message delivery, calendar outcome, reboot recovery, backup integrity, or restoration.
 
-Automated live evidence is currently supported only for `AC-01` (direct `/etc/os-release`, PID 1, and user Gateway service output) and `AC-12` (direct before/after Windows and WSL boot identities plus Gateway service output). OpenClaw 2026.7.1 `audit --json` returns `{events,nextCursor?}` metadata with `action`, `toolName`, and `occurredAt`, but deliberately contains no tool arguments, results, command output, message content, or calendar/backup verification result. It therefore cannot prove the other live criteria. `AC-02`, `AC-03`, `AC-07`, `AC-08`, `AC-13`, `AC-14`, `AC-15`, `AC-23`, `AC-25`, `AC-26`, `AC-27`, and `AC-32` are explicitly unsupported by this producer: invocation exits 125, writes no PASS evidence, and cannot be supplemented with operator JSON, text, environment assertions, or an audit event. They remain `NOT_VERIFIED` until a future approved product command emits authoritative criterion-specific structured results.
+Consequently, `scripts/wsl/run-live-probe.js` writes no evidence and exits 125 for every live criterion. `scripts/wsl/validate-live-evidence.js` also exits 125 without accepting any file. Operator-authored JSON, raw output, ledgers, hashes, target identities, environment flags, test adapters, or PATH substitutions cannot promote a row. Automated PASS remains disabled until an approved product command or attestation API provides authoritative criterion-specific results.
 
-Create the evidence directory and optional canary list locally. Canary values and credentials must never be command arguments:
+The following command demonstrates the fail-closed state; it returns `NOT_VERIFIED` with exit 125 and creates no PASS artifact:
 
 ```bash
 install -d -m 700 /absolute/private/live-evidence
-install -m 600 /dev/stdin /absolute/private/live-canaries
-export OCPA_LIVE_CANARY_FILE=/absolute/private/live-canaries
 node scripts/wsl/run-live-probe.js --criterion AC-01 --output-dir /absolute/private/live-evidence
 ```
-
-For supported `AC-12`, run `before-restart`, restart Windows and WSL, then run `after-restart`. The producer records `NOT_VERIFIED` and exits 125 until both direct-command phases are present; it emits final PASS evidence only after both boot identities changed and the Gateway is active.
-
-Example phase invocation:
-
-```bash
-node scripts/wsl/run-live-probe.js --criterion AC-12 --phase before-restart --output-dir /absolute/private/live-evidence
-```
-
-The producer and validator reject unknown fields, secret-bearing keys at any nesting depth, credential-shaped values, canaries, credential URLs, symlinks, non-private files, oversized input, stale evidence, path swaps, wrong IDs/digests, missing phases, and raw/evidence hash mismatches. `--test-adapter` evidence is explicitly test-only and is never accepted by the acceptance runner.
 
 ```bash
 LIVE_TEST=1 LIVE_EVIDENCE_DIR=/absolute/private/live-evidence \
   bash scripts/wsl/run-acceptance.sh --all
 ```
 
-`--all` without `LIVE_TEST=1`, without the evidence directory, or with any missing/invalid live evidence exits nonzero and records the affected rows as `NOT_VERIFIED`. It never promotes a skipped check to PASS.
+`--all` exits nonzero and records all live rows as `NOT_VERIFIED`, even with `LIVE_TEST=1` and a populated evidence directory. It never promotes a skipped or operator-asserted check to PASS.
 
 ## Required target observations
 
-The following observations are still required by the approved design, but except for the supported `AC-01` and `AC-12` probes they are operator checkpoints only and cannot promote an acceptance row to PASS with the current product commands. Capture no tokens or passwords:
+The following observations are still required by the approved design. They are manual checkpoints only and cannot promote an acceptance row to PASS with the current product commands. Capture no tokens or passwords:
 
 - `AC-01`, `AC-12`, and `AC-25`: Ubuntu 24.04, systemd PID 1, lingering, the exact current-user Windows startup task, `wsl.exe -d <distro> --exec /bin/sleep infinity`, restart-after-one-minute settings, Gateway active after reboot and 30 idle minutes without interactive login, and a fresh Telegram response.
 - `AC-02` and `AC-26`: a real ChatGPT OAuth Gateway and Telegram model response, injected refresh failure, approval revocation, and confirmed closed behavior after revocation.

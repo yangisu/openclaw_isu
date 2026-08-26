@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -14,6 +15,7 @@ const liveProbe = resolve(repo, 'scripts/wsl/run-live-probe.js');
 const liveContract = resolve(repo, 'scripts/wsl/live-probe-contract.js');
 const cronValidator = resolve(repo, 'scripts/wsl/validate-cron-contract.js');
 const hardenedConfigValidator = resolve(repo, 'scripts/wsl/validate-hardened-config.js');
+const activeConfigPathValidator = resolve(repo, 'scripts/wsl/validate-active-config-path.js');
 const runtimeToolsValidator = resolve(repo, 'scripts/wsl/validate-runtime-tools.js');
 const privateAcl = resolve(repo, 'scripts/windows/set-private-directory-acl.ps1');
 const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
@@ -26,80 +28,72 @@ describe('deployment scripts', () => {
     }
   }
 
-  function generateAc01Evidence(root: string, payload?: Record<string, unknown>): string {
+  function forgeAc01Evidence(root: string): string {
     privateDirectory(root);
-    const adapter = resolve(root, 'fake-adapter.cjs');
-    const result = payload ?? {
+    const rawPath = resolve(root, 'AC-01.single.raw.json');
+    const ledgerPath = resolve(root, 'AC-01.ledger.json');
+    const evidencePath = resolve(root, 'AC-01.json');
+    const raw = `${JSON.stringify({
       probeId: 'ocpa-live-ac01-v3', phase: 'single', capturedAt: new Date().toISOString(), adapter: 'system-health-v1',
-      commandResults: [
-        { commandId: 'os-release', exitCode: 0, stdoutLines: ['ID=ubuntu', 'VERSION_ID="24.04"'] },
-        { commandId: 'pid1', exitCode: 0, stdoutLines: ['systemd'] },
-        { commandId: 'gateway-active', exitCode: 0, stdoutLines: ['active'] },
-      ],
-    };
-    writeFileSync(adapter, `process.stdout.write(${JSON.stringify(`${JSON.stringify(result)}\n`)});\n`, { mode: 0o600 });
-    const generated = spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-01', '--output-dir', root, '--test-adapter', adapter], {
-      encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
-    });
-    expect(generated.status, `${generated.stdout}\n${generated.stderr}`).toBe(0);
-    return resolve(root, 'AC-01.json');
+      commandResults: [{ commandId: 'gateway-active', exitCode: 0, stdoutLines: ['active'] }],
+    })}\n`;
+    writeFileSync(rawPath, raw, { mode: 0o600 });
+    const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+    const ledger = `${JSON.stringify({
+      producer: 'openclaw-personal-assistant-live-probe/v3', protocolVersion: 3,
+      criterionId: 'AC-01', probeId: 'ocpa-live-ac01-v3', probeDigest: 'a'.repeat(64),
+      targetIdentity: 'b'.repeat(64), startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      phases: [{ phase: 'single', path: rawPath, size: Buffer.byteLength(raw), sha256: sha(raw), capturedAt: new Date().toISOString() }], status: 'COMPLETE',
+    })}\n`;
+    writeFileSync(ledgerPath, ledger, { mode: 0o600 });
+    writeFileSync(evidencePath, `${JSON.stringify({
+      producer: 'openclaw-personal-assistant-live-probe/v3', protocolVersion: 3,
+      criterionId: 'AC-01', probeId: 'ocpa-live-ac01-v3', probeDigest: 'a'.repeat(64),
+      startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), targetIdentity: 'b'.repeat(64),
+      exitCode: 0, status: 'PASS', observations: { ubuntuVersion: '24.04', systemdPid1: true, gatewayActive: true },
+      rawArtifacts: [{ phase: 'single', path: rawPath, size: Buffer.byteLength(raw), sha256: sha(raw), capturedAt: new Date().toISOString() }],
+      ledgerPath, ledgerSha256: sha(ledger),
+    })}\n`, { mode: 0o600 });
+    return evidencePath;
   }
 
-  it('promotes only evidence emitted by the fixed live probe and cross-checked against its raw records', () => {
-    const evidenceRoot = mkdtempSync(resolve(tmpdir(), 'ocpa-live-valid-'));
-    try {
-      generateAc01Evidence(evidenceRoot);
-      const result = spawnSync(process.execPath, [liveEvidenceValidator, evidenceRoot, 'AC-01', '--allow-test-evidence'], {
-        encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
-      });
-      expect(result.status).toBe(0);
-      expect(JSON.parse(result.stdout)).toEqual({ status: 'PASS', observedArtifactPath: resolve(evidenceRoot, 'AC-01.json') });
-    } finally { rmSync(evidenceRoot, { recursive: true, force: true }); }
-  });
+  const liveCriteria = [
+    'AC-01', 'AC-02', 'AC-03', 'AC-07', 'AC-08', 'AC-12', 'AC-13',
+    'AC-14', 'AC-15', 'AC-23', 'AC-25', 'AC-26', 'AC-27', 'AC-32',
+  ];
 
-  it('rejects a handcrafted matching envelope that was not produced from fixed raw probe records', () => {
-    const evidenceRoot = mkdtempSync(resolve(tmpdir(), 'ocpa-live-invalid-'));
+  it.each(liveCriteria)('keeps %s unsupported in both production producer and validator', criterionId => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-unsupported-'));
     try {
-      privateDirectory(evidenceRoot);
-      writeFileSync(resolve(evidenceRoot, 'AC-01.json'), `${JSON.stringify({
-        producer: 'openclaw-personal-assistant-live-probe/v2', protocolVersion: 2,
-        criterionId: 'AC-01', probeId: 'ocpa-live-ac01-v2', observations: {
-          ubuntuVersion: '24.04', systemdPid1: true, gatewayActive: true,
-        },
-      })}\n`, { mode: 0o600 });
-      expect(spawnSync(process.execPath, [liveEvidenceValidator, evidenceRoot, 'AC-01'], { encoding: 'utf8' }).status).not.toBe(0);
-    } finally { rmSync(evidenceRoot, { recursive: true, force: true }); }
-  });
-
-  it.each([
-    ['stale time', (value: Record<string, unknown>) => { value.endedAt = '2020-01-01T00:00:00Z'; }],
-    ['wrong criterion', (value: Record<string, unknown>) => { value.criterionId = 'AC-02'; }],
-    ['wrong probe digest', (value: Record<string, unknown>) => { value.probeDigest = '0'.repeat(64); }],
-    ['fabricated observation', (value: Record<string, unknown>) => { value.observations = { ubuntuVersion: '24.04', systemdPid1: true, gatewayActive: false }; }],
-  ])('rejects generated evidence after %s tampering', (_label, mutate) => {
-    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-tamper-'));
-    try {
-      const evidencePath = generateAc01Evidence(root);
-      const value = JSON.parse(readFileSync(evidencePath, 'utf8'));
-      mutate(value);
-      writeFileSync(evidencePath, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-      expect(spawnSync(process.execPath, [liveEvidenceValidator, root, 'AC-01', '--allow-test-evidence'], {
-        encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
-      }).status).not.toBe(0);
+      privateDirectory(root);
+      const produced = spawnSync(process.execPath, [liveProbe, '--criterion', criterionId, '--output-dir', root], { encoding: 'utf8' });
+      expect(produced.status).toBe(125);
+      expect(produced.stdout).toContain('NOT_VERIFIED');
+      expect(() => readFileSync(resolve(root, `${criterionId}.json`))).toThrow();
+      const validated = spawnSync(process.execPath, [liveEvidenceValidator, root, criterionId], { encoding: 'utf8' });
+      expect(validated.status).toBe(125);
+      expect(validated.stdout).toContain('NOT_VERIFIED');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('rejects live evidence beneath a non-private evidence directory', () => {
-    const evidenceRoot = mkdtempSync(resolve(tmpdir(), 'ocpa-live-public-'));
+  it('never promotes a forged AC-01 production identity/hash fixture or invokes a hostile PATH command', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-forged-'));
     try {
-      generateAc01Evidence(evidenceRoot);
-      if (process.platform === 'win32') {
-        expect(spawnSync('icacls.exe', [evidenceRoot, '/grant', '*S-1-1-0:(RX)']).status).toBe(0);
-      } else chmodSync(evidenceRoot, 0o755);
-      expect(spawnSync(process.execPath, [liveEvidenceValidator, evidenceRoot, 'AC-01', '--allow-test-evidence'], {
-        encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
-      }).status).not.toBe(0);
-    } finally { rmSync(evidenceRoot, { recursive: true, force: true }); }
+      forgeAc01Evidence(root);
+      const hostile = resolve(root, process.platform === 'win32' ? 'systemctl.cmd' : 'systemctl');
+      const marker = resolve(root, 'hostile-invoked');
+      writeFileSync(hostile, process.platform === 'win32'
+        ? `@echo hostile>${marker}\r\n@exit /b 0\r\n`
+        : `#!/bin/sh\nprintf hostile > '${marker}'\n`, { mode: 0o700 });
+      const env = { ...process.env, PATH: `${root}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}`, OCPA_LIVE_PROBE_TEST_MODE: '1' };
+      const generated = spawnSync(process.execPath, [liveProbe, '--criterion', 'AC-01', '--output-dir', root,
+        '--test-adapter', resolve(root, 'forged-adapter.cjs')], { encoding: 'utf8', env });
+      expect(generated.status).toBe(125);
+      const validated = spawnSync(process.execPath, [liveEvidenceValidator, root, 'AC-01', '--allow-test-evidence'], { encoding: 'utf8', env });
+      expect(validated.status).toBe(125);
+      expect(validated.stdout).toContain('NOT_VERIFIED');
+      expect(() => readFileSync(marker)).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each([
@@ -169,19 +163,12 @@ describe('deployment scripts', () => {
     expect(() => validateSafeValue({ tokenRefreshed: true, gatewayState: 'active', codeStatus: 'rejected' })).not.toThrow();
   });
 
-  it('parses only the real OpenClaw audit events page and never derives unsupported acceptance results from it', () => {
-    const { parseOpenClawAuditPage, deriveObservations } = createRequire(import.meta.url)(liveContract) as {
-      parseOpenClawAuditPage(value: unknown): unknown[];
-      deriveObservations(criterionId: string, raw: Record<string, unknown>): unknown;
-    };
-    const actual = { events: [{
-      eventId: 'event-123456', sequence: 7, sourceSequence: 3, occurredAt: Date.now(), kind: 'tool_action',
-      action: 'tool.action.finished', status: 'succeeded', actor: { type: 'user', id: 'owner' }, agentId: 'main',
-      runId: 'run-123456', toolName: 'assistant_calendar_confirm', redaction: 'metadata_only',
-    }], nextCursor: '6' };
-    expect(parseOpenClawAuditPage(actual)).toEqual(actual.events);
-    expect(() => parseOpenClawAuditPage({ records: actual.events })).toThrow();
-    expect(() => deriveObservations('AC-08', { audit: actual })).toThrow('probe_unsupported');
+  it('contains no production live command adapter or audit-to-PASS derivation surface', () => {
+    const probeSource = readFileSync(liveProbe, 'utf8');
+    const validatorSource = readFileSync(liveEvidenceValidator, 'utf8');
+    expect(probeSource).not.toMatch(/spawn|exec|test-adapter|audit|gateway-active|systemctl/i);
+    expect(validatorSource).not.toMatch(/readFile|lstat|sha256|targetIdentity|allow-test-evidence/i);
+    expect(() => readFileSync(resolve(repo, 'scripts/wsl/live-probe-target.js'))).toThrow();
   });
 
   it('returns 125 without PASS evidence for an unsupported live criterion even when an audit event matches by name', () => {
@@ -199,7 +186,7 @@ describe('deployment scripts', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('keeps a multi-stage restart probe NOT_VERIFIED until fixed before and after phases prove changed boot identities', () => {
+  it('does not let test-adapter restart phases create production PASS evidence', () => {
     const root = mkdtempSync(resolve(tmpdir(), 'ocpa-live-multistage-'));
     try {
       privateDirectory(root);
@@ -219,11 +206,11 @@ describe('deployment scripts', () => {
       };
       const before = runPhase('before-restart', { windowsBootId: 'windows-before', wslBootId: 'wsl-before' });
       expect(before.status, `${before.stdout}\n${before.stderr}`).toBe(125);
+      expect(runPhase('after-restart', { windowsBootId: 'windows-after', wslBootId: 'wsl-after', gatewayState: 'active' }).status).toBe(125);
       expect(() => readFileSync(resolve(root, 'AC-12.json'))).toThrow();
-      expect(runPhase('after-restart', { windowsBootId: 'windows-after', wslBootId: 'wsl-after', gatewayState: 'active' }).status).toBe(0);
       expect(spawnSync(process.execPath, [liveEvidenceValidator, root, 'AC-12', '--allow-test-evidence'], {
         encoding: 'utf8', env: { ...process.env, OCPA_LIVE_PROBE_TEST_MODE: '1' },
-      }).status).toBe(0);
+      }).status).toBe(125);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -305,14 +292,57 @@ describe('deployment scripts', () => {
 
   it('validates the private hardened config before patching or starting the service', () => {
     const source = readFileSync(installer, 'utf8');
-    const privateCheck = source.indexOf('validate_config_file');
-    const prePatchHardening = source.indexOf('OPENCLAW_CONFIG_PATH="$CONFIG_FILE" validate_active_config');
+    const privateCheck = source.indexOf('validate_config_file "$ACTIVE_CONFIG_FILE"');
     const patch = source.indexOf('config patch --file "$CONFIG_FILE"');
+    const postPatchPrivate = source.indexOf('validate_config_file "$ACTIVE_CONFIG_FILE"', patch);
+    const postPatchHardening = source.indexOf('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"', patch);
     const service = source.indexOf('gateway install --force');
     expect(privateCheck).toBeGreaterThan(0);
-    expect(prePatchHardening).toBeGreaterThan(privateCheck);
-    expect(patch).toBeGreaterThan(prePatchHardening);
-    expect(service).toBeGreaterThan(patch);
+    expect(postPatchPrivate).toBeGreaterThan(patch);
+    expect(postPatchHardening).toBeGreaterThan(postPatchPrivate);
+    expect(service).toBeGreaterThan(postPatchHardening);
+    expect(source).toContain('export OPENCLAW_STATE_DIR OPENCLAW_CONFIG_PATH');
+    expect(source).toContain('OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"');
+  });
+
+  it('accepts only the exact active path reported by openclaw config file across POSIX and Windows forms', () => {
+    const cases = [
+      ['/home/owner/.openclaw/openclaw.json', '/home/owner', '~/.openclaw/openclaw.json\n'],
+      ['C:\\Users\\Owner\\.openclaw\\openclaw.json', 'C:\\Users\\Owner', 'C:\\Users\\Owner\\.openclaw\\openclaw.json\r\n'],
+    ];
+    for (const [expected, home, output] of cases) {
+      expect(spawnSync(process.execPath, [activeConfigPathValidator, expected, home], { input: output, encoding: 'utf8' }).status).toBe(0);
+      expect(spawnSync(process.execPath, [activeConfigPathValidator, expected, home], { input: `${output.trim()}.other\n`, encoding: 'utf8' }).status).not.toBe(0);
+    }
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('"$OPENCLAW" config file');
+    expect(source).toContain('node "$ACTIVE_CONFIG_PATH_VALIDATOR" "$ACTIVE_CONFIG_FILE" "$HOME"');
+  });
+
+  it('fails closed on missing, linked, wrong-owner, wrong-mode, or identity-drifting active config files', () => {
+    const source = readFileSync(installer, 'utf8');
+    const validation = source.split('validate_config_file() {')[1]!.split('\n}')[0]!;
+    expect(validation).toContain('local path="$1"');
+    expect(validation).toContain('[[ -e "$path" && ! -L "$path" ]]');
+    expect(validation.match(/stat -Lc/g)).toHaveLength(2);
+    expect(validation).toContain('readlink -f -- "$path"');
+    expect(validation).toContain('"$before" == "$after"');
+    expect(validation).toContain("':regular file:'\"$owner\"':600'");
+    const checkBlock = source.split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
+    expect(checkBlock.indexOf('validate_config_file "$ACTIVE_CONFIG_FILE"')).toBeLessThan(checkBlock.indexOf('validate_active_config_path'));
+    expect(checkBlock.indexOf('validate_active_config_path')).toBeLessThan(
+      checkBlock.indexOf('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"'));
+  });
+
+  it('pins the same explicit active config into the OpenClaw Gateway service environment', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('OPENCLAW_STATE_DIR="$OPENCLAW_HOME"');
+    expect(source).toContain('ACTIVE_CONFIG_FILE="$OPENCLAW_STATE_DIR/openclaw.json"');
+    expect(source).toContain('OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"');
+    const runtimePaths = readFileSync(resolve(repo,
+      'plugins/openclaw-personal-assistant/node_modules/openclaw/dist/runtime-paths-C6MOwQ_j.js'), 'utf8');
+    expect(runtimePaths).toContain('OPENCLAW_CONFIG_PATH: sharedEnv.configPath');
+    expect(runtimePaths).toContain('const configPath = env.OPENCLAW_CONFIG_PATH');
   });
 
   it('fails closed on an unsafe config before installer mutation', () => {
@@ -355,7 +385,9 @@ describe('deployment scripts', () => {
       expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' }).status).not.toBe(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
     const checkBlock = readFileSync(installer, 'utf8').split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
-    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"');
+    expect(checkBlock).toContain('validate_config_file "$ACTIVE_CONFIG_FILE"');
+    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"');
+    expect(checkBlock).not.toMatch(/config patch|gateway install|cron add|mkdir/);
   });
 
   it('non-live acceptance emits exactly 32 criterion records with live work not verified', () => {
@@ -388,7 +420,7 @@ describe('deployment scripts', () => {
   it('--all preserves one faithful live artifact path while refusing all missing evidence without truncation', () => {
     const evidence = mkdtempSync(resolve(tmpdir(), 'ocpa-live-evidence-'));
     try {
-      generateAc01Evidence(evidence);
+      forgeAc01Evidence(evidence);
       const result = spawnSync(gitBash, [acceptance, '--all'], {
         cwd: repo, encoding: 'utf8', timeout: 200_000,
         env: { ...process.env, LIVE_TEST: '1', LIVE_EVIDENCE_DIR: evidence },

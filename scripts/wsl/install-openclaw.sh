@@ -27,12 +27,17 @@ PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
 CRON_TRIGGER="$SCRIPT_DIR/briefing-cron-trigger.js"
 CRON_VALIDATOR="$SCRIPT_DIR/validate-cron-contract.js"
 HARDENED_CONFIG_VALIDATOR="$SCRIPT_DIR/validate-hardened-config.js"
+ACTIVE_CONFIG_PATH_VALIDATOR="$SCRIPT_DIR/validate-active-config-path.js"
 RUNTIME_TOOLS_VALIDATOR="$SCRIPT_DIR/validate-runtime-tools.js"
 OPENCLAW="$PLUGIN_ROOT/node_modules/.bin/openclaw"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 SECRET_DIR="$OPENCLAW_HOME/secrets"
 CONFIG_TEMPLATE="$REPO_ROOT/config/openclaw.personal-assistant.example.json5"
 CONFIG_FILE="$OPENCLAW_HOME/openclaw.personal-assistant.json5"
+OPENCLAW_STATE_DIR="$OPENCLAW_HOME"
+ACTIVE_CONFIG_FILE="$OPENCLAW_STATE_DIR/openclaw.json"
+OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"
+export OPENCLAW_STATE_DIR OPENCLAW_CONFIG_PATH
 
 say() { printf '%s\n' "$*"; }
 run() {
@@ -63,14 +68,21 @@ validate_secret_tree() {
 }
 
 validate_config_file() {
-  local owner before after canonical
-  [[ -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || { say 'config_file_invalid'; return 1; }
+  local path="$1" owner before after canonical
+  [[ -e "$path" && ! -L "$path" ]] || { say 'config_file_invalid'; return 1; }
   owner="$(id -u)"
-  before="$(stat -Lc '%d:%i:%F:%u:%a' -- "$CONFIG_FILE")"
-  canonical="$(readlink -f -- "$CONFIG_FILE")"
-  after="$(stat -Lc '%d:%i:%F:%u:%a' -- "$CONFIG_FILE")"
-  [[ "$before" == "$after" && "$canonical" == "$CONFIG_FILE"
+  before="$(stat -Lc '%d:%i:%F:%u:%a' -- "$path")"
+  canonical="$(readlink -f -- "$path")"
+  after="$(stat -Lc '%d:%i:%F:%u:%a' -- "$path")"
+  [[ "$before" == "$after" && "$canonical" == "$path"
     && "$before" == *':regular file:'"$owner"':600' ]] || { say 'config_file_invalid'; return 1; }
+}
+
+validate_active_config_path() {
+  local reported
+  reported="$("$OPENCLAW" config file)" || { say 'active_config_path_unknown'; return 1; }
+  printf '%s\n' "$reported" | node "$ACTIVE_CONFIG_PATH_VALIDATOR" "$ACTIVE_CONFIG_FILE" "$HOME" >/dev/null \
+    || { say 'active_config_path_mismatch'; return 1; }
 }
 
 validate_runtime_tools() {
@@ -146,8 +158,9 @@ OPENCLAW_VERSION="$($OPENCLAW --version | sed -n 's/^OpenClaw \([^ ]*\).*/\1/p')
 
 if [[ "$MODE" == check ]]; then
   validate_secret_tree
-  validate_config_file
-  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
+  validate_config_file "$ACTIVE_CONFIG_FILE"
+  validate_active_config_path
+  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck
@@ -176,10 +189,8 @@ if [[ "$PHASE" == prepare ]]; then
 fi
 
 validate_secret_tree
-validate_config_file
+validate_config_file "$CONFIG_FILE"
 node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
-OPENCLAW_CONFIG_PATH="$CONFIG_FILE" "$OPENCLAW" config validate
-OPENCLAW_CONFIG_PATH="$CONFIG_FILE" validate_active_config
 "$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
 
 run npm --prefix "$PLUGIN_ROOT" ci
@@ -188,6 +199,9 @@ run "$OPENCLAW" plugins build --entry "$PLUGIN_ROOT/dist/index.js"
 run "$OPENCLAW" plugins validate --entry "$PLUGIN_ROOT/dist/index.js"
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
 run "$OPENCLAW" config patch --file "$CONFIG_FILE"
+validate_config_file "$ACTIVE_CONFIG_FILE"
+validate_active_config_path
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
 run "$OPENCLAW" config validate
 validate_active_config
 OWNER_ID="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.config.telegramUserId | tr -d '"[:space:]')"
