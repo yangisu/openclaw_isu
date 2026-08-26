@@ -139,7 +139,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       .rejects.toMatchObject({ code: 'sender_not_allowed' });
     await expect(mutate.execute('call-mutate', {
       operationId: 'operation-1', action: 'add', recordType: 'task',
-      title: 'Write report', source: 'telegram',
+      title: 'Write report',
     })).rejects.toMatchObject({ code: 'sender_not_allowed' });
     await expect(prepare.execute('call-prepare', {
       calendarId: 'default', uid: 'event-1@example.test',
@@ -204,7 +204,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       .rejects.toMatchObject({ code: 'sender_not_allowed' });
     await expect(mutate.execute('call-mutate', {
       operationId: 'operation-1', action: 'add', recordType: 'task',
-      title: 'Write report', source: 'telegram',
+      title: 'Write report',
     })).rejects.toMatchObject({ code: 'sender_not_allowed' });
     await expect(prepare.execute('call-prepare', {
       calendarId: 'default', uid: 'event-1@example.test',
@@ -624,6 +624,130 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(Value.Check(confirm, {
       requestId: randomUUID(), payloadHash: 'c'.repeat(64), url: 'https://example.test',
     })).toBe(false);
+  });
+
+  it.each([
+    ['task', {
+      operationId: 'typed-tool-task', action: 'add', recordType: 'task', title: 'Task',
+      priority: 'high', dueAt: '2026-08-26T10:00:00+09:00',
+    }, {
+      kind: 'task', title: 'Task', priority: 'high',
+      dueAt: '2026-08-26T10:00:00+09:00', source: 'telegram',
+    }],
+    ['study', {
+      operationId: 'typed-tool-study', action: 'add', recordType: 'study', title: 'Study',
+      subject: 'Math', targetAmount: 10, unit: 'problems', progress: 2,
+      targetDate: '2026-08-31', recurrence: 'daily', reviewDates: ['2026-08-27'],
+    }, {
+      kind: 'study', title: 'Study', subject: 'Math', targetAmount: 10, unit: 'problems',
+      progress: 2, targetDate: '2026-08-31', recurrence: 'daily',
+      reviewDates: ['2026-08-27'], source: 'telegram',
+    }],
+    ['note', {
+      operationId: 'typed-tool-note', action: 'add', recordType: 'note', title: 'Note',
+      url: 'https://example.test', tags: ['safe'],
+    }, {
+      kind: 'note', title: 'Note', url: 'https://example.test', tags: ['safe'],
+      source: 'telegram',
+    }],
+    ['preference', {
+      operationId: 'typed-tool-preference', action: 'add', recordType: 'preference',
+      title: 'Preference', active: true,
+    }, { kind: 'preference', title: 'Preference', active: true, source: 'telegram' }],
+    ['memory', {
+      operationId: 'typed-tool-memory', action: 'add', recordType: 'memory', title: 'Memory',
+      sensitivity: 'normal',
+    }, {
+      kind: 'memory', title: 'Memory', sensitivity: 'normal', source: 'telegram',
+    }],
+  ] as const)('routes a typed %s add with a trusted derived source', async (_kind, params, expected) => {
+    const resultFor = (operationId: string, input: Record<string, unknown>) => ({
+      operationId, id: `${String(input.kind ?? 'task').slice(0, 1).toUpperCase()}-20260825-001`,
+      replayed: false, record: { id: 'record', title: input.title, orderedFields: [], fields: {}, body: '' },
+      gitCommit: 'a'.repeat(40),
+    });
+    const addRecord = vi.fn(async (operationId: string, input: Record<string, unknown>) => (
+      resultFor(operationId, input)
+    ));
+    const addTask = vi.fn(async (operationId: string, input: Record<string, unknown>) => (
+      resultFor(operationId, input)
+    ));
+    const tool = createMutationTool(api(), ownerContext, {
+      openRepository: () => ({
+        addRecord, addTask, updateRecord: vi.fn(), archiveRecord: vi.fn(), close() {},
+      }),
+    });
+
+    const result = await tool.execute(`call-${params.recordType}`, params);
+
+    expect(result.details).toMatchObject({ operationId: params.operationId, replayed: false });
+    if (_kind === 'task') {
+      const { kind: _expectedKind, ...taskInput } = expected;
+      expect(addTask).toHaveBeenCalledWith(params.operationId, taskInput);
+      expect(addRecord).not.toHaveBeenCalled();
+    } else {
+      expect(addRecord).toHaveBeenCalledWith(params.operationId, expected);
+      expect(addTask).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    ['inbox add', {
+      operationId: 'reject-inbox-add', action: 'add', recordType: 'inbox', title: 'Inbox',
+      reason: 'unclear', originalText: 'raw',
+    }],
+    ['daily add', {
+      operationId: 'reject-daily-add', action: 'add', recordType: 'daily', title: 'Daily',
+      entryAt: '2026-08-25T09:03:00+09:00',
+    }],
+    ['model supplied source', {
+      operationId: 'reject-source', action: 'add', recordType: 'note', title: 'Note',
+      source: 'model-controlled',
+    }],
+    ['invented confirmation boolean', {
+      operationId: 'reject-confirmation', action: 'add', recordType: 'memory', title: 'Secret',
+      sensitivity: 'sensitive', confirmed: true,
+    }],
+    ['unsafe study integer', {
+      operationId: 'reject-unsafe-integer', action: 'add', recordType: 'study', title: 'Study',
+      subject: 'Math', targetAmount: 1e21, unit: 'pages',
+    }],
+    ['duplicate note tags', {
+      operationId: 'reject-duplicate-tags', action: 'add', recordType: 'note', title: 'Note',
+      tags: ['same', 'same'],
+    }],
+  ])('schema-rejects %s', (_label, params) => {
+    expect(Value.Check(mutationParameters, params)).toBe(false);
+  });
+
+  it.each([
+    ['progress above target', 'invalid_progress', {
+      operationId: 'invalid-study-progress', action: 'add', recordType: 'study', title: 'Study',
+      subject: 'Math', targetAmount: 2, unit: 'pages', progress: 3,
+    }],
+    ['invalid civil date', 'invalid_date', {
+      operationId: 'invalid-study-date', action: 'add', recordType: 'study', title: 'Study',
+      subject: 'Math', targetAmount: 2, unit: 'pages', targetDate: '2026-02-29',
+    }],
+  ])('rejects a typed add with %s before opening repository state', async (_label, code, params) => {
+    const openRepository = vi.fn();
+    const tool = createMutationTool(api(), ownerContext, { openRepository });
+
+    await expect(tool.execute('call-invalid-add', params as never)).rejects.toMatchObject({ code });
+
+    expect(openRepository).not.toHaveBeenCalled();
+  });
+
+  it('rejects a direct sensitive-memory add before opening repository state', async () => {
+    const openRepository = vi.fn();
+    const tool = createMutationTool(api(), ownerContext, { openRepository });
+
+    await expect(tool.execute('call-sensitive-memory', {
+      operationId: 'direct-sensitive-memory', action: 'add', recordType: 'memory',
+      title: 'Sensitive memory', body: 'Private body', sensitivity: 'sensitive',
+    })).rejects.toMatchObject({ code: 'confirmation_unavailable' });
+
+    expect(openRepository).not.toHaveBeenCalled();
   });
 
   it('enforces the canonical signed-int64 Telegram ID boundary in the plugin config schema', () => {

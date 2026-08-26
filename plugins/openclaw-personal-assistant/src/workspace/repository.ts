@@ -17,13 +17,18 @@ import { DatabaseSync } from 'node:sqlite';
 
 import type { AssistantConfig } from '../config.js';
 import type {
+  AddRecordInput,
   AssistantRecord,
+  MemoryRecord,
+  NoteRecord,
   ParsedDocument,
   ParsedRecord,
+  PreferenceRecord,
   RecordKind,
+  StudyRecord,
   TaskRecord,
 } from '../domain.js';
-import { parseDocument, serializeDocument } from '../markdown/codec.js';
+import { parseDocument, serializeDocument, validateRecord } from '../markdown/codec.js';
 import { OperationLedger, type LedgerOperation } from '../state/operations.js';
 import {
   WorkspaceLockCoordinator,
@@ -35,8 +40,10 @@ export type RepositoryCheckpoint = 'beforeRename' | 'afterRename' | 'afterGitCom
 export interface AddTaskInput {
   title: string;
   body?: string;
+  status?: TaskRecord['status'];
   priority?: TaskRecord['priority'];
   dueAt?: string;
+  completedAt?: string;
   source: string;
 }
 
@@ -85,7 +92,7 @@ interface PreparedFile {
 
 interface PreparedMutation {
   version: 1;
-  action: 'add-task' | 'update-record' | 'archive-record';
+  action: 'add-task' | 'add-record' | 'update-record' | 'archive-record';
   result: MutationResult;
   files: PreparedFile[];
 }
@@ -266,6 +273,153 @@ function validateOperationId(operationId: string): void {
   }
 }
 
+function addRecordFields(input: AddRecordInput, timestamp: string): AssistantRecord {
+  const common = {
+    created_at: timestamp,
+    updated_at: timestamp,
+    source: input.source,
+  };
+  switch (input.kind) {
+    case 'task':
+      return {
+        ...common,
+        type: 'task',
+        status: input.status ?? 'open',
+        priority: input.priority ?? 'normal',
+        ...(input.dueAt === undefined ? {} : { due_at: input.dueAt }),
+        ...(input.completedAt === undefined ? {} : { completed_at: input.completedAt }),
+      } satisfies TaskRecord;
+    case 'study':
+      return {
+        ...common,
+        type: 'study',
+        status: input.status ?? 'open',
+        subject: input.subject,
+        target_amount: input.targetAmount,
+        unit: input.unit,
+        progress: input.progress ?? 0,
+        ...(input.targetDate === undefined ? {} : { target_date: input.targetDate }),
+        ...(input.recurrence === undefined ? {} : { recurrence: input.recurrence }),
+        ...(input.reviewDates === undefined ? {} : { review_dates: input.reviewDates }),
+      } satisfies StudyRecord;
+    case 'note':
+      return {
+        ...common,
+        type: 'note',
+        status: input.status ?? 'active',
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.tags === undefined ? {} : { tags: input.tags }),
+      } satisfies NoteRecord;
+    case 'preference':
+      return {
+        ...common,
+        type: 'preference',
+        active: input.active ?? true,
+        ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
+      } satisfies PreferenceRecord;
+    case 'memory':
+      return {
+        ...common,
+        type: 'memory',
+        active: input.active ?? true,
+        ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
+        sensitivity: input.sensitivity ?? 'normal',
+      } satisfies MemoryRecord;
+  }
+}
+
+export function validateAddRecordInput(input: AddRecordInput): void {
+  if (typeof input !== 'object' || input === null
+    || !['task', 'study', 'note', 'preference', 'memory'].includes(input.kind)) {
+    throw new WorkspaceRepositoryError(
+      'unsupported_record_kind',
+      'public record add supports task, study, note, preference, or memory',
+    );
+  }
+  if (typeof input.source !== 'string' || !/^[a-z][a-z0-9_-]{0,99}$/.test(input.source)) {
+    throw new WorkspaceRepositoryError(
+      'invalid_source',
+      'record source must be a 1-100 character lowercase identifier',
+    );
+  }
+  if (typeof input.title !== 'string' || /[\r\n\u0000-\u001f\u007f]/.test(input.title)) {
+    throw new WorkspaceRepositoryError(
+      'invalid_title',
+      'record title must be one printable line',
+    );
+  }
+  if (input.title.length > 500) {
+    throw new WorkspaceRepositoryError('input_too_long', 'record title exceeds 500 characters');
+  }
+  if (input.body !== undefined
+    && (typeof input.body !== 'string' || input.body.length > 16_000)) {
+    throw new WorkspaceRepositoryError('input_too_long', 'record body exceeds 16000 characters');
+  }
+  if (/[\r\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.body ?? '')
+    || /(?:^|\n)### [^\n]*/.test(input.body ?? '')) {
+    throw new WorkspaceRepositoryError(
+      'invalid_body',
+      'record body cannot contain carriage returns or level-three record headings',
+    );
+  }
+  if (input.kind === 'study') {
+    assertAddStringLimit(input.subject, 500, 'study subject');
+    assertAddStringLimit(input.unit, 100, 'study unit');
+    if (!Number.isSafeInteger(input.targetAmount)) {
+      throw new WorkspaceRepositoryError(
+        'invalid_target_amount',
+        'targetAmount must be a safe decimal integer',
+      );
+    }
+    if (input.progress !== undefined && !Number.isSafeInteger(input.progress)) {
+      throw new WorkspaceRepositoryError(
+        'invalid_progress',
+        'progress must be a safe decimal integer',
+      );
+    }
+    if (input.reviewDates !== undefined) {
+      assertAddArray(input.reviewDates, 64, 'invalid_review_dates', 'reviewDates');
+    }
+  } else if (input.kind === 'note') {
+    if (input.url !== undefined) assertAddStringLimit(input.url, 2_048, 'note URL');
+    if (input.tags !== undefined) {
+      assertAddArray(input.tags, 64, 'invalid_tags', 'tags');
+      for (const tag of input.tags) assertAddStringLimit(tag, 100, 'note tag');
+    }
+  }
+  const id = `${KIND_PREFIX[input.kind]}-20000101-001`;
+  validateRecord({
+    id,
+    title: input.title,
+    orderedFields: [],
+    fields: { ...addRecordFields(input, '2000-01-01T00:00:00+09:00') },
+    body: input.body ?? '',
+  });
+}
+
+function assertAddStringLimit(value: unknown, maximum: number, label: string): void {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new WorkspaceRepositoryError('invalid_string', `${label} must be a non-empty string`);
+  }
+  if (value.length > maximum) {
+    throw new WorkspaceRepositoryError('input_too_long', `${label} exceeds ${maximum} characters`);
+  }
+}
+
+function assertAddArray(
+  value: readonly unknown[],
+  maximum: number,
+  code: string,
+  label: string,
+): void {
+  if (!Array.isArray(value) || value.length > maximum || new Set(value).size !== value.length) {
+    throw new WorkspaceRepositoryError(
+      code,
+      `${label} must contain at most ${maximum} unique items`,
+    );
+  }
+}
+
 function isWorkspaceLockMetadata(value: unknown): value is WorkspaceLockMetadata {
   if (value === null || typeof value !== 'object') return false;
   const metadata = value as Partial<WorkspaceLockMetadata>;
@@ -312,11 +466,40 @@ export class WorkspaceRepository {
   }
 
   async addTask(operationId: string, input: AddTaskInput): Promise<MutationResult> {
+    const safeInput: AddTaskInput = {
+      title: input.title,
+      ...(input.body === undefined ? {} : { body: input.body }),
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.priority === undefined ? {} : { priority: input.priority }),
+      ...(input.dueAt === undefined ? {} : { dueAt: input.dueAt }),
+      ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
+      source: input.source,
+    };
+    const typedInput: AddRecordInput = { kind: 'task', ...safeInput };
+    validateOperationId(operationId);
+    validateAddRecordInput(typedInput);
     return this.mutate(
       operationId,
-      { action: 'add-task', input },
+      { action: 'add-task', input: safeInput },
       'add-task',
-      async index => this.prepareAddTask(operationId, input, index),
+      async index => this.prepareAddRecord(operationId, typedInput, index, 'add-task'),
+    );
+  }
+
+  async addRecord(operationId: string, input: AddRecordInput): Promise<MutationResult> {
+    validateOperationId(operationId);
+    validateAddRecordInput(input);
+    if (input.kind === 'memory' && input.sensitivity === 'sensitive') {
+      throw new WorkspaceRepositoryError(
+        'confirmation_unavailable',
+        'sensitive memory requires authoritative owner confirmation that is unavailable',
+      );
+    }
+    return this.mutate(
+      operationId,
+      { action: 'add-record', input },
+      'add-record',
+      async index => this.prepareAddRecord(operationId, input, index, 'add-record'),
     );
   }
 
@@ -493,46 +676,42 @@ export class WorkspaceRepository {
     return { ...operation.result.result, replayed: true };
   }
 
-  private async prepareAddTask(
+  private async prepareAddRecord(
     operationId: string,
-    input: AddTaskInput,
+    input: AddRecordInput,
     index: WorkspaceIdIndex,
+    action: 'add-task' | 'add-record',
   ): Promise<PreparedMutation> {
-    const relativePath = managedFile('task');
+    const relativePath = managedFile(input.kind);
     this.assertGitPathClean(relativePath);
-    const loaded = await this.readDocument('task', relativePath);
+    const loaded = await this.readDocument(input.kind, relativePath);
     const date = dateInSeoul(this.now());
     const used = index.ids;
     let sequence = 1;
-    let id = `T-${date}-${String(sequence).padStart(3, '0')}`;
+    let id = `${KIND_PREFIX[input.kind]}-${date}-${String(sequence).padStart(3, '0')}`;
     while (used.has(id)) {
       sequence += 1;
       if (sequence > 999) {
-        throw new WorkspaceRepositoryError('id_exhausted', `task IDs exhausted for ${date}`);
+        throw new WorkspaceRepositoryError(
+          'id_exhausted',
+          `${input.kind} IDs exhausted for ${date}`,
+        );
       }
-      id = `T-${date}-${String(sequence).padStart(3, '0')}`;
+      id = `${KIND_PREFIX[input.kind]}-${date}-${String(sequence).padStart(3, '0')}`;
     }
     const timestamp = timestampInSeoul(this.now());
-    const fields: TaskRecord = {
-      type: 'task',
-      status: 'open',
-      priority: input.priority ?? 'normal',
-      ...(input.dueAt === undefined ? {} : { due_at: input.dueAt }),
-      created_at: timestamp,
-      updated_at: timestamp,
-      source: input.source,
-    };
     const record: ParsedRecord = {
       id,
       title: input.title,
       orderedFields: [],
-      fields: { ...fields },
+      fields: { ...addRecordFields(input, timestamp) },
       body: input.body ?? '',
     };
+    validateRecord(record);
     ensureAppendBoundary(loaded.document);
     loaded.document.records.push(record);
     const contents = serializeDocument(loaded.document);
-    return this.preparedMutation(operationId, 'add-task', record, [
+    return this.preparedMutation(operationId, action, record, [
       this.preparedFile(relativePath, loaded.text, contents),
     ]);
   }

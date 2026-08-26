@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile,
 } from 'node:fs/promises';
@@ -63,6 +64,19 @@ function taskInput(index: number): AddTaskInput {
     priority: index % 2 === 0 ? 'high' : 'normal',
     source: 'telegram',
   };
+}
+
+function legacyAddTaskHash(input: AddTaskInput): string {
+  const payload = JSON.stringify({
+    action: 'add-task',
+    input: {
+      ...(input.body === undefined ? {} : { body: input.body }),
+      ...(input.priority === undefined ? {} : { priority: input.priority }),
+      source: input.source,
+      title: input.title,
+    },
+  });
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
 function taskDocument(id: string, status: 'open' | 'archived' = 'open'): string {
@@ -246,6 +260,236 @@ describe('WorkspaceRepository', () => {
 
     await expect(repo.addTask('global-id-allocation', taskInput(1)))
       .resolves.toMatchObject({ id: 'T-20260825-002' });
+  });
+
+  it.each([
+    ['task', 'TASKS.md', 'T-20260825-001', {
+      kind: 'task', title: 'Typed task', body: 'Task body\n', source: 'telegram',
+      dueAt: '2026-08-26T10:00:00+09:00',
+    }, {
+      type: 'task', status: 'open', priority: 'normal',
+      due_at: '2026-08-26T10:00:00+09:00', source: 'telegram',
+    }],
+    ['study', 'STUDY.md', 'S-20260825-001', {
+      kind: 'study', title: 'Korean plan', body: 'Read carefully\n', source: 'telegram',
+      subject: 'Korean', targetAmount: 20, unit: 'pages', targetDate: '2026-08-31',
+      reviewDates: ['2026-08-26', '2026-08-28'],
+    }, {
+      type: 'study', status: 'open', subject: 'Korean', target_amount: 20,
+      unit: 'pages', progress: 0, target_date: '2026-08-31',
+      review_dates: ['2026-08-26', '2026-08-28'], source: 'telegram',
+    }],
+    ['note', 'NOTES.md', 'N-20260825-001', {
+      kind: 'note', title: 'Reference', body: 'Quoted untrusted text\n', source: 'telegram',
+      url: 'https://example.test/reference', tags: ['research', 'later'],
+    }, {
+      type: 'note', status: 'active', url: 'https://example.test/reference',
+      tags: ['research', 'later'], source: 'telegram',
+    }],
+    ['preference', 'USER.md', 'U-20260825-001', {
+      kind: 'preference', title: 'Concise replies', body: 'Prefer concise replies.\n',
+      source: 'telegram',
+    }, { type: 'preference', active: true, source: 'telegram' }],
+    ['memory', 'MEMORY.md', 'M-20260825-001', {
+      kind: 'memory', title: 'Project convention', body: 'Use LF endings.\n',
+      source: 'telegram', sensitivity: 'normal',
+    }, { type: 'memory', active: true, sensitivity: 'normal', source: 'telegram' }],
+  ] as const)(
+    'adds and queries a typed %s record in %s',
+    async (kind, relativePath, id, input, expectedFields) => {
+      const { repo, workspace } = await fixture();
+
+      const added = await repo.addRecord(`typed-add-${kind}`, input);
+      const queried = await repo.query({ kind, id });
+
+      expect(added).toMatchObject({ id, replayed: false, record: { body: input.body } });
+      expect(queried).toHaveLength(1);
+      expect(queried[0]).toMatchObject({ id, title: input.title, fields: expectedFields });
+      expect(parseDocument(kind, await readFile(join(workspace, relativePath), 'utf8')).records)
+        .toEqual(queried);
+      expect(git(workspace, 'show', '--format=', '--name-only', added.gitCommit!))
+        .toBe(relativePath);
+    },
+  );
+
+  it('preserves existing unknown note fields and replays a typed add idempotently', async () => {
+    const { repo, workspace } = await fixture();
+    await writeFile(join(workspace, 'NOTES.md'), [
+      '# Notes', '', '### N-20260825-001 Existing note', '- type: "note"',
+      '- status: active', '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "manual"',
+      '- custom_field: "keep-me"', '', 'Existing body', '',
+    ].join('\n'));
+    git(workspace, 'add', '--', 'NOTES.md');
+    git(workspace, 'commit', '--quiet', '-m', 'seed note with unknown field');
+    const input = {
+      kind: 'note' as const, title: 'Second note', body: 'Second body\n', source: 'telegram',
+    };
+
+    const first = await repo.addRecord('typed-note-replay', input);
+    const replay = await repo.addRecord('typed-note-replay', input);
+
+    expect(first.id).toBe('N-20260825-002');
+    expect(replay).toMatchObject({ id: first.id, replayed: true });
+    const text = await readFile(join(workspace, 'NOTES.md'), 'utf8');
+    expect(text).toContain('- custom_field: "keep-me"');
+    expect(parseDocument('note', text).records).toHaveLength(2);
+  });
+
+  it('uses the global archive index when allocating a typed study ID', async () => {
+    const { repo, workspace } = await fixture();
+    await mkdir(join(workspace, 'archive'));
+    await writeFile(join(workspace, 'archive', 'STUDY.md'), [
+      '# Study', '', '### S-20260825-001 Archived study', '- type: "study"',
+      '- status: archived', '- subject: "Old"', '- target_amount: 1', '- unit: "page"',
+      '- progress: 1', '- created_at: 2026-08-25T09:03:00+09:00',
+      '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "manual"', '', '',
+    ].join('\n'));
+    git(workspace, 'add', '--', 'archive/STUDY.md');
+    git(workspace, 'commit', '--quiet', '-m', 'seed archived study ID');
+
+    await expect(repo.addRecord('typed-study-allocation', {
+      kind: 'study', title: 'New study', source: 'telegram',
+      subject: 'New', targetAmount: 5, unit: 'pages',
+    })).resolves.toMatchObject({ id: 'S-20260825-002' });
+  });
+
+  it.each([
+    ['invalid task status', 'invalid_status', {
+      kind: 'task', title: 'Bad task', source: 'telegram', status: 'pending',
+    }],
+    ['study progress above target', 'invalid_progress', {
+      kind: 'study', title: 'Bad progress', source: 'telegram', subject: 'Math',
+      targetAmount: 2, unit: 'pages', progress: 3,
+    }],
+    ['invalid study civil date', 'invalid_date', {
+      kind: 'study', title: 'Bad date', source: 'telegram', subject: 'Math',
+      targetAmount: 2, unit: 'pages', targetDate: '2026-02-29',
+    }],
+    ['invalid internal source', 'invalid_source', {
+      kind: 'note', title: 'Bad source', source: 'owner supplied prose',
+    }],
+    ['title line injection', 'invalid_title', {
+      kind: 'note', title: 'First line\n### N-20260825-999 Injected', source: 'telegram',
+    }],
+    ['body heading injection', 'invalid_body', {
+      kind: 'note', title: 'Unsafe body', source: 'telegram',
+      body: 'Normal text\n### N-20260825-999 Injected\n- type: "note"\n',
+    }],
+    ['unsafe study integer', 'invalid_target_amount', {
+      kind: 'study', title: 'Unsafe number', source: 'telegram', subject: 'Math',
+      targetAmount: 1e21, unit: 'pages',
+    }],
+    ['oversized study subject', 'input_too_long', {
+      kind: 'study', title: 'Oversized subject', source: 'telegram', subject: 'x'.repeat(501),
+      targetAmount: 1, unit: 'page',
+    }],
+    ['duplicate note tags', 'invalid_tags', {
+      kind: 'note', title: 'Duplicate tags', source: 'telegram', tags: ['same', 'same'],
+    }],
+  ] as const)('rejects %s before ledger, file, or Git mutation', async (_label, code, input) => {
+    const { repo, workspace } = await fixture();
+    const operationId = `typed-invalid-${code}`;
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.addRecord(operationId, input as never)).rejects.toMatchObject({ code });
+
+    expect(repo.ledger.get(operationId)).toBeUndefined();
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('rejects sensitive memory before ledger, file, or Git mutation', async () => {
+    const { repo, workspace } = await fixture();
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.addRecord('typed-sensitive-memory', {
+      kind: 'memory', title: 'Sensitive fact', body: 'Do not store this.\n',
+      source: 'telegram', sensitivity: 'sensitive',
+    })).rejects.toMatchObject({ code: 'confirmation_unavailable' });
+
+    expect(repo.ledger.get('typed-sensitive-memory')).toBeUndefined();
+    await expect(readFile(join(workspace, 'MEMORY.md'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('keeps the legacy addTask payload identity replayable after upgrade', async () => {
+    const { repo } = await fixture();
+    const input = taskInput(1);
+    repo.ledger.begin('legacy-add-task', '42', legacyAddTaskHash(input));
+
+    const result = await repo.addTask('legacy-add-task', input);
+
+    expect(result).toMatchObject({ id: 'T-20260825-001', replayed: true });
+    expect(repo.ledger.get('legacy-add-task')).toMatchObject({ phase: 'committed' });
+  });
+
+  it.each(['applied', 'committed'] as const)(
+    'replays a legacy %s add-task ledger entry after upgrade',
+    async phase => {
+      const operationId = `legacy-add-task-${phase}`;
+      const { repo, workspace } = await fixture();
+      const input = taskInput(1);
+      const template = await repo.addTask(`legacy-template-${phase}`, input);
+      const templateOperation = repo.ledger.get<{
+        version: 1;
+        action: string;
+        result: typeof template;
+        files: Array<{
+          relativePath: string;
+          beforeHash: string | null;
+          afterHash: string;
+          contents: string;
+        }>;
+      }>(`legacy-template-${phase}`)!;
+      const prepared = {
+        ...templateOperation.result!,
+        action: 'add-task',
+        result: { ...templateOperation.result!.result, operationId },
+      };
+      repo.ledger.begin(operationId, '42', legacyAddTaskHash(input));
+      repo.ledger.markApplied(operationId, prepared);
+      if (phase === 'committed') {
+        repo.ledger.markCommitted(operationId, {
+          ...prepared,
+          result: { ...prepared.result, gitCommit: template.gitCommit },
+        });
+      } else {
+        git(workspace, 'reset', '--hard', `${template.gitCommit}^`);
+        await writeFile(join(workspace, 'TASKS.md'), prepared.files[0].contents);
+        git(workspace, 'add', '--', 'TASKS.md');
+        git(workspace, 'commit', '--quiet', '-m', 'legacy applied task', '-m',
+          `Assistant-Operation-Id: ${operationId}`);
+      }
+
+      const replay = await repo.addTask(operationId, input);
+
+      expect(replay).toMatchObject({ operationId, id: template.id, replayed: true });
+      expect(repo.ledger.get(operationId)).toMatchObject({ phase: 'committed' });
+      expect(git(workspace, 'status', '--short')).toBe('');
+    },
+  );
+
+  it('keeps addTask task-only when unchecked input carries a conflicting discriminant', async () => {
+    const { repo, workspace } = await fixture();
+    const unchecked = {
+      ...taskInput(1),
+      kind: 'memory',
+      sensitivity: 'sensitive',
+    };
+
+    const result = await repo.addTask('task-discriminant-override', unchecked as never);
+
+    expect(result).toMatchObject({
+      id: 'T-20260825-001',
+      record: { fields: { type: 'task', status: 'open', priority: 'normal' } },
+    });
+    await expect(readFile(join(workspace, 'MEMORY.md'), 'utf8'))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+    expect(parseDocument('task', await readFile(join(workspace, 'TASKS.md'), 'utf8')).records)
+      .toHaveLength(1);
   });
 
   it('does not duplicate an applied operation after restart', async () => {

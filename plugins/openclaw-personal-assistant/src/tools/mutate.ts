@@ -7,11 +7,13 @@ import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
 import { Type, type Static, type TSchema } from 'typebox';
 import { Value } from 'typebox/value';
 
-import type { AssistantRecord, ParsedRecord, RecordKind } from '../domain.js';
+import type { AddRecordInput, AssistantRecord, ParsedRecord, RecordKind } from '../domain.js';
 import {
   WorkspaceRepository,
+  type AddTaskInput,
   type MutationResult,
   type RecordPatch,
+  validateAddRecordInput,
 } from '../workspace/repository.js';
 import {
   AssistantToolError,
@@ -118,8 +120,59 @@ export const mutationParameters = Type.Union([
     recordType: Type.Literal('task'),
     title: Type.String({ minLength: 1, maxLength: 500 }),
     body: Type.Optional(Type.String({ maxLength: 16_000 })),
+    status: Type.Optional(workStatusSchema),
     priority: Type.Optional(Type.Union([Type.Literal('high'), Type.Literal('normal'), Type.Literal('low')])),
     dueAt: Type.Optional(timestampSchema),
+    completedAt: Type.Optional(timestampSchema),
+  }, { additionalProperties: false }),
+  Type.Object({
+    operationId: operationIdSchema,
+    action: Type.Literal('add'),
+    recordType: Type.Literal('study'),
+    title: Type.String({ minLength: 1, maxLength: 500 }),
+    body: Type.Optional(Type.String({ maxLength: 16_000 })),
+    status: Type.Optional(workStatusSchema),
+    subject: Type.String({ minLength: 1, maxLength: 500 }),
+    targetAmount: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+    unit: Type.String({ minLength: 1, maxLength: 100 }),
+    progress: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+    targetDate: Type.Optional(dateSchema),
+    recurrence: Type.Optional(Type.Union([
+      Type.Literal('none'), Type.Literal('daily'), Type.Literal('weekly'),
+    ])),
+    reviewDates: Type.Optional(Type.Array(dateSchema, { maxItems: 64, uniqueItems: true })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    operationId: operationIdSchema,
+    action: Type.Literal('add'),
+    recordType: Type.Literal('note'),
+    title: Type.String({ minLength: 1, maxLength: 500 }),
+    body: Type.Optional(Type.String({ maxLength: 16_000 })),
+    status: Type.Optional(Type.Union([Type.Literal('active'), Type.Literal('archived')])),
+    url: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+    tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 100 }), {
+      maxItems: 64,
+      uniqueItems: true,
+    })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    operationId: operationIdSchema,
+    action: Type.Literal('add'),
+    recordType: Type.Literal('preference'),
+    title: Type.String({ minLength: 1, maxLength: 500 }),
+    body: Type.Optional(Type.String({ maxLength: 16_000 })),
+    active: Type.Optional(Type.Boolean()),
+    supersedes: Type.Optional(preferenceIdSchema),
+  }, { additionalProperties: false }),
+  Type.Object({
+    operationId: operationIdSchema,
+    action: Type.Literal('add'),
+    recordType: Type.Literal('memory'),
+    title: Type.String({ minLength: 1, maxLength: 500 }),
+    body: Type.Optional(Type.String({ maxLength: 16_000 })),
+    active: Type.Optional(Type.Boolean()),
+    supersedes: Type.Optional(memoryIdSchema),
+    sensitivity: Type.Optional(Type.Union([Type.Literal('normal'), Type.Literal('sensitive')])),
   }, { additionalProperties: false }),
   ...modifySchemas,
   ...archiveSchemas,
@@ -128,13 +181,8 @@ export const mutationParameters = Type.Union([
 type MutationParameters = Static<typeof mutationParameters>;
 
 export interface MutationRepository {
-  addTask(operationId: string, input: {
-    title: string;
-    body?: string;
-    priority?: 'high' | 'normal' | 'low';
-    dueAt?: string;
-    source: string;
-  }): Promise<MutationResult>;
+  addRecord(operationId: string, input: AddRecordInput): Promise<MutationResult>;
+  addTask(operationId: string, input: AddTaskInput): Promise<MutationResult>;
   updateRecord(operationId: string, targetId: string, patch: RecordPatch): Promise<MutationResult>;
   archiveRecord(operationId: string, targetId: string, reason: string): Promise<MutationResult>;
   close(): void;
@@ -161,19 +209,29 @@ export function createMutationTool(
         throw new AssistantToolError('invalid_parameters', 'Mutation parameters do not match the tool schema');
       }
       if (params.action !== 'add') assertTargetMatchesRecordType(params.targetId, params.recordType);
+      let addInput: AddRecordInput | undefined;
+      if (params.action === 'add') {
+        addInput = addInputFromParameters(params);
+        validateAddRecordInput(addInput);
+        if (addInput.kind === 'memory' && addInput.sensitivity === 'sensitive') {
+          throw new AssistantToolError(
+            'confirmation_unavailable',
+            'Sensitive memory confirmation is unavailable for direct tool requests',
+          );
+        }
+      }
       signal?.throwIfAborted();
 
       const repository = (dependencies.openRepository ?? openRepository)(config);
       try {
         let result: MutationResult;
         if (params.action === 'add') {
-          result = await repository.addTask(params.operationId, {
-            title: params.title,
-            ...(params.body === undefined ? {} : { body: params.body }),
-            ...(params.priority === undefined ? {} : { priority: params.priority }),
-            ...(params.dueAt === undefined ? {} : { dueAt: params.dueAt }),
-            source: 'telegram',
-          });
+          if (addInput!.kind === 'task') {
+            const { kind: _kind, ...taskInput } = addInput!;
+            result = await repository.addTask(params.operationId, taskInput);
+          } else {
+            result = await repository.addRecord(params.operationId, addInput!);
+          }
         } else if (params.action === 'modify') {
           const patch: RecordPatch = {
             ...(params.title === undefined ? {} : { title: params.title }),
@@ -192,6 +250,63 @@ export function createMutationTool(
       }
     },
   };
+}
+
+function addInputFromParameters(
+  params: Extract<MutationParameters, { action: 'add' }>,
+): AddRecordInput {
+  const common = {
+    title: params.title,
+    ...(params.body === undefined ? {} : { body: params.body }),
+    source: 'telegram',
+  };
+  switch (params.recordType) {
+    case 'task':
+      return {
+        ...common,
+        kind: 'task',
+        ...(params.status === undefined ? {} : { status: params.status }),
+        ...(params.priority === undefined ? {} : { priority: params.priority }),
+        ...(params.dueAt === undefined ? {} : { dueAt: params.dueAt }),
+        ...(params.completedAt === undefined ? {} : { completedAt: params.completedAt }),
+      };
+    case 'study':
+      return {
+        ...common,
+        kind: 'study',
+        subject: params.subject,
+        targetAmount: params.targetAmount,
+        unit: params.unit,
+        ...(params.status === undefined ? {} : { status: params.status }),
+        ...(params.progress === undefined ? {} : { progress: params.progress }),
+        ...(params.targetDate === undefined ? {} : { targetDate: params.targetDate }),
+        ...(params.recurrence === undefined ? {} : { recurrence: params.recurrence }),
+        ...(params.reviewDates === undefined ? {} : { reviewDates: params.reviewDates }),
+      };
+    case 'note':
+      return {
+        ...common,
+        kind: 'note',
+        ...(params.status === undefined ? {} : { status: params.status }),
+        ...(params.url === undefined ? {} : { url: params.url }),
+        ...(params.tags === undefined ? {} : { tags: params.tags }),
+      };
+    case 'preference':
+      return {
+        ...common,
+        kind: 'preference',
+        ...(params.active === undefined ? {} : { active: params.active }),
+        ...(params.supersedes === undefined ? {} : { supersedes: params.supersedes }),
+      };
+    case 'memory':
+      return {
+        ...common,
+        kind: 'memory',
+        ...(params.active === undefined ? {} : { active: params.active }),
+        ...(params.supersedes === undefined ? {} : { supersedes: params.supersedes }),
+        ...(params.sensitivity === undefined ? {} : { sensitivity: params.sensitivity }),
+      };
+  }
 }
 
 function openRepository(config: AssistantToolConfig): MutationRepository {

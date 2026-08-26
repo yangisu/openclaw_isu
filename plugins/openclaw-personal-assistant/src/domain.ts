@@ -90,6 +90,59 @@ export interface DailyRecord extends CommonRecordFields {
   related_ids?: string[];
 }
 
+interface AddRecordBase {
+  title: string;
+  body?: string;
+  source: string;
+}
+
+export interface AddTaskRecordInput extends AddRecordBase {
+  kind: 'task';
+  status?: TaskRecord['status'];
+  priority?: TaskRecord['priority'];
+  dueAt?: string;
+  completedAt?: string;
+}
+
+export interface AddStudyRecordInput extends AddRecordBase {
+  kind: 'study';
+  status?: StudyRecord['status'];
+  subject: string;
+  targetAmount: number;
+  unit: string;
+  progress?: number;
+  targetDate?: string;
+  recurrence?: StudyRecord['recurrence'];
+  reviewDates?: string[];
+}
+
+export interface AddNoteRecordInput extends AddRecordBase {
+  kind: 'note';
+  status?: NoteRecord['status'];
+  url?: string;
+  tags?: string[];
+}
+
+export interface AddPreferenceRecordInput extends AddRecordBase {
+  kind: 'preference';
+  active?: boolean;
+  supersedes?: string;
+}
+
+export interface AddMemoryRecordInput extends AddRecordBase {
+  kind: 'memory';
+  active?: boolean;
+  supersedes?: string;
+  sensitivity?: NonNullable<MemoryRecord['sensitivity']>;
+}
+
+export type AddRecordInput =
+  | AddTaskRecordInput
+  | AddStudyRecordInput
+  | AddNoteRecordInput
+  | AddPreferenceRecordInput
+  | AddMemoryRecordInput;
+
 export type AssistantRecord =
   | TaskRecord
   | StudyRecord
