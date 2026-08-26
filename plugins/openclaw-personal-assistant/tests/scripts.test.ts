@@ -64,7 +64,7 @@ describe('deployment scripts', () => {
   ];
   const acceptanceNotVerifiedCriteria = [
     ...liveCriteria,
-    'AC-05', 'AC-09',
+    'AC-09',
     'AC-18', 'AC-20', 'AC-29',
   ].sort();
 
@@ -496,7 +496,7 @@ describe('deployment scripts', () => {
     const result = spawnSync(gitBash, [acceptance, '--non-live'], { cwd: repo, encoding: 'utf8', timeout: 200_000 });
     expect(result.status).toBe(0);
     const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-    expect(summary).toMatchObject({ total: 32, pass: 13, fail: 0, notVerified: 19 });
+    expect(summary).toMatchObject({ total: 32, pass: 14, fail: 0, notVerified: 18 });
     const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
     expect(index.criteria).toHaveLength(32);
     expect(index.criteria.every((item: Record<string, unknown>) =>
@@ -508,6 +508,10 @@ describe('deployment scripts', () => {
     expect(notVerified.map((item: Record<string, unknown>) => String(item.criterionId)).sort())
       .toEqual(acceptanceNotVerifiedCriteria);
     expect(notVerified.every((item: Record<string, unknown>) => item.exitCode === 125)).toBe(true);
+    expect(index.criteria).toContainEqual(expect.objectContaining({
+      criterionId: 'AC-05', status: 'PASS', exitCode: 0,
+      command: 'vitest AC-05 typed local add/query and fail-closed boundaries',
+    }));
     expect(index.criteria.filter((item: Record<string, unknown>) =>
       ['AC-18', 'AC-20', 'AC-29'].includes(String(item.criterionId))))
       .toEqual(expect.arrayContaining([
@@ -541,7 +545,7 @@ describe('deployment scripts', () => {
       });
       expect(result.status).toBe(2);
       const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-      expect(summary).toMatchObject({ total: 32, pass: 13, fail: 0, notVerified: 19 });
+      expect(summary).toMatchObject({ total: 32, pass: 14, fail: 0, notVerified: 18 });
       const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
       expect(index.criteria.filter((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED')
         .map((item: Record<string, unknown>) => String(item.criterionId)).sort())

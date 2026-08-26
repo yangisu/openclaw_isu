@@ -52,7 +52,7 @@ The local test evidence covers the remaining safe component contracts, including
 - `AC-20` remains `NOT_VERIFIED` until the built plugin runtime connects OAuth refresh and CalDAV failures to the durable calendar-only gate and owner-facing reason while local functions stay available.
 - `AC-29` remains `NOT_VERIFIED` until the built plugin's production startup path invokes stale-submission recovery without replay and confirmation consumption is bound to that runtime flow.
 
-`AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded, so both confirmation entry points remain non-writing and no single-use confirmation can be consumed. Review each artifact rather than relying only on summary counts.
+`AC-05` is a safe local PASS only when its narrowly selected production tests all succeed: the mutation tool derives the trusted source for task, note, preference, normal-memory, and study adds; the real repository adds and queries all five types; sensitive memory remains fail-closed; and the public schema rejects inbox/daily adds. A generic suite or source grep is not accepted as evidence. `AC-09` remains `NOT_VERIFIED`: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded, so both confirmation entry points remain non-writing and no single-use confirmation can be consumed. Review each artifact rather than relying only on summary counts.
 
 ## Final gate
 

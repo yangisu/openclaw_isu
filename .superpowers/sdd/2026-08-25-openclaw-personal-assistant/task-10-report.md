@@ -56,11 +56,11 @@ Earlier isolated package-local runtime inspection linked the built plugin into a
 
 The latest safe acceptance evidence contained exactly 32 stable IDs (`AC-01` through `AC-32`):
 
-- PASS: 13 non-live criteria
+- PASS: 14 non-live criteria
 - FAIL: 0
-- NOT_VERIFIED: 19 criteria (14 live-only criteria and 5 honestly unverified production gaps)
+- NOT_VERIFIED: 18 criteria (14 live-only criteria and 4 honestly unverified production gaps)
 
-All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-05 and AC-09 also remain NOT_VERIFIED because the current product does not implement every mutation kind or executable-response boundary those criteria require. AC-18, AC-20, and AC-29 remain NOT_VERIFIED because passing component state-machine tests do not prove the missing built-plugin startup reconciliation, runtime OAuth/CalDAV gate, warning, and no-replay wiring. The runner always records all 14 live rows as NOT_VERIFIED/125; `--all`, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, and arbitrary evidence cannot promote them. Generated `artifacts/acceptance/*` directories are deleted after verification and remain ignored.
+All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Telegram/CalDAV/Naver behavior, exact 08:00/22:00 observations, reboot and 30-minute idle recovery, real age archive/restore, target ACL/same-handle deletion, and physical-media/durability checks as applicable. AC-09 remains NOT_VERIFIED because the current product lacks the authoritative direct-owner confirmation boundary. AC-18, AC-20, and AC-29 remain NOT_VERIFIED because passing component state-machine tests do not prove the missing built-plugin startup reconciliation, runtime OAuth/CalDAV gate, warning, and no-replay wiring. AC-05 now uses narrowly selected production tool and real-repository add/query tests rather than generic-suite or grep evidence. The runner always records all 14 live rows as NOT_VERIFIED/125; `--all`, `LIVE_TEST`, `LIVE_EVIDENCE_DIR`, PATH, and arbitrary evidence cannot promote them. Generated `artifacts/acceptance/*` directories are deleted after verification and remain ignored.
 
 ## Security and operational notes
 
@@ -73,7 +73,7 @@ All live-only items remain honestly NOT VERIFIED. These include real OpenAI/Tele
 
 ## Concerns / deferred evidence
 
-There are no known non-live test failures in completed verification. AC-05, AC-09, AC-18, AC-20, and AC-29 remain explicit non-live production gaps rather than false PASS results. All 14 live acceptance criteria remain automated-unsupported and cannot be accepted by the runner until authoritative product commands or an attestation API are implemented. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
+There are no known non-live test failures in completed verification. AC-09, AC-18, AC-20, and AC-29 remain explicit non-live production gaps rather than false PASS results. AC-05 is supported by its exact typed add/query and fail-closed production test selection. All 14 live acceptance criteria remain automated-unsupported and cannot be accepted by the runner until authoritative product commands or an attestation API are implemented. Windows Git emits benign LF-to-CRLF warnings from disposable backup test repositories; these are not failures and did not modify the real workspace.
 
 ## Review fix round 1
 
@@ -82,7 +82,7 @@ All Critical, Important, and Minor review findings were addressed without touchi
 - PoC evidence now accepts only the exact four-field schema, constructs a fresh sanitized envelope, rejects extra/nested fields and unsafe checks, and enforces valid, non-future, fresh timestamps. Regression tests prove credential-like extras are neither persisted nor printed.
 - Live acceptance promotion now validates criterion-specific evidence under an explicit absolute private `LIVE_EVIDENCE_DIR`: exact ID/status/generator, freshness, exit 0, ordinary non-link private files, canonical containment, required observations, artifact existence and privacy, and current SHA-256. Invalid, fabricated, stale, wrong-ID, missing, permission-bad, and secret-bearing evidence remains NOT_VERIFIED with exit 125.
 - CLI backup and reconciliation now require `stateDir`, use the real `SubsystemHealthStore`, close resources reliably, preserve archive-bound `publication_unknown`, and clear only the exactly reconciled archive.
-- AC-16, AC-17, AC-30, and AC-31 now execute the exact concurrency/preservation, interruption-before-replace, one-byte mismatch, and retention/link clauses. Every acceptance label was reconciled to the approved design; unsupported AC-05 and AC-09 clauses are honestly NOT_VERIFIED.
+- AC-05 executes the exact five typed add/query, trusted-source, sensitive-memory, and inbox/daily rejection clauses. AC-16, AC-17, AC-30, and AC-31 execute the exact concurrency/preservation, interruption-before-replace, one-byte mismatch, and retention/link clauses. Unsupported AC-09 remains honestly NOT_VERIFIED.
 - Installer check mode is read-only but validates the installed build freshness, source type-check, package-local plugin validation/runtime, hardened active config, exact five optional tools, service/systemd/linger state, and exact single no-catch-up Cron row. The Node range is exactly `>=24.15.0 <25.0.0`.
 - Initialization enforces and verifies privacy on the root and every existing child. Secret validation requires direct canonical regular files under the secret root, current ownership, stable identity, no symlink, and exact mode 0600.
 - The restore runbook creates the isolated restore root with mode 0700 before use.
@@ -137,7 +137,7 @@ Exit 0; exactly 32 unique rows (`AC-01` through `AC-32`): 16 PASS, 0 FAIL, 16 NO
 
 Package-local OpenClaw 2026.7.1 plugin validation exited 0. A fresh isolated runtime inspection found exactly five tools and all were optional: `assistant_briefing`, `assistant_calendar_confirm`, `assistant_calendar_prepare`, `assistant_mutate`, and `assistant_query`. A production/docs scan for credential shapes and the two test canaries found zero files. Generated acceptance evidence and isolated runtime state were removed. No live OpenClaw state, credentials, services, scheduled tasks, firewall, Naver, Telegram, or external service was touched.
 
-AC-05 and AC-09 remain honest non-live product gaps and therefore NOT_VERIFIED. Live probe evidence is deliberately absent until an authorized target run executes every required fixed phase.
+AC-09 remains an honest non-live product gap and therefore NOT_VERIFIED. AC-05 is promoted only by its narrowly named production integration command. Live probe evidence is deliberately absent until an authorized target run executes every required fixed phase.
 
 ## Review fix round 3
 
@@ -226,7 +226,13 @@ C:\Program Files\Git\bin\bash.exe scripts/wsl/run-acceptance.sh --non-live
 C:\Program Files\Git\bin\bash.exe scripts/wsl/run-acceptance.sh --all
 ```
 
-Both runs produced exactly 32 ordered criterion rows: 13 PASS, 0 FAIL, and 19 NOT_VERIFIED. Every NOT_VERIFIED row used exit code 125. The NOT_VERIFIED set is the 14 automated-unsupported live criteria plus `AC-05`, `AC-09`, `AC-18`, `AC-20`, and `AC-29`. `--non-live` exited 0 because no executed check failed; `--all` exited 2 because unresolved rows remain. No live state, credentials, services, configuration, or external system was touched.
+The current expected result is exactly 32 ordered criterion rows: 14 PASS, 0 FAIL, and 18 NOT_VERIFIED. Every NOT_VERIFIED row uses exit code 125. The NOT_VERIFIED set is the 14 automated-unsupported live criteria plus `AC-09`, `AC-18`, `AC-20`, and `AC-29`. `--non-live` exits 0 when no executed check fails; `--all` exits 2 because unresolved rows remain. No live state, credentials, services, configuration, or external system is touched.
+
+## Phase 3C AC-05 acceptance evidence
+
+AC-05 no longer relies on a generic schema test or an unsupported marker. Its acceptance command selects only production behavior that proves all five requested local record types: trusted-source mutation routing for task, note, preference, normal memory, and study; real repository add followed by query and Markdown parse for all five; direct sensitive-memory fail-closed behavior; and schema rejection of inbox/daily adds. A failing focused command records AC-05 as `FAIL`; only exit 0 records `PASS`.
+
+TDD RED was the prior `13 PASS / 19 NOT_VERIFIED` summary against the new literal `14 PASS / 18 NOT_VERIFIED` expectation. After replacing only the AC-05 row, the focused non-live acceptance test passed in 62.04 seconds. The exact AC-05 selection passed 13/13 tests, and the complete deployment-script suite passed 54/54 in 145.07 seconds. Standalone `--non-live` and `--all` each produced exactly 32 rows with 14 PASS, 0 FAIL, and 18 NOT_VERIFIED; all NV rows used exit 125 and all 14 live rows remained NV. AC-09, AC-18, AC-20, AC-29, and all 14 live criteria remain unchanged and fail-closed. Generated evidence was inspected and removed.
 
 ## Phase 3B maintenance orchestration
 

@@ -81,7 +81,7 @@ run_live_evidence AC-01 'Ubuntu 24.04 WSL2 systemd and OpenClaw Gateway are heal
 run_live_evidence AC-02 'ChatGPT OAuth produces a real model response'
 run_live_evidence AC-03 'The owner receives a response from @Yangisu_openclaw_bot'
 run_safe AC-04 'An unauthorized Telegram user ID cannot access the assistant' 'vitest exact Telegram owner allowlist and pre-read rejection' npm test -- tests/config/security.test.ts tests/tools/tools.test.ts -t 'allows only one numeric Telegram owner|repository read and side effect for a non-owner'
-run_safe_unverified AC-05 'Tasks, notes, preferences, long-term memory, and study plans can be added and queried' 'vitest current typed add schema before recording an unimplemented acceptance clause' 'NOT VERIFIED: the current mutation surface adds tasks only; other record kinds can be queried/modified but not added.' npm test -- tests/tools/tools.test.ts -t 'exposes strict schemas'
+run_safe AC-05 'Tasks, notes, preferences, long-term memory, and study plans can be added and queried' 'vitest AC-05 typed local add/query and fail-closed boundaries' npm test -- tests/tools/tools.test.ts tests/workspace/repository.test.ts -t 'routes a typed .* add with a trusted derived source|schema-rejects (inbox add|daily add)|rejects a direct sensitive-memory add|adds and queries a typed .* record'
 run_safe AC-06 'Task and study progress can be updated, completed, and archived' 'vitest AC-06 task completion and study progress/archive contract' npm test -- tests/workspace/repository.test.ts -t 'AC-06'
 run_live_evidence AC-07 'Existing Naver events are read through CalDAV'
 run_live_evidence AC-08 'One confirmed Naver test event is created without duplicate retry and then deleted by the user'
