@@ -16,27 +16,36 @@ Generated acceptance artifacts are intentionally Git-ignored. Treat them as loca
 
 ## Live evidence rules
 
-Live work must be performed manually on the target PC with `LIVE_TEST=1`. Do not put credentials or credential-bearing URLs in command arguments or evidence. `LIVE_EVIDENCE_DIR` must be an absolute, canonical, owner-private directory. Each live check needs an ordinary non-link file named `AC-XX.json`; its exact schema is:
+Live work must be performed on the target PC. Never hand-write or edit an `AC-XX.json` envelope. The only authorized producer is `scripts/wsl/run-live-probe.js`, which executes the fixed criterion/phase command described by the versioned probe contract, derives observations from bounded structured raw results, and writes the raw records, stateful ledger, hashes, target identity, and final evidence. The validator independently reopens nothing by path after its bounded no-follow read, verifies stable file identity and privacy, checks the fixed probe ID/digest, and re-derives every observation from the raw records.
 
-```json
-{
-  "version": 1,
-  "generator": "openclaw-personal-assistant-live-acceptance/v1",
-  "criterionId": "AC-01",
-  "status": "PASS",
-  "observedAt": "2026-08-26T00:00:00Z",
-  "exitCode": 0,
-  "observedArtifactPath": "/absolute/private/path/to/redacted-observation",
-  "observedArtifactSha256": "<64 lowercase hex characters>",
-  "observations": {
-    "ubuntuVersion": "24.04",
-    "systemdPid1": true,
-    "gatewayActive": true
-  }
-}
+Create the evidence directory and optional canary list locally. Canary values and credentials must never be command arguments:
+
+```bash
+install -d -m 700 /absolute/private/live-evidence
+install -m 600 /dev/stdin /absolute/private/live-canaries
+export OCPA_LIVE_CANARY_FILE=/absolute/private/live-canaries
+node scripts/wsl/run-live-probe.js --criterion AC-01 --output-dir /absolute/private/live-evidence
 ```
 
-The evidence and artifact must be under `LIVE_EVIDENCE_DIR`, owned by the current user, private, ordinary files, non-symlinks, fresh within 24 hours, and unchanged from the recorded SHA-256. The exact observation keys differ by criterion and are enforced by `scripts/wsl/validate-live-evidence.js`; inspect that versioned validator before generating evidence. A narrative, empty file, stale timestamp, wrong criterion, unexpected field, missing observation, permissive ACL/mode, or hash mismatch remains `NOT_VERIFIED` with exit code 125.
+For multi-stage criteria, run the listed fixed phases in order. The producer records `NOT_VERIFIED` and exits 125 until every phase is present; it emits final PASS evidence only after cross-phase identity/time checks succeed:
+
+- `AC-03`: `owner-request`, then `owner-response`.
+- `AC-08`: `before-create`, `after-create`, then `after-user-delete` after the user deletes the one event in Naver.
+- `AC-12`: `before-restart`, restart Windows and WSL, then `after-restart`.
+- `AC-13`: `backup`, then `isolated-restore`.
+- `AC-15`: `caldav-shapes`, then `failure-injection`.
+- `AC-23`: `observe-0800`, `observe-2200`, `observe-2300`, then `after-wake`.
+- `AC-25`: `before-reboot`, reboot and remain logged out/idle for at least 30 minutes, then `after-reboot-idle`.
+- `AC-26`: `gateway-call`, `telegram-call`, `refresh-failure`, then `revocation`.
+- `AC-27`: `state-rejection`, `create`, `refresh`, then `revoke`.
+
+Example phase invocation:
+
+```bash
+node scripts/wsl/run-live-probe.js --criterion AC-25 --phase before-reboot --output-dir /absolute/private/live-evidence
+```
+
+The producer and validator reject unknown fields, secret-bearing keys at any nesting depth, credential-shaped values, canaries, credential URLs, symlinks, non-private files, oversized input, stale evidence, path swaps, wrong IDs/digests, missing phases, and raw/evidence hash mismatches. `--test-adapter` evidence is explicitly test-only and is never accepted by the acceptance runner.
 
 ```bash
 LIVE_TEST=1 LIVE_EVIDENCE_DIR=/absolute/private/live-evidence \

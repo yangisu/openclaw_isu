@@ -786,15 +786,24 @@ describe('encrypted verified backup', () => {
 
   it('AC-30 rejects an exact one-byte manifest corruption', async () => {
     const f = await fixture();
+    const canary = 'AC30-PLAINTEXT-CANARY-DO-NOT-RETAIN';
+    await writeFile(join(f.workspaceDir, 'NOTES.md'), `# Notes\n\n${canary}\n`);
     const backup = await createBackup({ ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age });
     const oneByteCorruptingAge = new FakeAge('test-key', bundle => {
       const manifest = bundle.files.find(entry => entry.path === 'manifest.json')!;
       manifest.data[10] ^= 1;
     });
 
-    await expect(verifyBackup({
-      archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: oneByteCorruptingAge, health: f.health,
+    const restoreRoot = join(f.root, 'isolated-restore');
+    await mkdir(restoreRoot, { mode: 0o700 });
+    const tempBefore = new Set((await readdir(tmpdir())).filter(name => name.startsWith('openclaw-backup-')));
+    await expect(restoreBackup({
+      archivePath: backup.archivePath, restoreRoot, identityFile: 'test-key', ageRunner: oneByteCorruptingAge, health: f.health,
     })).rejects.toMatchObject({ code: 'archive_hash_mismatch' });
+    expect(await readdir(restoreRoot)).toEqual([]);
+    const tempAfter = (await readdir(tmpdir())).filter(name => name.startsWith('openclaw-backup-'));
+    expect(tempAfter.filter(name => !tempBefore.has(name))).toEqual([]);
+    expect(JSON.stringify(await readdir(restoreRoot))).not.toContain(canary);
   }, 30_000);
 
   it('fails closed when identity-bound retention deletion is unavailable', async () => {

@@ -164,6 +164,30 @@ describe('operational CLI', () => {
     }
   }, 30_000);
 
+  it('preserves existing managed files while repairing their privacy idempotently', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-private-files-'));
+    await mkdir(join(root, 'workspace'), { recursive: true });
+    const tasks = join(root, 'workspace', 'TASKS.md');
+    await writeFile(tasks, 'owner content must survive\n', { mode: 0o644 });
+    if (process.platform === 'win32') {
+      const { spawnSync } = await import('node:child_process');
+      expect(spawnSync('icacls.exe', [tasks, '/inheritance:e']).status).toBe(0);
+    } else await chmod(tasks, 0o644);
+
+    expect(await runCli(['init', '--root', root], capture().io)).toBe(0);
+    expect(await runCli(['init', '--root', root], capture().io)).toBe(0);
+    expect(await readFile(tasks, 'utf8')).toBe('owner content must survive\n');
+    if (process.platform === 'win32') {
+      const { spawnSync } = await import('node:child_process');
+      const script = `$a=Get-Acl -LiteralPath '${tasks.replaceAll("'", "''")}'; if(!$a.AreAccessRulesProtected -or @($a.Access|? IsInherited).Count -ne 0){exit 1}`;
+      expect(spawnSync('pwsh', ['-NoProfile', '-Command', script]).status).toBe(0);
+    } else {
+      const info = await stat(tasks);
+      expect(info.mode & 0o777).toBe(0o600);
+      expect(info.uid).toBe(process.getuid!());
+    }
+  }, 30_000);
+
   it.each([
     ['backup', '--workspace', '/tmp/workspace', '--state', '/tmp/state', '--backup-dir', 'relative', '--identity', '/tmp/key', '--recipient', 'age1test'],
     ['restore', '--archive', 'relative', '--restore-root', '/tmp/restore', '--identity', '/tmp/key'],
@@ -205,6 +229,31 @@ describe('operational CLI', () => {
       await expect(applyRetention({ backupDir, identityFile: identity, health: reopened }))
         .rejects.toMatchObject({ code: 'publication_unknown' });
     } finally { reopened.close(); }
+  });
+
+  it('validates every reconcile option before creating or opening health state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-reconcile-parse-'));
+    const state = join(root, 'state-that-must-not-exist');
+    expect(await runCli([
+      'backup', 'reconcile', '--archive', 'relative', '--identity', join(root, 'identity'), '--state', state,
+    ], capture().io)).toBe(64);
+    await expect(lstat(state)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rejects a symlinked health state before SQLite can be created', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-backup-state-link-'));
+    const target = join(root, 'target');
+    const state = join(root, 'state');
+    const workspace = join(root, 'workspace');
+    const backupDir = join(root, 'backup');
+    const identity = join(root, 'identity');
+    await Promise.all([mkdir(target), mkdir(workspace), mkdir(backupDir), writeFile(identity, 'identity')]);
+    await symlink(target, state, process.platform === 'win32' ? 'junction' : 'dir');
+    expect(await runCli([
+      'backup', '--workspace', workspace, '--state', state, '--backup-dir', backupDir,
+      '--identity', identity, '--recipient', 'age1abcdefghijklmnop',
+    ], capture().io)).toBe(64);
+    await expect(lstat(join(target, 'health.sqlite'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('rejects secrets and credential URLs in command-line arguments', async () => {

@@ -74,6 +74,7 @@ async function init(args: readonly string[], io: CliIo): Promise<number> {
   for (const [name, content] of templates) {
     const path = join(root, name);
     await assertWithin(root, path);
+    await assertStablePath(path, 'file', true);
     const handle = await open(path, 'wx', 0o600).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') return undefined;
       throw error;
@@ -84,6 +85,8 @@ async function init(args: readonly string[], io: CliIo): Promise<number> {
       await handle.close();
       created.push(name.replaceAll('\\', '/'));
     }
+    await assertStablePath(path, 'file', false);
+    await enforcePrivateFile(path);
   }
   io.stdout(JSON.stringify({ status: 'open', observedChecks: ['owner-private directories', 'non-secret templates'], created, redactedErrorCode: null, timestamp: now() }));
   return EXIT.ok;
@@ -136,10 +139,19 @@ async function backup(args: readonly string[], io: CliIo): Promise<number> {
   const allowed = reconcile ? ['archive', 'identity', 'state'] : ['workspace', 'state', 'backup-dir', 'identity', 'recipient'];
   const options = parseOptions(optionArgs, allowed);
   if (reconcile) {
-    const health = new SubsystemHealthStore(requiredAbsolute(options, 'state'));
+    const archivePath = requiredAbsolute(options, 'archive');
+    const identityFile = requiredAbsolute(options, 'identity');
+    const stateDir = requiredAbsolute(options, 'state');
+    await Promise.all([
+      assertStablePath(archivePath, 'file', false),
+      assertStablePath(identityFile, 'file', false),
+      assertStablePath(stateDir, 'directory', true),
+    ]);
+    await preparePrivateStateDirectory(stateDir);
+    const health = new SubsystemHealthStore(stateDir);
     try {
       const result = await verifyBackup({
-        archivePath: requiredAbsolute(options, 'archive'), identityFile: requiredAbsolute(options, 'identity'), health,
+        archivePath, identityFile, health,
       });
       io.stdout(JSON.stringify({ status: 'open', observedChecks: ['exact archive publication reconciled'], archive: result.archivePath, redactedErrorCode: null, timestamp: now() }));
       return EXIT.ok;
@@ -151,6 +163,13 @@ async function backup(args: readonly string[], io: CliIo): Promise<number> {
   const identityFile = requiredAbsolute(options, 'identity');
   const recipient = required(options, 'recipient');
   if (!/^age1[0-9a-z]{10,}$/.test(recipient)) throw usageError('invalid age recipient');
+  await Promise.all([
+    assertStablePath(workspaceDir, 'directory', false),
+    assertStablePath(stateDir, 'directory', true),
+    assertStablePath(backupDir, 'directory', true),
+    assertStablePath(identityFile, 'file', false),
+  ]);
+  await preparePrivateStateDirectory(stateDir);
   const health = new SubsystemHealthStore(stateDir);
   let repository: Awaited<ReturnType<typeof openRepository>> | undefined;
   try {
@@ -256,6 +275,19 @@ function setWindowsPrivateAcl(path: string): void {
   } catch { throw pathError(); }
 }
 
+function setWindowsPrivateFileAcl(path: string): void {
+  if (process.platform !== 'win32') return;
+  try {
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      "$p=$env:OCPA_PRIVATE_FILE; $i=[Security.Principal.WindowsIdentity]::GetCurrent().User; $a=[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'); & icacls.exe $p '/inheritance:r' '/grant:r' ('*'+$i.Value+':(F)') ('*'+$a.Value+':(F)') | Out-Null; if($LASTEXITCODE -ne 0){exit 1}; $v=Get-Acl -LiteralPath $p; $r=@($v.Access); $s=@($r|ForEach-Object{$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value}); if(!$v.AreAccessRulesProtected -or @($r|Where-Object IsInherited).Count -ne 0 -or @($r|Where-Object AccessControlType -ne Allow).Count -ne 0 -or @($s|Where-Object{$_ -ne $i.Value -and $_ -ne $a.Value}).Count -ne 0 -or $s -notcontains $i.Value){exit 1}",
+    ], {
+      encoding: 'utf8', timeout: 10_000, windowsHide: true,
+      env: windowsPowerShellEnv('OCPA_PRIVATE_FILE', path),
+    });
+  } catch { throw pathError(); }
+}
+
 async function enforcePrivateDirectory(path: string): Promise<void> {
   if (process.platform === 'win32') {
     setWindowsPrivateAcl(path);
@@ -265,6 +297,35 @@ async function enforcePrivateDirectory(path: string): Promise<void> {
   const info = await stat(path);
   if (!info.isDirectory() || (info.mode & 0o777) !== 0o700
     || (typeof process.getuid === 'function' && info.uid !== process.getuid())) throw pathError();
+}
+
+async function enforcePrivateFile(path: string): Promise<void> {
+  if (process.platform === 'win32') {
+    setWindowsPrivateFileAcl(path);
+    return;
+  }
+  await chmod(path, 0o600);
+  const info = await stat(path);
+  if (!info.isFile() || (info.mode & 0o777) !== 0o600
+    || (typeof process.getuid === 'function' && info.uid !== process.getuid())) throw pathError();
+}
+
+async function assertStablePath(path: string, kind: 'file' | 'directory', allowMissing: boolean): Promise<void> {
+  await assertDirectPath(path, allowMissing);
+  const before = await lstat(path).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && allowMissing) return undefined;
+    throw error;
+  });
+  if (!before) return;
+  if (before.isSymbolicLink() || (kind === 'file' ? !before.isFile() : !before.isDirectory())) throw pathError();
+  const after = await lstat(path);
+  if (before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode) throw pathError();
+}
+
+async function preparePrivateStateDirectory(stateDir: string): Promise<void> {
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await assertStablePath(stateDir, 'directory', false);
+  await enforcePrivateDirectory(stateDir);
 }
 
 function windowsPowerShellEnv(name: string, value: string): NodeJS.ProcessEnv {

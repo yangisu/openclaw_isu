@@ -25,6 +25,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 PLUGIN_ROOT="$REPO_ROOT/plugins/openclaw-personal-assistant"
 CRON_TRIGGER="$SCRIPT_DIR/briefing-cron-trigger.js"
+CRON_VALIDATOR="$SCRIPT_DIR/validate-cron-contract.js"
+HARDENED_CONFIG_VALIDATOR="$SCRIPT_DIR/validate-hardened-config.js"
 OPENCLAW="$PLUGIN_ROOT/node_modules/.bin/openclaw"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 SECRET_DIR="$OPENCLAW_HOME/secrets"
@@ -57,6 +59,17 @@ validate_secret_tree() {
     [[ "$before" == "$after" && "$canonical" == "$path" && "$(dirname -- "$canonical")" == "$secret_root"
       && "$before" == *':regular file:'"$owner"':600' ]] || { say "secret_file_invalid:$file"; return 1; }
   done
+}
+
+validate_config_file() {
+  local owner before after canonical
+  [[ -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || { say 'config_file_invalid'; return 1; }
+  owner="$(id -u)"
+  before="$(stat -Lc '%d:%i:%F:%u:%a' -- "$CONFIG_FILE")"
+  canonical="$(readlink -f -- "$CONFIG_FILE")"
+  after="$(stat -Lc '%d:%i:%F:%u:%a' -- "$CONFIG_FILE")"
+  [[ "$before" == "$after" && "$canonical" == "$CONFIG_FILE"
+    && "$before" == *':regular file:'"$owner"':600' ]] || { say 'config_file_invalid'; return 1; }
 }
 
 validate_runtime_tools() {
@@ -102,10 +115,8 @@ validate_cron_contract() {
   owner_id="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.config.telegramUserId | tr -d '"[:space:]')"
   [[ "$owner_id" =~ ^[1-9][0-9]{0,18}$ ]] || { say 'telegram_owner_id_invalid'; return 1; }
   cron_json="$($OPENCLAW cron list --all --json)"
-  node -e '
-const x=JSON.parse(process.argv[1]); const rows=(x.jobs??x).filter(j=>j.declarationKey===process.argv[2]||j.name==="Personal assistant hourly briefing");
-const j=rows[0]; if(rows.length!==1||j.schedule?.expr!==process.argv[3]||j.schedule?.tz!=="Asia/Seoul"||j.schedule?.staggerMs!==0||j.sessionTarget!=="isolated"||j.payload?.message!==process.argv[4]||j.delivery?.mode!=="announce"||j.delivery?.channel!=="telegram"||String(j.delivery?.to)!==process.argv[5]||!j.trigger?.script?.includes("minute === 0")) process.exit(1);
-' "$cron_json" "$CRON_KEY" "$CRON_EXPR" "$CRON_MESSAGE" "$owner_id" || { say 'cron_contract_invalid'; return 1; }
+  printf '%s' "$cron_json" | node "$CRON_VALIDATOR" "$CRON_TRIGGER" "$CRON_KEY" "$CRON_EXPR" "$CRON_MESSAGE" "$owner_id" \
+    || { say 'cron_contract_invalid'; return 1; }
 }
 
 if [[ "$MODE" == "dry-run" ]]; then
@@ -138,9 +149,7 @@ OPENCLAW_VERSION="$($OPENCLAW --version | sed -n 's/^OpenClaw \([^ ]*\).*/\1/p')
 
 if [[ "$MODE" == check ]]; then
   validate_secret_tree
-  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" && "$(readlink -f -- "$CONFIG_FILE")" == "$CONFIG_FILE"
-    && "$(stat -c %u -- "$CONFIG_FILE")" == "$(id -u)" && "$(stat -c %a -- "$CONFIG_FILE")" == 600 ]] \
-    || { say 'config_permissions_invalid'; exit 1; }
+  validate_config_file
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck
@@ -169,7 +178,11 @@ if [[ "$PHASE" == prepare ]]; then
 fi
 
 validate_secret_tree
-[[ "$(stat -c %a "$CONFIG_FILE")" == 600 ]] || { say 'config_permissions_invalid'; exit 1; }
+validate_config_file
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
+OPENCLAW_CONFIG_PATH="$CONFIG_FILE" "$OPENCLAW" config validate
+OPENCLAW_CONFIG_PATH="$CONFIG_FILE" validate_active_config
+"$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
 
 run npm --prefix "$PLUGIN_ROOT" ci
 run npm --prefix "$PLUGIN_ROOT" run build
@@ -178,6 +191,7 @@ run "$OPENCLAW" plugins validate --entry "$PLUGIN_ROOT/dist/index.js"
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
 run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 run "$OPENCLAW" config validate
+validate_active_config
 OWNER_ID="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.config.telegramUserId | tr -d '"[:space:]')"
 [[ "$OWNER_ID" =~ ^[1-9][0-9]{0,18}$ ]] || { say 'telegram_owner_id_invalid'; exit 1; }
 
