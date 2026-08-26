@@ -90,6 +90,19 @@ interface PreparedMutation {
   files: PreparedFile[];
 }
 
+interface WorkspaceRecordLocation {
+  kind: RecordKind;
+  relativePath: string;
+  archived: boolean;
+  record: ParsedRecord;
+}
+
+interface WorkspaceIdIndex {
+  ids: Set<string>;
+  locations: WorkspaceRecordLocation[];
+  byId: Map<string, WorkspaceRecordLocation>;
+}
+
 interface WorkspaceLockMetadata {
   version: 1;
   pid: number;
@@ -303,7 +316,7 @@ export class WorkspaceRepository {
       operationId,
       { action: 'add-task', input },
       'add-task',
-      async () => this.prepareAddTask(operationId, input),
+      async index => this.prepareAddTask(operationId, input, index),
     );
   }
 
@@ -316,7 +329,7 @@ export class WorkspaceRepository {
       operationId,
       { action: 'update-record', targetId, patch },
       'update-record',
-      async () => this.prepareUpdate(operationId, targetId, patch),
+      async index => this.prepareUpdate(operationId, targetId, patch, index),
     );
   }
 
@@ -329,29 +342,18 @@ export class WorkspaceRepository {
       operationId,
       { action: 'archive-record', targetId, reason },
       'archive-record',
-      async () => this.prepareArchive(operationId, targetId, reason),
+      async index => this.prepareArchive(operationId, targetId, reason, index),
     );
   }
 
   async query(criteria: QueryCriteria = {}): Promise<ParsedRecord[]> {
     return this.withLock(async () => {
-      const kinds = criteria.kind
-        ? [criteria.kind]
-        : ALL_KINDS;
-      const records: ParsedRecord[] = [];
-      for (const kind of kinds) {
-        for (const relativePath of await this.documentPaths(kind, false)) {
-          const active = await this.readDocument(kind, relativePath);
-          records.push(...active.document.records.map(cloneRecord));
-        }
-        if (criteria.includeArchived) {
-          for (const relativePath of await this.documentPaths(kind, true)) {
-            const archived = await this.readDocument(kind, relativePath);
-            records.push(...archived.document.records.map(cloneRecord));
-          }
-        }
-      }
-      return records.filter(record => criteria.id === undefined || record.id === criteria.id);
+      const index = await this.buildWorkspaceIdIndex();
+      return index.locations
+        .filter(location => criteria.kind === undefined || location.kind === criteria.kind)
+        .filter(location => criteria.includeArchived || !location.archived)
+        .map(location => cloneRecord(location.record))
+        .filter(record => criteria.id === undefined || record.id === criteria.id);
     });
   }
 
@@ -373,20 +375,20 @@ export class WorkspaceRepository {
     operationId: string,
     payload: unknown,
     action: PreparedMutation['action'],
-    prepare: () => Promise<PreparedMutation>,
+    prepare: (index: WorkspaceIdIndex) => Promise<PreparedMutation>,
   ): Promise<MutationResult> {
     validateOperationId(operationId);
-    const existing = this.ledger.get<PreparedMutation>(operationId);
-    const operation = this.ledger.begin(
-      operationId,
-      this.config.telegramUserId,
-      operationPayloadHash(payload),
-    ) as LedgerOperation<PreparedMutation>;
-    if (operation.phase === 'committed' || operation.phase === 'replied') {
-      return this.replayedResult(operation);
-    }
-
     return this.withLock(async () => {
+      const index = await this.buildWorkspaceIdIndex();
+      const existing = this.ledger.get<PreparedMutation>(operationId);
+      const operation = this.ledger.begin(
+        operationId,
+        this.config.telegramUserId,
+        operationPayloadHash(payload),
+      ) as LedgerOperation<PreparedMutation>;
+      if (operation.phase === 'committed' || operation.phase === 'replied') {
+        return this.replayedResult(operation);
+      }
       const current = this.ledger.get<PreparedMutation>(operationId)!;
       if (current.phase === 'committed' || current.phase === 'replied') {
         return this.replayedResult(current);
@@ -403,7 +405,7 @@ export class WorkspaceRepository {
         }
       } else {
         try {
-          prepared = await prepare();
+          prepared = await prepare(index);
         } catch (error) {
           if (error instanceof WorkspaceRepositoryError && error.code === 'workspace_conflict') {
             await this.appendConflictInbox(operationId, error.message).catch(nested => {
@@ -468,7 +470,7 @@ export class WorkspaceRepository {
       throw error;
     }
 
-    let gitCommit = this.findOperationCommit(operationId);
+    let gitCommit = this.findOperationCommit(operationId, prepared);
     if (!gitCommit) {
       gitCommit = this.commitPrepared(operationId, prepared);
       await this.options.checkpoint?.('afterGitCommit');
@@ -494,16 +496,13 @@ export class WorkspaceRepository {
   private async prepareAddTask(
     operationId: string,
     input: AddTaskInput,
+    index: WorkspaceIdIndex,
   ): Promise<PreparedMutation> {
     const relativePath = managedFile('task');
     this.assertGitPathClean(relativePath);
     const loaded = await this.readDocument('task', relativePath);
-    const archive = await this.readDocument('task', `archive/${relativePath}`);
     const date = dateInSeoul(this.now());
-    const used = new Set([
-      ...loaded.document.records.map(record => record.id),
-      ...archive.document.records.map(record => record.id),
-    ]);
+    const used = index.ids;
     let sequence = 1;
     let id = `T-${date}-${String(sequence).padStart(3, '0')}`;
     while (used.has(id)) {
@@ -542,9 +541,10 @@ export class WorkspaceRepository {
     operationId: string,
     targetId: string,
     patch: RecordPatch,
+    index: WorkspaceIdIndex,
   ): Promise<PreparedMutation> {
     const kind = kindFromId(targetId);
-    const relativePath = await this.findActiveRecordPath(kind, targetId);
+    const relativePath = this.activeRecordPath(index, kind, targetId);
     this.assertGitPathClean(relativePath);
     const loaded = await this.readDocument(kind, relativePath);
     const record = loaded.document.records.find(candidate => candidate.id === targetId);
@@ -572,12 +572,13 @@ export class WorkspaceRepository {
     operationId: string,
     targetId: string,
     reason: string,
+    index: WorkspaceIdIndex,
   ): Promise<PreparedMutation> {
     if (reason.length === 0) {
       throw new WorkspaceRepositoryError('invalid_archive_reason', 'archive reason cannot be empty');
     }
     const kind = kindFromId(targetId);
-    const relativePath = await this.findActiveRecordPath(kind, targetId);
+    const relativePath = this.activeRecordPath(index, kind, targetId);
     const archivePath = kind === 'daily'
       ? `archive/${basename(relativePath)}`
       : `archive/${relativePath}`;
@@ -585,11 +586,11 @@ export class WorkspaceRepository {
     this.assertGitPathClean(archivePath);
     const active = await this.readDocument(kind, relativePath);
     const archived = await this.readDocument(kind, archivePath);
-    const index = active.document.records.findIndex(record => record.id === targetId);
-    if (index < 0) {
+    const recordIndex = active.document.records.findIndex(record => record.id === targetId);
+    if (recordIndex < 0) {
       throw new WorkspaceRepositoryError('record_not_found', `record ${targetId} was not found`);
     }
-    const [record] = active.document.records.splice(index, 1);
+    const [record] = active.document.records.splice(recordIndex, 1);
     record.fields.updated_at = timestampInSeoul(this.now());
     record.fields.archived_at = timestampInSeoul(this.now());
     record.fields.archive_reason = reason;
@@ -741,10 +742,52 @@ export class WorkspaceRepository {
     }
   }
 
-  private async findActiveRecordPath(kind: RecordKind, targetId: string): Promise<string> {
-    for (const relativePath of await this.documentPaths(kind, false)) {
-      const loaded = await this.readDocument(kind, relativePath);
-      if (loaded.document.records.some(record => record.id === targetId)) return relativePath;
+  private async buildWorkspaceIdIndex(): Promise<WorkspaceIdIndex> {
+    const locations: WorkspaceRecordLocation[] = [];
+    const byId = new Map<string, WorkspaceRecordLocation>();
+    for (const kind of ALL_KINDS) {
+      for (const archived of [false, true]) {
+        for (const relativePath of await this.documentPaths(kind, archived)) {
+          let loaded: { text: string | null; document: ParsedDocument };
+          try {
+            loaded = await this.readDocument(kind, relativePath);
+          } catch (error) {
+            if ((error as { code?: string }).code === 'duplicate_id') {
+              throw new WorkspaceRepositoryError(
+                'workspace_duplicate_id',
+                `workspace document ${relativePath} contains a duplicate ID`,
+                error,
+              );
+            }
+            throw error;
+          }
+          for (const record of loaded.document.records) {
+            const location = { kind, relativePath, archived, record };
+            const existing = byId.get(record.id);
+            if (existing !== undefined) {
+              throw new WorkspaceRepositoryError(
+                'workspace_duplicate_id',
+                `record ID ${record.id} occurs in both ${existing.relativePath} and ${relativePath}`,
+                { id: record.id, paths: [existing.relativePath, relativePath] },
+              );
+            }
+            byId.set(record.id, location);
+            locations.push(location);
+          }
+        }
+      }
+    }
+    return { ids: new Set(byId.keys()), locations, byId };
+  }
+
+  private activeRecordPath(
+    index: WorkspaceIdIndex,
+    kind: RecordKind,
+    targetId: string,
+  ): string {
+    const location = index.byId.get(targetId);
+    if (location !== undefined && location.kind === kind && !location.archived) {
+      return location.relativePath;
     }
     throw new WorkspaceRepositoryError('record_not_found', `record ${targetId} was not found`);
   }
@@ -1070,6 +1113,10 @@ export class WorkspaceRepository {
   }
 
   private git(args: readonly string[]): string {
+    return this.gitRaw(args).trim();
+  }
+
+  private gitRaw(args: readonly string[]): string {
     try {
       return execFileSync('git', [...args], {
         cwd: this.config.workspaceDir,
@@ -1077,7 +1124,7 @@ export class WorkspaceRepository {
         timeout: 30_000,
         windowsHide: true,
         maxBuffer: 1024 * 1024,
-      }).trim();
+      });
     } catch (error) {
       throw new WorkspaceRepositoryError('git_failed', `git ${args[0]} failed`, error);
     }
@@ -1093,17 +1140,48 @@ export class WorkspaceRepository {
     }
   }
 
-  private findOperationCommit(operationId: string): string | undefined {
+  private findOperationCommit(
+    operationId: string,
+    prepared: PreparedMutation,
+  ): string | undefined {
     const output = this.git([
       'log', '--all', '--format=%H%x1f%B%x1e', '--fixed-strings',
       `--grep=Assistant-Operation-Id: ${operationId}`,
     ]);
     const trailer = `Assistant-Operation-Id: ${operationId}`;
+    const candidates: string[] = [];
     for (const entry of output.split('\x1e')) {
       const [commit, body = ''] = entry.trim().split('\x1f', 2);
-      if (body.split(/\r?\n/).includes(trailer)) return commit || undefined;
+      if (commit && body.split(/\r?\n/).includes(trailer)) candidates.push(commit);
     }
-    return undefined;
+    if (candidates.length !== 1) return undefined;
+    const [candidate] = candidates;
+    try {
+      this.git(['merge-base', '--is-ancestor', candidate, 'HEAD']);
+      const preparedPaths = new Set(prepared.files.map(file => file.relativePath));
+      const changedPaths = new Set(this.git([
+        'diff-tree', '--no-commit-id', '--name-only', '-r', `${candidate}^!`,
+      ]).split(/\r?\n/).filter(Boolean));
+      if ([...preparedPaths].some(path => !changedPaths.has(path))) return undefined;
+      if ([...changedPaths].some(path => this.isManagedOperationPath(path)
+        && !preparedPaths.has(path))) return undefined;
+      for (const file of prepared.files) {
+        const contents = this.gitRaw(['show', `${candidate}:${file.relativePath}`]);
+        if (sha256(contents) !== file.afterHash) return undefined;
+      }
+      const status = this.git([
+        'status', '--porcelain=v1', '--untracked-files=all', '--', ...preparedPaths,
+      ]);
+      return status.length === 0 ? candidate : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isManagedOperationPath(relativePath: string): boolean {
+    return /^(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md$/.test(relativePath)
+      || /^archive\/(?:TASKS|STUDY|NOTES|USER|MEMORY|INBOX)\.md$/.test(relativePath)
+      || /^(?:memory|archive)\/\d{4}-\d{2}-\d{2}\.md$/.test(relativePath);
   }
 
   private commitPrepared(operationId: string, prepared: PreparedMutation): string {

@@ -65,6 +65,22 @@ function taskInput(index: number): AddTaskInput {
   };
 }
 
+function taskDocument(id: string, status: 'open' | 'archived' = 'open'): string {
+  return [
+    '# Tasks', '', `### ${id} Existing task`, '- type: "task"', `- status: ${status}`,
+    '- priority: normal', '- created_at: 2026-08-25T09:03:00+09:00',
+    '- updated_at: 2026-08-25T09:03:00+09:00', '- source: "manual"', '', 'Existing body', '',
+  ].join('\n');
+}
+
+function dailyDocument(id: string, title: string, entryAt: string): string {
+  return [
+    '# Daily Memory', '', `### ${id} ${title}`, '- type: "daily"', `- entry_at: ${entryAt}`,
+    `- created_at: ${entryAt}`, `- updated_at: ${entryAt}`, '- source: "manual"', '',
+    `${title} body`, '',
+  ].join('\n');
+}
+
 function repositoryUrlForChild(): string {
   if (childRepositoryUrl !== undefined) return childRepositoryUrl;
   const tsc = join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
@@ -170,6 +186,68 @@ describe('WorkspaceRepository', () => {
       .toHaveLength(10);
   }, 20_000);
 
+  it('fails every query closed when two daily files contain the same workspace ID', async () => {
+    const { repo, workspace } = await fixture();
+    await mkdir(join(workspace, 'memory'));
+    const firstPath = join(workspace, 'memory', '2026-08-24.md');
+    const secondPath = join(workspace, 'memory', '2026-08-25.md');
+    await writeFile(firstPath, dailyDocument(
+      'D-090300-001', 'First daily', '2026-08-24T09:03:00+09:00',
+    ));
+    await writeFile(secondPath, dailyDocument(
+      'D-090300-001', 'Second daily', '2026-08-25T09:03:00+09:00',
+    ));
+    git(workspace, 'add', '--', 'memory/2026-08-24.md', 'memory/2026-08-25.md');
+    git(workspace, 'commit', '--quiet', '-m', 'add duplicate daily IDs');
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.query({ kind: 'task' })).rejects.toMatchObject({
+      code: 'workspace_duplicate_id',
+    });
+
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
+    expect(await readFile(firstPath, 'utf8')).toContain('First daily body');
+    expect(await readFile(secondPath, 'utf8')).toContain('Second daily body');
+  });
+
+  it('fails update closed without a ledger row when active and archive contain the same ID', async () => {
+    const { repo, workspace } = await fixture();
+    await mkdir(join(workspace, 'archive'));
+    const active = taskDocument('T-20260825-001');
+    const archived = taskDocument('T-20260825-001', 'archived');
+    await writeFile(join(workspace, 'TASKS.md'), active);
+    await writeFile(join(workspace, 'archive', 'TASKS.md'), archived);
+    git(workspace, 'add', '--', 'TASKS.md', 'archive/TASKS.md');
+    git(workspace, 'commit', '--quiet', '-m', 'add active archive duplicate');
+    const head = git(workspace, 'rev-parse', 'HEAD');
+
+    await expect(repo.updateRecord('duplicate-update', 'T-20260825-001', {
+      title: 'Must not update either copy',
+    })).rejects.toMatchObject({ code: 'workspace_duplicate_id' });
+
+    expect(repo.ledger.get('duplicate-update')).toBeUndefined();
+    expect(await readFile(join(workspace, 'TASKS.md'), 'utf8')).toBe(active);
+    expect(await readFile(join(workspace, 'archive', 'TASKS.md'), 'utf8')).toBe(archived);
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('allocates a task ID not used in either the active or archive workspace index', async () => {
+    const { repo, workspace } = await fixture();
+    await mkdir(join(workspace, 'archive'));
+    await writeFile(join(workspace, 'TASKS.md'), taskDocument('T-20260825-003'));
+    await writeFile(
+      join(workspace, 'archive', 'TASKS.md'),
+      taskDocument('T-20260825-001', 'archived'),
+    );
+    git(workspace, 'add', '--', 'TASKS.md', 'archive/TASKS.md');
+    git(workspace, 'commit', '--quiet', '-m', 'seed non-contiguous global task IDs');
+
+    await expect(repo.addTask('global-id-allocation', taskInput(1)))
+      .resolves.toMatchObject({ id: 'T-20260825-002' });
+  });
+
   it('does not duplicate an applied operation after restart', async () => {
     const { config, repo } = await fixture();
     const first = await repo.addTask('stable-operation-id', taskInput(1));
@@ -235,6 +313,131 @@ describe('WorkspaceRepository', () => {
         .toHaveLength(2);
     },
   );
+
+  it('does not reuse an exact trailer commit that is only reachable on another branch', async () => {
+    let interrupt = true;
+    const operationId = 'unrelated-trailer-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    const unrelatedCandidate = git(workspace, 'rev-parse', 'HEAD');
+    const exactPreparedText = await readFile(join(workspace, 'TASKS.md'), 'utf8');
+    git(workspace, 'branch', 'unrelated-candidate', unrelatedCandidate);
+    git(workspace, 'reset', '--hard', 'HEAD^');
+    await writeFile(join(workspace, 'ordinary-parent.txt'), 'different recovery parent\n');
+    git(workspace, 'add', '--', 'ordinary-parent.txt');
+    git(workspace, 'commit', '--quiet', '-m', 'different recovery parent');
+    await writeFile(join(workspace, 'TASKS.md'), exactPreparedText);
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).not.toBe(unrelatedCandidate);
+    expect(git(workspace, 'merge-base', '--is-ancestor', recovered.gitCommit!, 'HEAD')).toBe('');
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('does not reuse an ancestor trailer commit whose prepared blob is wrong', async () => {
+    let interrupt = true;
+    const operationId = 'wrong-blob-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    const exactPreparedText = await readFile(join(workspace, 'TASKS.md'), 'utf8');
+    git(workspace, 'reset', '--hard', 'HEAD^');
+    await writeFile(join(workspace, 'TASKS.md'), taskDocument('T-20260825-001'));
+    git(workspace, 'add', '--', 'TASKS.md');
+    git(workspace, 'commit', '--quiet', '-m', 'wrong prepared blob', '-m',
+      `Assistant-Operation-Id: ${operationId}`);
+    const wrongCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'TASKS.md'), exactPreparedText);
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).not.toBe(wrongCandidate);
+    expect(git(workspace, 'status', '--short')).toBe('');
+    expect(git(workspace, 'show', `${recovered.gitCommit}:TASKS.md`)).toContain('Task 1');
+  });
+
+  it('does not reuse a trailer commit that touched an extra managed workspace path', async () => {
+    let interrupt = true;
+    const operationId = 'extra-managed-path-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    const exactPreparedText = await readFile(join(workspace, 'TASKS.md'), 'utf8');
+    git(workspace, 'reset', '--hard', 'HEAD^');
+    await writeFile(join(workspace, 'TASKS.md'), exactPreparedText);
+    await writeFile(join(workspace, 'NOTES.md'), '# Notes\n\n');
+    git(workspace, 'add', '--', 'TASKS.md', 'NOTES.md');
+    git(workspace, 'commit', '--quiet', '-m', 'candidate with extra managed path', '-m',
+      `Assistant-Operation-Id: ${operationId}`);
+    const extraPathCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'TASKS.md'), '# Tasks\n\n');
+    git(workspace, 'add', '--', 'TASKS.md');
+    git(workspace, 'commit', '--quiet', '-m', 'later unrelated workspace state');
+    await writeFile(join(workspace, 'TASKS.md'), exactPreparedText);
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).not.toBe(extraPathCandidate);
+    expect(git(workspace, 'show', '--format=', '--name-only', recovered.gitCommit!)).toBe('TASKS.md');
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('does not reuse either commit when an exact operation trailer is ambiguous', async () => {
+    let interrupt = true;
+    const operationId = 'ambiguous-trailer-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    const exactPreparedText = await readFile(join(workspace, 'TASKS.md'), 'utf8');
+    git(workspace, 'reset', '--hard', 'HEAD^');
+    for (const title of ['First wrong candidate', 'Second wrong candidate']) {
+      await writeFile(join(workspace, 'TASKS.md'), `${taskDocument('T-20260825-001')}\n${title}\n`);
+      git(workspace, 'add', '--', 'TASKS.md');
+      git(workspace, 'commit', '--quiet', '-m', title, '-m',
+        `Assistant-Operation-Id: ${operationId}`);
+    }
+    const newestAmbiguousCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'TASKS.md'), exactPreparedText);
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).not.toBe(newestAmbiguousCandidate);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
+
+  it('reuses a unique exact ancestor commit despite unrelated files in a later parent tree', async () => {
+    let interrupt = true;
+    const operationId = 'valid-ancestor-candidate';
+    const { config, repo, workspace } = await fixture(phase => {
+      if (phase === 'afterGitCommit' && interrupt) throw new Error('crash:afterGitCommit');
+    });
+    await expect(repo.addTask(operationId, taskInput(1))).rejects.toThrow('crash:afterGitCommit');
+    const validCandidate = git(workspace, 'rev-parse', 'HEAD');
+    await writeFile(join(workspace, 'ordinary.txt'), 'ordinary later file\n');
+    git(workspace, 'add', '--', 'ordinary.txt');
+    git(workspace, 'commit', '--quiet', '-m', 'later unrelated file');
+    interrupt = false;
+
+    const restarted = await restart(config, repo);
+    const recovered = await restarted.addTask(operationId, taskInput(1));
+
+    expect(recovered.gitCommit).toBe(validCandidate);
+    expect(git(workspace, 'status', '--short')).toBe('');
+  });
 
   it('recovers a dead child process lock and quarantines only its known temp file', async () => {
     const { config, repo, workspace } = await fixture();
