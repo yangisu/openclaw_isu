@@ -263,6 +263,19 @@ describe('deployment scripts', () => {
     expect(spawnSync(process.execPath, [runtimeToolsValidator], { input: JSON.stringify(valid), encoding: 'utf8' }).status).not.toBe(0);
   });
 
+  it('validates mixed plugin registration through runtime inspection without the tool-only entry validator', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).not.toMatch(/plugins\s+(?:build|validate)\s+--entry/);
+    const install = source.indexOf('plugins install --link "$PLUGIN_ROOT"');
+    const runtime = source.indexOf('validate_runtime_tools', install);
+    expect(install).toBeGreaterThan(-1);
+    expect(runtime).toBeGreaterThan(install);
+    const checkBlock = source.split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
+    expect(checkBlock).toContain('validate_runtime_tools');
+    expect(checkBlock).toContain('node "$MIXED_ENTRY_VALIDATOR"');
+    expect(checkBlock).not.toMatch(/run plugin:validate|run (?:plugin:)?build/);
+  });
+
   it('suppresses OpenClaw startup catch-up outside an exact Seoul hour', () => {
     const source = readFileSync(installer, 'utf8');
     const trigger = resolve(repo, 'scripts/wsl/briefing-cron-trigger.js');

@@ -52,7 +52,7 @@ The local test evidence covers the remaining safe component contracts, including
 - `AC-20` remains `NOT_VERIFIED` until the built plugin runtime connects OAuth refresh and CalDAV failures to the durable calendar-only gate and owner-facing reason while local functions stay available.
 - `AC-29` remains `NOT_VERIFIED` until the built plugin's production startup path invokes stale-submission recovery without replay and confirmation consumption is bound to that runtime flow.
 
-`AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: update/delete tools are absent, but an executable response path has not yet proven the exact Naver-app guidance. Review each artifact rather than relying only on summary counts.
+`AC-05` remains `NOT_VERIFIED` until every requested local record kind has a real add-and-query path; the current mutation tool adds tasks only. `AC-09` also remains `NOT_VERIFIED`: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded, so both confirmation entry points remain non-writing and no single-use confirmation can be consumed. Review each artifact rather than relying only on summary counts.
 
 ## Final gate
 

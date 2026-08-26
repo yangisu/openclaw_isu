@@ -83,7 +83,7 @@ node plugins/openclaw-personal-assistant/dist/cli.js oauth status \
   --token-file "$HOME/.openclaw/secrets/naver-oauth-token"
 ```
 
-Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. Calendar confirmation obtains a safety-window-valid access token from the production provider; it never reads an access token directly.
+Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. The production token provider validates and refreshes these stores, but calendar creation is currently disabled: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded. Neither `/assistant-confirm` nor the `assistant_calendar_confirm` tool can perform an external write, and `AC-09` remains `NOT_VERIFIED`.
 
 ## 4. Finish installation
 
@@ -92,7 +92,7 @@ bash scripts/wsl/install-openclaw.sh --finish
 bash scripts/wsl/install-openclaw.sh --check
 ```
 
-The finish phase builds and validates the plugin with the package-local CLI, links it, validates the hardened config, installs/enables the user Gateway service, and declares one idempotent isolated Cron job with:
+The finish phase builds the mixed plugin, validates its built registration contract, links it, and then validates the installed plugin through package-local OpenClaw runtime inspection. OpenClaw 2026.7.1's `plugins build/validate --entry` commands are for simple `defineToolPlugin` entries and are not used for this mixed `definePluginEntry`. The installer then validates the hardened config, installs/enables the user Gateway service, and declares one idempotent isolated Cron job with:
 
 - expression `0 8-22 * * *`
 - timezone `Asia/Seoul`
@@ -148,7 +148,7 @@ node plugins/openclaw-personal-assistant/dist/cli.js oauth revoke \
   --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-For the create PoC, create exactly one clearly named test event after the single-use confirmation. Verify there is no duplicate, then delete that one test event yourself in the Naver app. The assistant does not modify or delete Naver events.
+There is no automated create PoC while the confirmation boundary is fail-closed. If a future approved OpenClaw release provides direct, non-forwarded owner provenance and the production boundary is implemented and reviewed, create exactly one clearly named test event after the single-use confirmation, verify there is no duplicate, and delete that one event yourself in the Naver app. The assistant does not modify or delete Naver events.
 
 ## 6. Backup and restore boundary
 

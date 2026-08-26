@@ -1,4 +1,4 @@
-import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 import { Type } from 'typebox';
 
 import { TELEGRAM_USER_ID_PATTERN } from '../telegram-user-id.js';
@@ -32,61 +32,14 @@ export const configSchema = Type.Object({
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
-export default defineToolPlugin({
-  id: 'openclaw-personal-assistant',
-  name: 'OpenClaw Personal Assistant',
-  description: 'Owner-scoped local records, Naver calendar, and briefings.',
-  configSchema,
-  tools: tool => [
-    tool({
-      name: 'assistant_query',
-      label: 'Assistant Query',
-      description: 'Read owner-scoped local records or Naver CalDAV events as quoted untrusted data.',
-      parameters: queryParameters,
-      optional: true,
-      factory({ api, toolContext }) {
-        return createQueryTool(api, toolContext);
-      },
-    }),
-    tool({
-      name: 'assistant_mutate',
-      label: 'Assistant Mutate',
-      description: 'Add, modify, or archive one owner-scoped local record with an idempotent operation ID.',
-      parameters: mutationParameters,
-      optional: true,
-      factory({ api, toolContext }) {
-        return createMutationTool(api, toolContext);
-      },
-    }),
-    tool({
-      name: 'assistant_calendar_prepare',
-      label: 'Assistant Calendar Prepare',
-      description: 'Prepare one Naver calendar event locally without writing to Naver.',
-      parameters: calendarPrepareParameters,
-      optional: true,
-      factory({ api, toolContext }) {
-        return createCalendarPrepareTool(api, toolContext);
-      },
-    }),
-    tool({
-      name: 'assistant_calendar_confirm',
-      label: 'Assistant Calendar Confirm',
-      description: 'Create one prepared Naver event after explicit owner confirmation.',
-      parameters: calendarConfirmParameters,
-      optional: true,
-      factory({ api, toolContext }) {
-        return createCalendarConfirmTool(api, toolContext);
-      },
-    }),
-    tool({
-      name: 'assistant_briefing',
-      label: 'Assistant Briefing',
-      description: 'Build one deterministic owner briefing from local records and fresh calendar state.',
-      parameters: briefingParameters,
-      optional: true,
-      factory({ api, toolContext }) {
-        return createBriefingTool(api, toolContext);
-      },
-    }),
-  ],
-});
+export function registerAssistantTools(api: OpenClawPluginApi): void {
+  api.registerTool(context => createQueryTool(api, context), { name: 'assistant_query', optional: true });
+  api.registerTool(context => createMutationTool(api, context), { name: 'assistant_mutate', optional: true });
+  api.registerTool(context => createCalendarPrepareTool(api, context), {
+    name: 'assistant_calendar_prepare', optional: true,
+  });
+  api.registerTool(context => createCalendarConfirmTool(api, context), {
+    name: 'assistant_calendar_confirm', optional: true,
+  });
+  api.registerTool(context => createBriefingTool(api, context), { name: 'assistant_briefing', optional: true });
+}

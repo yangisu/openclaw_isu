@@ -118,9 +118,9 @@ interface CalendarPrepareResult {
 interface CalendarConfirmResult {
   requestId: string;
   payloadHash: string;
-  status: CalendarRequest['status'];
-  attemptCount: number;
-  errorCode?: string;
+  status: 'confirmation_unavailable';
+  externalWrite: false;
+  errorCode: 'host_provenance_unavailable';
 }
 
 export function createCalendarPrepareTool(
@@ -192,19 +192,15 @@ export function createCalendarConfirmTool(
         throw new AssistantToolError('invalid_parameters', 'Calendar confirmation parameters do not match the tool schema');
       }
       signal?.throwIfAborted();
-      const outbox = await (dependencies.openOutbox ?? openConfirmOutbox)(config);
-      try {
-        const request = await outbox.confirmAndSubmit(params.requestId, senderId, params.payloadHash);
-        return jsonResult({
-          requestId: request.requestId,
-          payloadHash: request.payloadHash,
-          status: request.status,
-          attemptCount: request.attemptCount,
-          ...(request.errorCode === undefined ? {} : { errorCode: request.errorCode }),
-        });
-      } finally {
-        outbox.close();
-      }
+      void senderId;
+      void dependencies;
+      return jsonResult({
+        requestId: params.requestId,
+        payloadHash: params.payloadHash,
+        status: 'confirmation_unavailable',
+        externalWrite: false,
+        errorCode: 'host_provenance_unavailable',
+      });
     },
   };
 }
@@ -232,18 +228,6 @@ function openPrepareOutbox(config: AssistantToolConfig): PreparedOutbox {
     caldav: {
       async listEvents() {
         throw new AssistantToolError('external_read_forbidden', 'Calendar prepare cannot read externally');
-      },
-    },
-  });
-}
-
-async function openConfirmOutbox(config: AssistantToolConfig): Promise<ConfirmingOutbox> {
-  return new CalendarOutbox({
-    stateDir: config.stateDir,
-    api: await createCalendarWriteApi(config),
-    caldav: {
-      async listEvents() {
-        throw new AssistantToolError('external_read_forbidden', 'Calendar confirmation does not read CalDAV');
       },
     },
   });

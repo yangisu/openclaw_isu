@@ -3,16 +3,14 @@ import { rm } from 'node:fs/promises';
 
 import { Value } from 'typebox/value';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getToolPluginMetadata } from 'openclaw/plugin-sdk/tool-plugin';
-
 import plugin from '../../src/index.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
 import { createBriefingTool } from '../../src/tools/briefing.js';
 import { SubsystemHealthStore } from '../../src/state/health.js';
 import {
-  createCalendarConfirmTool, createCalendarPrepareTool, createCalendarWriteApi,
+  calendarConfirmParameters, createCalendarConfirmTool, createCalendarPrepareTool, createCalendarWriteApi,
 } from '../../src/tools/calendar.js';
-import { createMutationTool } from '../../src/tools/mutate.js';
+import { createMutationTool, mutationParameters } from '../../src/tools/mutate.js';
 import { createQueryTool } from '../../src/tools/query.js';
 import { configSchema } from '../../src/tools/register.js';
 
@@ -55,8 +53,14 @@ afterEach(async () => {
 
 describe('OpenClaw personal-assistant tool boundary', () => {
   it('registers exactly five statically owned optional tools', () => {
-    const metadata = getToolPluginMetadata(plugin);
-    expect(metadata?.tools.map(tool => ({ name: tool.name, optional: tool.optional }))).toEqual([
+    const registrations: Array<{ name?: string; optional?: boolean }> = [];
+    plugin.register({
+      config: {}, pluginConfig: config, registrationMode: 'tool-discovery',
+      registerTool(_factory: unknown, options: { name?: string; optional?: boolean }) {
+        registrations.push(options);
+      },
+    } as never);
+    expect(registrations).toEqual([
       { name: 'assistant_query', optional: true },
       { name: 'assistant_mutate', optional: true },
       { name: 'assistant_calendar_prepare', optional: true },
@@ -65,13 +69,51 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     ]);
   });
 
-  it('registers five tools without a model-controlled message_sent correlation hook', () => {
+  it('registers five tools plus a full-mode service and owner command without model correlation hooks', () => {
     const registerTool = vi.fn();
+    const registerService = vi.fn();
+    const registerCommand = vi.fn();
     const on = vi.fn();
-    plugin.register({ config: {}, pluginConfig: config, registerTool, on } as never);
+    plugin.register({
+      config: {}, pluginConfig: config, registrationMode: 'full',
+      registerTool, registerService, registerCommand, on,
+    } as never);
 
     expect(registerTool).toHaveBeenCalledTimes(5);
+    expect(registerService).toHaveBeenCalledTimes(1);
+    expect(registerCommand).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'assistant-confirm', acceptsArgs: true, requireAuth: true, exposeSenderIsOwner: true,
+    }));
     expect(on).not.toHaveBeenCalled();
+  });
+
+  it('keeps the owner command fail-closed for incomplete, non-owner, and forwarded-unverifiable contexts', async () => {
+    const commands: Array<{ handler(context: Record<string, unknown>): Promise<{ text?: string }> | { text?: string } }> = [];
+    plugin.register({
+      config: {}, pluginConfig: config, registrationMode: 'full',
+      registerTool() {}, registerService() {}, registerCommand(command: unknown) { commands.push(command as never); },
+    } as never);
+    const command = commands[0]!;
+    const base = {
+      channel: 'telegram', channelId: 'telegram', isAuthorizedSender: true, senderIsOwner: true,
+      senderId: config.telegramUserId, from: `telegram:${config.telegramUserId}`,
+      to: `telegram:${config.telegramUserId}`, args: '11111111-1111-4111-8111-111111111111',
+      commandBody: '/assistant-confirm 11111111-1111-4111-8111-111111111111', config: {},
+      requestConversationBinding: async () => ({ status: 'error' }),
+      detachConversationBinding: async () => ({ removed: false }),
+      getCurrentConversationBinding: async () => null,
+    };
+
+    for (const context of [
+      base,
+      { ...base, senderIsOwner: false },
+      { ...base, senderId: '999', from: 'telegram:999' },
+      { ...base, args: 'not-a-request-id' },
+    ]) {
+      const result = await command.handler(context);
+      expect(result.text).toMatch(/unavailable/i);
+      expect(result.text).not.toMatch(/11111111|123456789|not-a-request-id/);
+    }
   });
 
   it.each([
@@ -438,7 +480,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     outbox.close();
   });
 
-  it('binds confirmation to request ID, payload hash, and the trusted owner sender', async () => {
+  it('keeps direct model-tool confirmation non-writing when host provenance cannot exclude forwarded input', async () => {
     const requestId = '11111111-1111-4111-8111-111111111111';
     const payloadHash = 'b'.repeat(64);
     const confirmAndSubmit = vi.fn(async (receivedRequestId, senderId, receivedHash) => ({
@@ -454,13 +496,16 @@ describe('OpenClaw personal-assistant tool boundary', () => {
 
     const result = await tool.execute('call-6', { requestId, payloadHash });
 
-    expect(confirmAndSubmit).toHaveBeenCalledWith(requestId, config.telegramUserId, payloadHash);
-    expect(result.details).toMatchObject({ requestId, payloadHash, status: 'succeeded' });
+    expect(confirmAndSubmit).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({
+      requestId, payloadHash, status: 'confirmation_unavailable', externalWrite: false,
+      errorCode: 'host_provenance_unavailable',
+    });
     expect(result.details).not.toHaveProperty('payloadIcal');
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
   });
 
-  it('uses the real outbox to consume confirmation once without a duplicate external write', async () => {
+  it('never opens the real outbox or writes externally from direct confirmation tool calls', async () => {
     const stateDir = `/tmp/openclaw-tool-confirm-${randomUUID()}`;
     temporaryStateDirs.push(stateDir);
     const scopedApi = api({ stateDir });
@@ -488,12 +533,12 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     };
 
     await expect(confirm.execute('call-confirm-real', confirmation)).resolves.toMatchObject({
-      details: { status: 'succeeded', attemptCount: 1 },
+      details: { status: 'confirmation_unavailable', externalWrite: false },
     });
-    await expect(confirm.execute('call-confirm-duplicate', confirmation)).rejects.toMatchObject({
-      code: 'confirmation_consumed',
+    await expect(confirm.execute('call-confirm-duplicate', confirmation)).resolves.toMatchObject({
+      details: { status: 'confirmation_unavailable', externalWrite: false },
     });
-    expect(createSchedule).toHaveBeenCalledTimes(1);
+    expect(createSchedule).not.toHaveBeenCalled();
   });
 
   it('refreshes through the real token provider before constructing the Naver create client', async () => {
@@ -550,9 +595,8 @@ describe('OpenClaw personal-assistant tool boundary', () => {
   });
 
   it('exposes strict schemas with no generic command or delete surface', () => {
-    const metadata = getToolPluginMetadata(plugin)!;
-    const mutation = metadata.tools.find(tool => tool.name === 'assistant_mutate')!.parameters;
-    const confirm = metadata.tools.find(tool => tool.name === 'assistant_calendar_confirm')!.parameters;
+    const mutation = mutationParameters;
+    const confirm = calendarConfirmParameters;
 
     expect(Value.Check(mutation, {
       operationId: 'op-1', action: 'modify', recordType: 'task', title: 'missing target',

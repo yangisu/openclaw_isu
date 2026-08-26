@@ -11,8 +11,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
-    "plugin:validate": "npm run plugin:build && openclaw plugins validate --entry ./dist/index.js",
+    "plugin:build": "npm run build",
+    "plugin:validate": "npm run plugin:build && node scripts/validate-mixed-entry.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

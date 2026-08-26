@@ -29,6 +29,7 @@ CRON_VALIDATOR="$SCRIPT_DIR/validate-cron-contract.js"
 HARDENED_CONFIG_VALIDATOR="$SCRIPT_DIR/validate-hardened-config.js"
 ACTIVE_CONFIG_PATH_VALIDATOR="$SCRIPT_DIR/validate-active-config-path.js"
 RUNTIME_TOOLS_VALIDATOR="$SCRIPT_DIR/validate-runtime-tools.js"
+MIXED_ENTRY_VALIDATOR="$PLUGIN_ROOT/scripts/validate-mixed-entry.mjs"
 OPENCLAW="$PLUGIN_ROOT/node_modules/.bin/openclaw"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 SECRET_DIR="$OPENCLAW_HOME/secrets"
@@ -131,7 +132,7 @@ validate_cron_contract() {
 if [[ "$MODE" == "dry-run" ]]; then
   say "DRY_RUN verify Ubuntu $EXPECTED_UBUNTU, Node >=$MIN_NODE <$MAX_NODE, systemd, lingering"
   say "DRY_RUN verify package-local OpenClaw $EXPECTED_OPENCLAW"
-  say "DRY_RUN build, validate, and inspect exact optional tools: assistant_briefing,assistant_calendar_confirm,assistant_calendar_prepare,assistant_mutate,assistant_query"
+  say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_confirm,assistant_calendar_prepare,assistant_mutate,assistant_query"
   say "DRY_RUN install owner-private token/config files and user systemd service"
   say "DRY_RUN declare exactly one Cron row: $CRON_EXPR $CRON_TZ staggerMs=0 isolated announce telegram owner"
   say 'DRY_RUN exact-hour trigger suppresses OpenClaw startup catch-up/replay'
@@ -164,7 +165,7 @@ if [[ "$MODE" == check ]]; then
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck
-  "$OPENCLAW" plugins validate --entry "$PLUGIN_ROOT/dist/index.js"
+  node "$MIXED_ENTRY_VALIDATOR"
   validate_runtime_tools
   "$OPENCLAW" config validate
   validate_active_config
@@ -199,9 +200,7 @@ node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
 "$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
 
 run npm --prefix "$PLUGIN_ROOT" ci
-run npm --prefix "$PLUGIN_ROOT" run build
-run "$OPENCLAW" plugins build --entry "$PLUGIN_ROOT/dist/index.js"
-run "$OPENCLAW" plugins validate --entry "$PLUGIN_ROOT/dist/index.js"
+run npm --prefix "$PLUGIN_ROOT" run plugin:validate
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
 run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 validate_config_file "$ACTIVE_CONFIG_FILE"

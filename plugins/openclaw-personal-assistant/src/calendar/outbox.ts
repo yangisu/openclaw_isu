@@ -583,6 +583,19 @@ export class CalendarOutbox {
     return reconciled;
   }
 
+  pendingReconcileIds(limit: number): string[] {
+    this.#assertOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new CalendarOutboxError('invalid_reconcile_limit', 'Reconciliation limit must be between 1 and 100');
+    }
+    const rows = this.#database.prepare(`
+      SELECT request_id FROM calendar_requests
+      WHERE status = 'pending_reconcile'
+      ORDER BY created_at, request_id LIMIT ?
+    `).all(limit) as Array<{ request_id: string }>;
+    return rows.map(row => row.request_id);
+  }
+
   pruneSucceeded(evidence: VerifiedOutboxBackupEvidence): string[] {
     this.#assertOpen();
     const verified = evidence && typeof evidence === 'object' ? VERIFIED_EVIDENCE.get(evidence) : undefined;
