@@ -21,13 +21,15 @@ export function isOwnerOnlySecretMode(mode: number, platform: NodeJS.Platform = 
 
 export class SecretFileStore<T> {
   readonly #path: string;
+  readonly #maxBytes: number;
 
-  constructor(path: string) {
+  constructor(path: string, maxBytes = 1_048_576) {
     this.#path = path;
+    this.#maxBytes = maxBytes;
   }
 
   async read(): Promise<T> {
-    const serialized = await readSecretFile(this.#path, productionSecretFs);
+    const serialized = await readSecretFile(this.#path, productionSecretFs, this.#maxBytes);
     try {
       return JSON.parse(serialized) as T;
     } catch {

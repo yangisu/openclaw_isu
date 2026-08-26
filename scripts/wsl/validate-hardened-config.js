@@ -27,7 +27,8 @@ try {
     || config.tools?.elevated?.enabled !== false || JSON.stringify([...(config.tools?.allow ?? [])].sort()) !== JSON.stringify(expectedTools)
     || plugin?.enabled !== true || plugin?.config?.timezone !== 'Asia/Seoul'
     || calendar?.caldavSecretFile !== join(secretDir, 'naver-caldav').replaceAll('\\', '/')
-    || calendar?.naverTokenFile !== join(secretDir, 'naver-oauth').replaceAll('\\', '/')
+    || calendar?.naverOAuthClientFile !== join(secretDir, 'naver-oauth-client').replaceAll('\\', '/')
+    || calendar?.naverTokenFile !== join(secretDir, 'naver-oauth-token').replaceAll('\\', '/')
     || !validCalendarMappings(calendar)
     || containsPlaceholder(config)) throw new Error('hardening');
   process.stdout.write('{"status":"PASS"}\n');

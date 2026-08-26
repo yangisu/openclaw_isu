@@ -1,24 +1,107 @@
 import { chmod, lstat, mkdtemp, mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { runCli, type CliIo } from '../src/cli.js';
+import { runCli, type CliDependencies, type CliIo } from '../src/cli.js';
 import { buildBriefing } from '../src/briefing/build.js';
 import { applyRetention } from '../src/ops/backup.js';
 import { SubsystemHealthStore } from '../src/state/health.js';
 
-function capture(): { io: CliIo; stdout: string[]; stderr: string[] } {
+function capture(stdin = ''): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
   const stderr: string[] = [];
   return {
     stdout,
     stderr,
-    io: { stdout: value => stdout.push(value), stderr: value => stderr.push(value) },
+    io: { stdout: value => stdout.push(value), stderr: value => stderr.push(value), readStdin: async () => stdin },
   };
 }
 
 describe('operational CLI', () => {
+  it('runs the Naver OAuth lifecycle with sensitive values only on private stdin and secret stores', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-cli-'));
+    const clientFile = join(root, 'naver-client.json');
+    const tokenFile = join(root, 'naver-token.json');
+    const state = join(root, 'state');
+    const credentials = {
+      version: 1 as const, clientId: 'owner-client', clientSecret: 'client-secret-canary',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    };
+    const credentialStore = new CliMemoryStore<unknown>();
+    const tokenStore = new CliMemoryStore<unknown>();
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'access-token-canary', refresh_token: 'refresh-token-canary',
+        token_type: 'bearer', expires_in: 3600,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'access-token-refreshed', token_type: 'bearer', expires_in: 7200,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('', { status: 200 }));
+    const dependencies: CliDependencies = {
+      credentialStore: () => credentialStore,
+      tokenStore: () => tokenStore as never,
+      oauthFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+    };
+    const common = ['--client-file', clientFile, '--token-file', tokenFile, '--state', state];
+
+    const configured = capture(JSON.stringify(credentials));
+    expect(await runCli(['oauth', 'configure', '--client-file', clientFile], configured.io, dependencies)).toBe(0);
+    const begun = capture();
+    expect(await runCli(['oauth', 'begin', '--client-file', clientFile, '--state', state], begun.io, dependencies)).toBe(0);
+    const authorization = JSON.parse(begun.stdout[0]!);
+    const authorizationUrl = new URL(authorization.authorizationUrl);
+    const stateValue = authorizationUrl.searchParams.get('state')!;
+    const completed = capture(JSON.stringify({
+      callbackUrl: `${credentials.redirectUri}?code=authorization-code-canary&state=${encodeURIComponent(stateValue)}`,
+    }));
+    expect(await runCli(['oauth', 'callback', ...common], completed.io, dependencies)).toBe(0);
+    expect(await runCli(['oauth', 'refresh', ...common], capture().io, dependencies)).toBe(0);
+    expect(await runCli([
+      'oauth', 'status', '--client-file', clientFile, '--token-file', tokenFile,
+    ], capture().io, dependencies)).toBe(0);
+    const revoked = capture();
+    expect(await runCli(['oauth', 'revoke', ...common], revoked.io, dependencies)).toBe(0);
+
+    const exposed = [configured, begun, completed, revoked].flatMap(item => [...item.stdout, ...item.stderr]).join('\n');
+    expect(exposed).not.toMatch(/client-secret-canary|authorization-code-canary|access-token-canary|refresh-token-canary|access-token-refreshed/);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(tokenStore.value).toBeUndefined();
+    expect(common.join(' ')).not.toMatch(/canary|code|secret/i);
+  });
+
+  it('rejects a callback whose exact redirect query contains an unapproved field before exchange', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-redirect-'));
+    const clientFile = join(root, 'client.json');
+    const tokenFile = join(root, 'token.json');
+    const state = join(root, 'state');
+    const credentials = new CliMemoryStore<unknown>({
+      version: 1, clientId: 'client', clientSecret: 'secret',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    });
+    const fetch = vi.fn();
+    const dependencies: CliDependencies = {
+      credentialStore: () => credentials,
+      tokenStore: () => new CliMemoryStore() as never,
+      oauthFetch: fetch,
+    };
+    const begun = capture();
+    expect(await runCli([
+      'oauth', 'begin', '--client-file', clientFile, '--state', state,
+    ], begun.io, dependencies)).toBe(0);
+    const stateValue = new URL(JSON.parse(begun.stdout[0]!).authorizationUrl).searchParams.get('state')!;
+    const callback = capture(JSON.stringify({
+      callbackUrl: `http://127.0.0.1:1456/naver/callback?code=private&state=${stateValue}&extra=1`,
+    }));
+
+    expect(await runCli([
+      'oauth', 'callback', '--client-file', clientFile, '--token-file', tokenFile, '--state', state,
+    ], callback.io, dependencies)).toBe(64);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(callback.stdout).toEqual([]);
+  });
   it('initializes only private directories and non-secret templates without overwriting data', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-cli-'));
     const out = capture();
@@ -45,7 +128,7 @@ describe('operational CLI', () => {
     await expect(lstat(join(target, 'new-root'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('records a redacted PoC result and doctor fails closed for closed gates', async () => {
+  it('records a redacted PoC report while doctor keeps operator-authored gates unknown', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-gate-'));
     const state = join(root, 'state');
     const evidence = join(root, 'evidence.json');
@@ -60,7 +143,40 @@ describe('operational CLI', () => {
     expect(poc.stdout.join('')).toContain('authentication rejected without credential disclosure');
     const doctor = capture();
     expect(await runCli(['doctor', '--state', state], doctor.io)).toBe(1);
-    expect(doctor.stdout.join('')).toContain('caldav: closed');
+    expect(doctor.stdout.join('')).toContain('caldav: unknown');
+  });
+
+  it('keeps fabricated Naver PoC evidence report-only and derives OAuth readiness from fresh secret state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-oauth-doctor-'));
+    const state = join(root, 'state');
+    const evidence = join(root, 'evidence.json');
+    const clientFile = join(root, 'client.json');
+    const tokenFile = join(root, 'token.json');
+    await writeFile(evidence, JSON.stringify({
+      status: 'open', observedChecks: ['operator claimed Naver OAuth success'], redactedErrorCode: null,
+      timestamp: new Date().toISOString(),
+    }));
+    expect(await runCli(['poc', 'naver-oauth', '--state', state, '--evidence', evidence], capture().io)).toBe(0);
+    const fabricated = capture();
+    expect(await runCli(['doctor', '--state', state], fabricated.io)).toBe(1);
+    expect(fabricated.stdout.join('\n')).toContain('naver-oauth: unknown');
+
+    const dependencies: CliDependencies = {
+      credentialStore: () => new CliMemoryStore({
+        version: 1 as const, clientId: 'client', clientSecret: 'secret',
+        redirectUri: 'http://127.0.0.1:1456/naver/callback',
+      }),
+      tokenStore: () => new CliMemoryStore({
+        version: 1 as const, accessToken: 'access', refreshToken: 'refresh',
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+    };
+    const derived = capture();
+    expect(await runCli([
+      'doctor', '--state', state, '--naver-client-file', clientFile, '--naver-token-file', tokenFile,
+    ], derived.io, dependencies)).toBe(1);
+    expect(derived.stdout.join('\n')).toContain('naver-oauth: open');
+    expect(derived.stdout.join('\n')).toContain('naver-create: unknown');
   });
 
   it('rejects extra PoC evidence fields before secrets can reach stdout or durable state', async () => {
@@ -111,7 +227,7 @@ describe('operational CLI', () => {
     expect(stored).toEqual(printed);
   });
 
-  it('doctor reports missing and expired durable evidence as non-success', async () => {
+  it('doctor keeps missing and expired operator evidence report-only and unknown', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-doctor-'));
     const state = join(root, 'state');
     await mkdir(join(state, 'gates'), { recursive: true });
@@ -121,7 +237,7 @@ describe('operational CLI', () => {
     }));
     const output = capture();
     expect(await runCli(['doctor', '--state', state, '--max-age-hours', '24'], output.io)).toBe(1);
-    expect(output.stdout.join('')).toContain('openai: expired');
+    expect(output.stdout.join('')).toContain('openai: unknown');
     expect(output.stdout.join('')).toContain('caldav: unknown');
   });
 
@@ -262,3 +378,13 @@ describe('operational CLI', () => {
     expect(output.stderr.join('')).not.toContain('secret-value');
   });
 });
+
+class CliMemoryStore<T> {
+  constructor(public value?: T) {}
+  async read(): Promise<T> {
+    if (this.value === undefined) throw Object.assign(new Error('missing'), { code: 'secret_file_invalid' });
+    return this.value;
+  }
+  async write(value: T): Promise<void> { this.value = value; }
+  async delete(): Promise<void> { this.value = undefined; }
+}

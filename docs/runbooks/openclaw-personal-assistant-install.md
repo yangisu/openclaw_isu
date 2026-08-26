@@ -54,7 +54,36 @@ assistant_calendar_confirm
 assistant_briefing
 ```
 
-Register the exact Naver OAuth callback and calendar permission in the Naver developer console. Complete the OAuth browser interaction locally. Do not put OAuth tokens in `openclaw.personal-assistant.json5`; it contains file references only.
+Register the exact Naver OAuth callback and calendar permission in the Naver developer console. The plugin owns only the Naver OAuth lifecycle; ChatGPT model OAuth remains entirely OpenClaw-managed and is not proven by plugin PoC evidence.
+
+Create a temporary owner-only JSON file with exactly `version`, `clientId`, `clientSecret`, and `redirectUri`, where `version` is `1` and `redirectUri` exactly matches the registered callback. Use a local editor and mode `600`; do not type its contents as shell arguments. Then run the package CLI with the sensitive document on stdin:
+
+```bash
+umask 077
+editor /absolute/owner-private/naver-client-input.json
+node plugins/openclaw-personal-assistant/dist/cli.js oauth configure \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  < /absolute/owner-private/naver-client-input.json
+node plugins/openclaw-personal-assistant/dist/cli.js oauth begin \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
+```
+
+Complete the displayed authorization URL locally. Put only `{"callbackUrl":"<the complete returned callback URL>"}` in another owner-only temporary file, then pass it on stdin. The CLI requires the exact scheme, host, port, and path, one state, and either one code or one error; state is single-use for ten minutes.
+
+```bash
+editor /absolute/owner-private/naver-callback.json
+node plugins/openclaw-personal-assistant/dist/cli.js oauth callback \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant" \
+  < /absolute/owner-private/naver-callback.json
+node plugins/openclaw-personal-assistant/dist/cli.js oauth status \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/naver-oauth-token"
+```
+
+Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. Calendar confirmation obtains a safety-window-valid access token from the production provider; it never reads an access token directly.
 
 ## 4. Finish installation
 
@@ -93,15 +122,31 @@ Do not change the principal to `SYSTEM`. Do not add a firewall inbound rule or p
 
 ## 5. PoC gates
 
-Each PoC must produce a local JSON evidence file containing exactly `status`, `observedChecks`, `redactedErrorCode`, and `timestamp`, with no additional or nested fields. Allowed status values are `open`, `closed`, `unknown`, and `expired`. Evidence must be current within 24 hours and no more than five minutes in the future. Checks containing control/format characters, URLs, OAuth codes, keys, or token-like values are rejected rather than redacted or persisted:
+The legacy `poc` command accepts only a local report containing exactly `status`, `observedChecks`, `redactedErrorCode`, and `timestamp`, with no additional or nested fields. It is report-only: it cannot open a runtime gate and `doctor` does not use it as operational proof. Checks containing control/format characters, URLs, OAuth codes, keys, or token-like values are rejected rather than redacted or persisted:
 
 ```bash
 node plugins/openclaw-personal-assistant/dist/cli.js poc openai --state "$HOME/.openclaw/state/openclaw-personal-assistant" --evidence /absolute/path/openai-redacted.json
 node plugins/openclaw-personal-assistant/dist/cli.js poc caldav --state "$HOME/.openclaw/state/openclaw-personal-assistant" --evidence /absolute/path/caldav-redacted.json
-node plugins/openclaw-personal-assistant/dist/cli.js doctor --state "$HOME/.openclaw/state/openclaw-personal-assistant"
+node plugins/openclaw-personal-assistant/dist/cli.js doctor \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant" \
+  --naver-client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --naver-token-file "$HOME/.openclaw/secrets/naver-oauth-token"
 ```
 
-Repeat for `naver-oauth` and `naver-create`. `doctor` is read-only and is successful only while every durable gate is open and younger than the selected maximum age. Closed, unknown, missing, or expired evidence is not installation success.
+`doctor` verifies the real versioned Naver app store and token freshness read-only. `naver-create` remains unknown until authoritative production integration evidence exists; arbitrary `poc --evidence` cannot change it. OpenAI model authentication is inspected with the package-local OpenClaw commands and live Gateway behavior, not claimed as plugin-controlled. Consequently `doctor` remains nonzero while any required gate is unknown, closed, or expired.
+
+Use explicit refresh or revoke locally when required. Neither command accepts a token, code, or secret argument. Revoke attempts the remote request and always invalidates the local token; a remote failure therefore remains fail-closed and requires a new authorization before calendar creation.
+
+```bash
+node plugins/openclaw-personal-assistant/dist/cli.js oauth refresh \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
+node plugins/openclaw-personal-assistant/dist/cli.js oauth revoke \
+  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
+```
 
 For the create PoC, create exactly one clearly named test event after the single-use confirmation. Verify there is no duplicate, then delete that one test event yourself in the Naver app. The assistant does not modify or delete Naver events.
 

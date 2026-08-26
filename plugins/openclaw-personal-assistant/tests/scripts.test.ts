@@ -310,6 +310,18 @@ describe('deployment scripts', () => {
     expect(source).toContain('OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"');
   });
 
+  it('pauses for the stdin-only Naver OAuth lifecycle and validates both private OAuth stores', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('naver-oauth-client naver-oauth-token');
+    expect(source).toContain('oauth configure --client-file');
+    expect(source).toContain('oauth begin --client-file');
+    expect(source).toContain('oauth callback --client-file');
+    expect(source).toContain('oauth status --client-file');
+    expect(source).toContain('--token-file "$SECRET_DIR/naver-oauth-token"');
+    expect(source).toContain('doctor --state');
+    expect(source).not.toMatch(/oauth callback[^\n]*(?:--code(?:\s|=)|--token(?:\s|=)|--client-secret(?:\s|=))/);
+  });
+
   it('accepts only the exact active path reported by openclaw config file across POSIX and Windows forms', () => {
     const cases = [
       ['/home/owner/.openclaw/openclaw.json', '/home/owner', '~/.openclaw/openclaw.json\n'],
@@ -371,7 +383,8 @@ describe('deployment scripts', () => {
   it.each([
     ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
     ['wrong CalDAV secret path', (text: string) => text.replace('/naver-caldav', '/wrong-caldav')],
-    ['wrong Naver token path', (text: string) => text.replace('/naver-oauth', '/wrong-oauth')],
+    ['wrong Naver client path', (text: string) => text.replace('/naver-oauth-client', '/wrong-client')],
+    ['wrong Naver token path', (text: string) => text.replace('/naver-oauth-token', '/wrong-token')],
     ['missing calendar mapping', (text: string) => text.replace(/\s*calendarMappings: \[[\s\S]*?\n\s*\],/, '')],
     ['duplicate calendar API ID', (text: string) => text.replace(
       "apiCalendarId: 'api-personal'",

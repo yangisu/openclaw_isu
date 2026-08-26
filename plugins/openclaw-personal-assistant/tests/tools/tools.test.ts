@@ -9,7 +9,9 @@ import plugin from '../../src/index.js';
 import { CalendarOutbox } from '../../src/calendar/outbox.js';
 import { createBriefingTool } from '../../src/tools/briefing.js';
 import { SubsystemHealthStore } from '../../src/state/health.js';
-import { createCalendarConfirmTool, createCalendarPrepareTool } from '../../src/tools/calendar.js';
+import {
+  createCalendarConfirmTool, createCalendarPrepareTool, createCalendarWriteApi,
+} from '../../src/tools/calendar.js';
 import { createMutationTool } from '../../src/tools/mutate.js';
 import { createQueryTool } from '../../src/tools/query.js';
 import { configSchema } from '../../src/tools/register.js';
@@ -494,6 +496,59 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(createSchedule).toHaveBeenCalledTimes(1);
   });
 
+  it('refreshes through the real token provider before constructing the Naver create client', async () => {
+    const stateDir = `/tmp/openclaw-tool-oauth-${randomUUID()}`;
+    temporaryStateDirs.push(stateDir);
+    const tokenStore = new MemoryStore({
+      version: 1 as const, accessToken: 'access-expired', refreshToken: 'refresh-secret',
+      expiresAt: '2026-08-25T00:00:00.000Z',
+    });
+    const oauthFetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'access-current', token_type: 'bearer', expires_in: 3600,
+    }), { status: 200 }));
+    const calendarFetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      result: 'success', returnValue: { processType: 'create', calendarId: 'default', icalUid: 'event-1' },
+    }), { status: 200 }));
+    const writeApi = await createCalendarWriteApi({
+      ...config, stateDir,
+      calendar: {
+        naverOAuthClientFile: '/home/user/.openclaw/secrets/naver-oauth-client',
+        naverTokenFile: '/home/user/.openclaw/secrets/naver-oauth-token',
+      },
+    }, {
+      credentialStore: new MemoryStore({
+        version: 1 as const, clientId: 'client-id', clientSecret: 'client-secret',
+        redirectUri: 'http://127.0.0.1:1456/naver/callback',
+      }),
+      tokenStore, oauthFetch, calendarFetch,
+      now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      health: { report: vi.fn(), recover: vi.fn() },
+    });
+
+    await expect(writeApi.createSchedule({
+      calendarId: 'default', scheduleIcalString: 'BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n',
+    })).resolves.toMatchObject({ processType: 'create', icalUid: 'event-1' });
+    expect(oauthFetch).toHaveBeenCalledTimes(1);
+    expect(calendarFetch).toHaveBeenCalledTimes(1);
+    expect(String(calendarFetch.mock.calls[0]![1]?.headers &&
+      new Headers(calendarFetch.mock.calls[0]![1]!.headers).get('authorization'))).toBe('Bearer access-current');
+  });
+
+  it('rejects OAuth client and token stores inside workspace, state, or backup roots', async () => {
+    for (const path of [
+      '/home/user/.openclaw/workspace/oauth-client',
+      '/home/user/.openclaw/state/oauth-client',
+      '/mnt/d/openclaw_setting/backups/oauth-client',
+    ]) {
+      await expect(createCalendarWriteApi({
+        ...config,
+        calendar: { naverOAuthClientFile: path, naverTokenFile: '/home/user/.openclaw/secrets/naver-token' },
+      }, {
+        credentialStore: new MemoryStore({}), tokenStore: new MemoryStore({}) as never,
+      })).rejects.toMatchObject({ code: 'invalid_calendar_config' });
+    }
+  });
+
   it('exposes strict schemas with no generic command or delete surface', () => {
     const metadata = getToolPluginMetadata(plugin)!;
     const mutation = metadata.tools.find(tool => tool.name === 'assistant_mutate')!.parameters;
@@ -548,3 +603,10 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     })).toBe(false);
   });
 });
+
+class MemoryStore<T> {
+  constructor(public value: T) {}
+  async read(): Promise<T> { return this.value; }
+  async write(value: T): Promise<void> { this.value = value; }
+  async delete(): Promise<void> { throw new Error('not used'); }
+}

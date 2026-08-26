@@ -11,10 +11,24 @@ import {
 } from './ops/backup.js';
 import { openRepository } from './workspace/repository.js';
 import { SubsystemHealthStore } from './state/health.js';
+import {
+  NaverOAuth, validateNaverOAuthClientCredentials, validateStoredToken,
+  type NaverOAuthClientCredentials, type NaverTokenSet, type SecretStore,
+} from './calendar/oauth.js';
+import { SecretFileStore } from './secrets/file-store.js';
 
 export interface CliIo {
   stdout(value: string): void;
   stderr(value: string): void;
+  readStdin?(): Promise<string>;
+}
+
+type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+export interface CliDependencies {
+  credentialStore?: (path: string) => SecretStore<unknown>;
+  tokenStore?: (path: string) => SecretStore<NaverTokenSet>;
+  oauthFetch?: FetchLike;
+  now?: () => number;
 }
 
 type GateStatus = 'open' | 'closed' | 'unknown' | 'expired';
@@ -30,24 +44,169 @@ const EXIT = Object.freeze({ ok: 0, gateClosed: 1, gateUnknown: 2, publicationUn
 const defaultIo: CliIo = {
   stdout: value => process.stdout.write(`${value}\n`),
   stderr: value => process.stderr.write(`${value}\n`),
+  readStdin: readBoundedStdin,
 };
 
-export async function runCli(args: readonly string[], io: CliIo = defaultIo): Promise<number> {
+export async function runCli(
+  args: readonly string[], io: CliIo = defaultIo, dependencies: CliDependencies = {},
+): Promise<number> {
   try {
     rejectSensitiveArguments(args);
     const [command, ...rest] = args;
     if (command === 'init') return await init(rest, io);
     if (command === 'poc') return await poc(rest, io);
-    if (command === 'doctor') return await doctor(rest, io);
+    if (command === 'doctor') return await doctor(rest, io, dependencies);
+    if (command === 'oauth') return await oauth(rest, io, dependencies);
     if (command === 'backup') return await backup(rest, io);
     if (command === 'restore') return await restore(rest, io);
-    throw usageError('expected init, poc, doctor, backup, or restore');
+    throw usageError('expected init, poc, doctor, oauth, backup, or restore');
   } catch (error) {
     const code = safeErrorCode(error);
     io.stderr(JSON.stringify({ status: 'error', redactedErrorCode: code }));
     if (error instanceof BackupPublicationUnknownError || code === 'publication_unknown') return EXIT.publicationUnknown;
     return code === 'cli_usage' || code.startsWith('path_') ? EXIT.usage : EXIT.operation;
   }
+}
+
+async function oauth(args: readonly string[], io: CliIo, dependencies: CliDependencies): Promise<number> {
+  const [action, ...optionArgs] = args;
+  if (action === 'configure') {
+    const options = parseOptions(optionArgs, ['client-file']);
+    const clientFile = requiredAbsolute(options, 'client-file');
+    const input = await readPrivateInput(io);
+    let parsed: unknown;
+    try { parsed = JSON.parse(input); } catch { throw usageError('invalid OAuth credential input'); }
+    const credentials = validateNaverOAuthClientCredentials(parsed);
+    await (dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384))
+      .write(credentials);
+    io.stdout(JSON.stringify({ status: 'configured', redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  if (action === 'status') {
+    const options = parseOptions(optionArgs, ['client-file', 'token-file']);
+    const tokenFile = requiredAbsolute(options, 'token-file');
+    const clientFile = options.get('client-file');
+    if (clientFile) {
+      if (!isAbsolute(clientFile) || resolve(clientFile) !== clientFile) throw pathError();
+      validateNaverOAuthClientCredentials(await (
+        dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384)
+      ).read());
+    }
+    const tokens = validateStoredToken(await openTokenStore(tokenFile, dependencies).read());
+    const remainingMs = Date.parse(tokens.expiresAt) - (dependencies.now?.() ?? Date.now());
+    const status = remainingMs > 60_000 ? 'open' : 'expired';
+    io.stdout(JSON.stringify({ status, expiresAt: tokens.expiresAt, redactedErrorCode: status === 'open' ? null : 'OAUTH_TOKEN_EXPIRED' }));
+    return status === 'open' ? EXIT.ok : EXIT.gateClosed;
+  }
+  const allowed = action === 'begin' ? ['client-file', 'state'] : ['client-file', 'token-file', 'state'];
+  if (!['begin', 'callback', 'refresh', 'revoke'].includes(String(action))) throw usageError('unsupported OAuth action');
+  const options = parseOptions(optionArgs, allowed);
+  const clientFile = requiredAbsolute(options, 'client-file');
+  const stateDir = requiredAbsolute(options, 'state');
+  const tokenFile = action === 'begin' ? undefined : requiredAbsolute(options, 'token-file');
+  await preparePrivateStateDirectory(stateDir);
+  const credentialStore = dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384);
+  const credentials = validateNaverOAuthClientCredentials(await credentialStore.read());
+  const tokenStore = tokenFile === undefined
+    ? new UnusedTokenStore()
+    : openTokenStore(tokenFile, dependencies);
+  const client = new NaverOAuth({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: credentials.redirectUri,
+    stateDbPath: join(stateDir, 'naver-oauth-state.sqlite3'),
+    tokenStore,
+    ...(dependencies.oauthFetch === undefined ? {} : { fetch: dependencies.oauthFetch }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    healthStateDir: stateDir,
+  });
+  if (action === 'begin') {
+    const authorization = client.authorize();
+    io.stdout(JSON.stringify({
+      status: 'authorization_required', authorizationUrl: authorization.authorizationUrl,
+      stateGuidance: 'Use only the matching local callback once within 10 minutes.', redactedErrorCode: null,
+    }));
+    return EXIT.ok;
+  }
+  if (action === 'callback') {
+    const callbackUrl = parseCallbackInput(await readPrivateInput(io), credentials);
+    await client.handleCallback({
+      state: requiredCallbackValue(callbackUrl, 'state'),
+      ...(callbackUrl.searchParams.has('code') ? { code: requiredCallbackValue(callbackUrl, 'code') } : {}),
+      ...(callbackUrl.searchParams.has('error') ? { error: requiredCallbackValue(callbackUrl, 'error') } : {}),
+      ...(callbackUrl.searchParams.has('error_description')
+        ? { errorDescription: requiredCallbackValue(callbackUrl, 'error_description') } : {}),
+    });
+    io.stdout(JSON.stringify({ status: 'authorized', redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  if (action === 'refresh') {
+    const refreshed = await client.refresh();
+    io.stdout(JSON.stringify({ status: 'open', expiresAt: refreshed.expiresAt, redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  await client.revoke();
+  io.stdout(JSON.stringify({ status: 'revoked', redactedErrorCode: null }));
+  return EXIT.ok;
+}
+
+function openTokenStore(path: string, dependencies: CliDependencies): SecretStore<NaverTokenSet> {
+  return dependencies.tokenStore?.(path) ?? new SecretFileStore<NaverTokenSet>(path, 32_768);
+}
+
+class UnusedTokenStore implements SecretStore<NaverTokenSet> {
+  async read(): Promise<NaverTokenSet> { throw usageError('token store is unavailable'); }
+  async write(): Promise<void> { throw usageError('token store is unavailable'); }
+  async delete(): Promise<void> { throw usageError('token store is unavailable'); }
+}
+
+function parseCallbackInput(input: string, credentials: NaverOAuthClientCredentials): URL {
+  let value: unknown;
+  try { value = JSON.parse(input); } catch { throw usageError('invalid OAuth callback input'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).join('\0') !== 'callbackUrl'
+    || typeof (value as { callbackUrl?: unknown }).callbackUrl !== 'string') {
+    throw usageError('invalid OAuth callback input');
+  }
+  let callback: URL;
+  try { callback = new URL((value as { callbackUrl: string }).callbackUrl); } catch {
+    throw usageError('invalid OAuth callback input');
+  }
+  const expected = new URL(credentials.redirectUri);
+  if (callback.origin !== expected.origin || callback.pathname !== expected.pathname
+    || callback.username || callback.password || callback.hash) throw usageError('OAuth redirect does not match');
+  const keys = [...callback.searchParams.keys()];
+  const hasCode = callback.searchParams.has('code');
+  const hasError = callback.searchParams.has('error');
+  const allowed = new Set(hasError ? ['state', 'error', 'error_description'] : ['state', 'code']);
+  if (hasCode === hasError || keys.some(key => !allowed.has(key)) || new Set(keys).size !== keys.length) {
+    throw usageError('invalid OAuth callback input');
+  }
+  return callback;
+}
+
+function requiredCallbackValue(url: URL, name: string): string {
+  const values = url.searchParams.getAll(name);
+  if (values.length !== 1 || !values[0] || values[0].length > 8_192) throw usageError('invalid OAuth callback input');
+  return values[0];
+}
+
+async function readPrivateInput(io: CliIo): Promise<string> {
+  const input = await (io.readStdin?.() ?? Promise.reject(usageError('private stdin is required')));
+  if (Buffer.byteLength(input, 'utf8') > 16_384) throw usageError('private stdin is too large');
+  return input;
+}
+
+async function readBoundedStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += bytes.length;
+    if (total > 16_384) throw usageError('private stdin is too large');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, total).toString('utf8');
 }
 
 async function init(args: readonly string[], io: CliIo): Promise<number> {
@@ -108,8 +267,8 @@ async function poc(args: readonly string[], io: CliIo): Promise<number> {
   return gateExit(safe.status);
 }
 
-async function doctor(args: readonly string[], io: CliIo): Promise<number> {
-  const options = parseOptions(args, ['state', 'max-age-hours']);
+async function doctor(args: readonly string[], io: CliIo, dependencies: CliDependencies): Promise<number> {
+  const options = parseOptions(args, ['state', 'max-age-hours', 'naver-client-file', 'naver-token-file']);
   const state = requiredAbsolute(options, 'state');
   await assertDirectPath(state, false);
   const maxAgeHours = Number(options.get('max-age-hours') ?? '24');
@@ -117,12 +276,22 @@ async function doctor(args: readonly string[], io: CliIo): Promise<number> {
   const observed: Array<{ gate: string; status: GateStatus }> = [];
   for (const gate of GATES) {
     let status: GateStatus = 'unknown';
-    try {
-      const evidence = parseEvidence(await readFile(join(state, 'gates', `${gate}.json`), 'utf8'));
-      const age = Date.now() - new Date(evidence.timestamp).valueOf();
-      status = age < -5 * 60_000 ? 'unknown'
-        : age > maxAgeHours * 3_600_000 ? 'expired' : evidence.status;
-    } catch { status = 'unknown'; }
+    if (gate === 'naver-oauth') {
+      const clientFile = options.get('naver-client-file');
+      const tokenFile = options.get('naver-token-file');
+      if (clientFile && tokenFile) {
+        if (!isAbsolute(clientFile) || resolve(clientFile) !== clientFile
+          || !isAbsolute(tokenFile) || resolve(tokenFile) !== tokenFile) throw pathError();
+        try {
+          validateNaverOAuthClientCredentials(await (
+            dependencies.credentialStore?.(clientFile) ?? new SecretFileStore<unknown>(clientFile, 16_384)
+          ).read());
+          const token = validateStoredToken(await openTokenStore(tokenFile, dependencies).read());
+          const age = Date.parse(token.expiresAt) - (dependencies.now?.() ?? Date.now());
+          status = age > 60_000 ? 'open' : 'expired';
+        } catch { status = 'closed'; }
+      }
+    }
     observed.push({ gate, status });
   }
   const status: GateStatus = observed.every(item => item.status === 'open') ? 'open'

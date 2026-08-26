@@ -12,13 +12,25 @@ const REVOKE_ENDPOINT = 'https://nid.naver.com/oauth2.0/revoke';
 const STATE_LIFETIME_MS = 10 * 60_000;
 const CONSUMED_STATE_RETENTION_MS = 24 * 60 * 60_000;
 const MAX_ACTIVE_STATES = 128;
+const TOKEN_SAFETY_WINDOW_MS = 60_000;
+const REFRESH_LEASE_MS = 45_000;
+const REFRESH_WAIT_MS = 25;
+const REFRESH_FAILURE_COOLDOWN_MS = 5_000;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export interface NaverTokenSet {
+  version: 1;
   accessToken: string;
   refreshToken: string;
   expiresAt: string;
+}
+
+export interface NaverOAuthClientCredentials {
+  version: 1;
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
 }
 
 export interface NaverAuthorization {
@@ -40,6 +52,8 @@ export type NaverOAuthErrorCode =
   | 'oauth_rate_limited'
   | 'oauth_server'
   | 'oauth_invalid_response'
+  | 'oauth_token_invalid'
+  | 'oauth_credentials_invalid'
   | 'oauth_timeout'
   | 'oauth_request_failed';
 
@@ -147,7 +161,7 @@ export class NaverOAuth {
 
   async refresh(current?: NaverTokenSet): Promise<NaverTokenSet> {
     return this.#trackHealth(async () => {
-      const existing = current ?? await this.#tokenStore.read();
+      const existing = validateStoredToken(current ?? await this.#tokenStore.read());
       const response = await this.#requestToken(new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: this.#clientId,
@@ -160,36 +174,168 @@ export class NaverOAuth {
     });
   }
 
+  async getValidAccessToken(safetyWindowMs = TOKEN_SAFETY_WINDOW_MS): Promise<string> {
+    if (!Number.isSafeInteger(safetyWindowMs) || safetyWindowMs < 0 || safetyWindowMs > 10 * 60_000) {
+      throw new NaverOAuthError('oauth_token_invalid', 'Naver OAuth token state is invalid');
+    }
+    try {
+      const current = validateStoredToken(await this.#tokenStore.read());
+      if (Date.parse(current.expiresAt) - this.#now() > safetyWindowMs) {
+        this.#withHealth(health => health.recover('naver-oauth'));
+        return current.accessToken;
+      }
+      return await this.#refreshWithLease(safetyWindowMs);
+    } catch (error) {
+      if (error instanceof NaverOAuthError) {
+        if (error.code === 'oauth_token_invalid') this.#withHealth(health => health.report({
+          errorCode: error.code, target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+        }));
+        throw error;
+      }
+      const mapped = new NaverOAuthError('oauth_token_invalid', 'Naver OAuth token state is invalid');
+      this.#withHealth(health => health.report({
+        errorCode: mapped.code, target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+      }));
+      throw mapped;
+    }
+  }
+
   async revoke(current?: NaverTokenSet): Promise<void> {
-    return this.#trackHealth(async () => {
-      const existing = current ?? await this.#tokenStore.read();
-      const signal = AbortSignal.timeout(this.#timeoutMs);
-      let response: Response;
+    let existing: NaverTokenSet;
+    try {
+      existing = validateStoredToken(current ?? await this.#tokenStore.read());
+    } catch (error) {
+      this.#reportOAuthFailure(error);
+      throw error;
+    }
+      let failure: unknown;
       try {
-        response = await this.#fetch(REVOKE_ENDPOINT, {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-          body: new URLSearchParams({
-            client_id: this.#clientId,
-            client_secret: this.#clientSecret,
-            token: existing.refreshToken,
-            token_type_hint: 'refresh_token',
-          }),
-          signal,
-        });
-      } catch {
-        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
+        const signal = AbortSignal.timeout(this.#timeoutMs);
+        let response: Response;
+        try {
+          response = await this.#fetch(REVOKE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: new URLSearchParams({
+              client_id: this.#clientId,
+              client_secret: this.#clientSecret,
+              token: existing.refreshToken,
+              token_type_hint: 'refresh_token',
+            }),
+            signal,
+          });
+        } catch {
+          if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+          throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth request failed');
+        }
+        if (!response.ok) throw oauthHttpError(response.status);
+        try {
+          await response.text();
+        } catch {
+          if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
+          throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
+        }
+      } catch (error) {
+        failure = error;
       }
-      if (!response.ok) throw oauthHttpError(response.status);
       try {
-        await response.text();
-      } catch {
-        if (signal.aborted) throw new NaverOAuthError('oauth_timeout', 'Naver OAuth request timed out');
-        throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth response failed');
+        await this.#tokenStore.delete();
+      } catch (error) {
+        if (failure === undefined) failure = error;
       }
-      await this.#tokenStore.delete();
-    });
+    if (failure !== undefined) {
+      this.#reportOAuthFailure(failure);
+      throw failure;
+    }
+    this.#withHealth(health => health.report({
+      errorCode: 'oauth_revoked', target: 'naver-oauth', message: 'Naver OAuth authorization is revoked',
+    }));
+  }
+
+  #reportOAuthFailure(error: unknown): void {
+    this.#withHealth(health => health.report({
+      errorCode: error instanceof NaverOAuthError ? error.code : 'oauth_request_failed',
+      target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    }));
+  }
+
+  async #refreshWithLease(safetyWindowMs: number): Promise<string> {
+    const leaseId = randomBytes(16).toString('hex');
+    const deadline = Date.now() + REFRESH_LEASE_MS + this.#timeoutMs * 2;
+    while (Date.now() < deadline) {
+      const lease = this.#tryAcquireRefreshLease(leaseId);
+      if (lease.failureCode) throw new NaverOAuthError(lease.failureCode, 'Naver OAuth refresh is unavailable');
+      if (lease.acquired) {
+        let succeeded = false;
+        try {
+          const latest = validateStoredToken(await this.#tokenStore.read());
+          if (Date.parse(latest.expiresAt) - this.#now() > safetyWindowMs) {
+            this.#withHealth(health => health.recover('naver-oauth'));
+            succeeded = true;
+            return latest.accessToken;
+          }
+          const refreshed = await this.refresh(latest);
+          succeeded = true;
+          return refreshed.accessToken;
+        } catch (error) {
+          this.#markRefreshLeaseFailed(leaseId, oauthFailureCode(error));
+          throw error;
+        } finally {
+          if (succeeded) this.#releaseRefreshLease(leaseId);
+        }
+      }
+      await new Promise(resolvePromise => setTimeout(resolvePromise, REFRESH_WAIT_MS));
+      const latest = validateStoredToken(await this.#tokenStore.read());
+      if (Date.parse(latest.expiresAt) - this.#now() > safetyWindowMs) {
+        this.#withHealth(health => health.recover('naver-oauth'));
+        return latest.accessToken;
+      }
+    }
+    throw new NaverOAuthError('oauth_request_failed', 'Naver OAuth refresh is unavailable');
+  }
+
+  #tryAcquireRefreshLease(leaseId: string): { acquired: boolean; failureCode?: NaverOAuthErrorCode } {
+    const database = this.#openStateDatabase();
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      const now = Date.now();
+      database.prepare('DELETE FROM oauth_refresh_lease WHERE expires_at <= ?').run(now);
+      const existing = database.prepare(
+        'SELECT status, error_code FROM oauth_refresh_lease WHERE singleton = 1',
+      ).get() as { status: string; error_code: string | null } | undefined;
+      if (existing?.status === 'failed' && existing.error_code) {
+        database.exec('COMMIT');
+        return { acquired: false, failureCode: oauthFailureCode({ code: existing.error_code }) };
+      }
+      const result = database.prepare(`
+        INSERT INTO oauth_refresh_lease (singleton, lease_id, expires_at, status, error_code)
+        VALUES (1, ?, ?, 'refreshing', NULL)
+        ON CONFLICT(singleton) DO NOTHING
+      `).run(leaseId, now + REFRESH_LEASE_MS);
+      database.exec('COMMIT');
+      return { acquired: result.changes === 1 };
+    } catch (error) {
+      if (database.isTransaction) database.exec('ROLLBACK');
+      throw error;
+    } finally { database.close(); }
+  }
+
+  #markRefreshLeaseFailed(leaseId: string, code: NaverOAuthErrorCode): void {
+    const database = this.#openStateDatabase();
+    try {
+      database.prepare(`
+        UPDATE oauth_refresh_lease
+        SET status = 'failed', error_code = ?, expires_at = ?
+        WHERE singleton = 1 AND lease_id = ?
+      `).run(code, Date.now() + REFRESH_FAILURE_COOLDOWN_MS, leaseId);
+    } finally { database.close(); }
+  }
+
+  #releaseRefreshLease(leaseId: string): void {
+    const database = this.#openStateDatabase();
+    try {
+      database.prepare('DELETE FROM oauth_refresh_lease WHERE singleton = 1 AND lease_id = ?').run(leaseId);
+    } finally { database.close(); }
   }
 
   async #trackHealth<T>(operation: () => Promise<T>): Promise<T> {
@@ -277,6 +423,14 @@ export class NaverOAuth {
         consumed_at INTEGER
       ) STRICT;
       CREATE INDEX IF NOT EXISTS oauth_states_active_idx ON oauth_states (consumed, expires_at, id);
+      CREATE TABLE IF NOT EXISTS oauth_refresh_lease (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        lease_id TEXT NOT NULL CHECK(length(lease_id) = 32),
+        expires_at INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('refreshing', 'failed')),
+        error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 64),
+        CHECK((status = 'refreshing' AND error_code IS NULL) OR (status = 'failed' AND error_code IS NOT NULL))
+      ) STRICT;
     `);
     return database;
   }
@@ -298,6 +452,18 @@ function oauthHttpError(status: number): NaverOAuthError {
   return new NaverOAuthError('oauth_request_failed', `Naver OAuth request failed with HTTP ${status}`);
 }
 
+const OAUTH_ERROR_CODES = new Set<NaverOAuthErrorCode>([
+  'oauth_state_invalid', 'oauth_callback_error', 'oauth_auth', 'oauth_rate_limited', 'oauth_server',
+  'oauth_invalid_response', 'oauth_token_invalid', 'oauth_credentials_invalid', 'oauth_timeout', 'oauth_request_failed',
+]);
+
+function oauthFailureCode(error: unknown): NaverOAuthErrorCode {
+  const code = error instanceof NaverOAuthError ? error.code
+    : error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && OAUTH_ERROR_CODES.has(code as NaverOAuthErrorCode)
+    ? code as NaverOAuthErrorCode : 'oauth_request_failed';
+}
+
 function parseTokenResponse(value: unknown, previousRefreshToken: string | undefined, now: number): NaverTokenSet {
   const record = objectValue(value);
   const accessToken = nonEmptyString(record.access_token);
@@ -313,9 +479,50 @@ function parseTokenResponse(value: unknown, previousRefreshToken: string | undef
     throw new NaverOAuthError('oauth_invalid_response', 'Naver OAuth returned an incomplete token response');
   }
   return {
+    version: 1,
     accessToken,
     refreshToken,
     expiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
+export function validateStoredToken(value: unknown): NaverTokenSet {
+  const record = objectValue(value);
+  const keys = Object.keys(record).sort();
+  if (keys.join('\0') !== ['accessToken', 'expiresAt', 'refreshToken', 'version'].join('\0')
+    || record.version !== 1
+    || typeof record.accessToken !== 'string' || record.accessToken.length < 1 || record.accessToken.length > 8_192
+    || typeof record.refreshToken !== 'string' || record.refreshToken.length < 1 || record.refreshToken.length > 8_192
+    || typeof record.expiresAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(record.expiresAt)
+    || !Number.isFinite(Date.parse(record.expiresAt))) {
+    throw new NaverOAuthError('oauth_token_invalid', 'Naver OAuth token state is invalid');
+  }
+  return {
+    version: 1, accessToken: record.accessToken, refreshToken: record.refreshToken, expiresAt: record.expiresAt,
+  };
+}
+
+export function validateNaverOAuthClientCredentials(value: unknown): NaverOAuthClientCredentials {
+  const record = objectValue(value);
+  const keys = Object.keys(record).sort();
+  if (keys.join('\0') !== ['clientId', 'clientSecret', 'redirectUri', 'version'].join('\0')
+    || record.version !== 1
+    || typeof record.clientId !== 'string' || record.clientId.length < 1 || record.clientId.length > 512
+    || typeof record.clientSecret !== 'string' || record.clientSecret.length < 1 || record.clientSecret.length > 8_192
+    || typeof record.redirectUri !== 'string' || record.redirectUri.length > 2_048) {
+    throw new NaverOAuthError('oauth_credentials_invalid', 'Naver OAuth app credentials are invalid');
+  }
+  let redirect: URL;
+  try { redirect = new URL(record.redirectUri); } catch {
+    throw new NaverOAuthError('oauth_credentials_invalid', 'Naver OAuth app credentials are invalid');
+  }
+  const loopbackHttp = redirect.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(redirect.hostname);
+  if ((!loopbackHttp && redirect.protocol !== 'https:') || redirect.username || redirect.password
+    || redirect.search || redirect.hash) {
+    throw new NaverOAuthError('oauth_credentials_invalid', 'Naver OAuth app credentials are invalid');
+  }
+  return {
+    version: 1, clientId: record.clientId, clientSecret: record.clientSecret, redirectUri: redirect.href,
   };
 }
 

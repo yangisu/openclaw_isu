@@ -3,7 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { NaverOAuth, type NaverTokenSet } from '../../src/calendar/oauth.js';
+import {
+  NaverOAuth, validateNaverOAuthClientCredentials, type NaverTokenSet,
+} from '../../src/calendar/oauth.js';
 import { SubsystemHealthStore } from '../../src/state/health.js';
 
 const temporaryDirectories: string[] = [];
@@ -40,6 +42,23 @@ afterEach(async () => {
 });
 
 describe('NaverOAuth one-time callback state', () => {
+  it('accepts only the exact versioned OAuth app credential schema', () => {
+    expect(validateNaverOAuthClientCredentials({
+      version: 1, clientId: 'owner-client', clientSecret: 'owner-secret',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    })).toEqual({
+      version: 1, clientId: 'owner-client', clientSecret: 'owner-secret',
+      redirectUri: 'http://127.0.0.1:1456/naver/callback',
+    });
+    for (const invalid of [
+      { version: 2, clientId: 'id', clientSecret: 'secret', redirectUri: 'http://127.0.0.1/callback' },
+      { version: 1, clientId: 'id', clientSecret: 'secret', redirectUri: 'http://example.com/callback' },
+      { version: 1, clientId: 'id', clientSecret: 'secret', redirectUri: 'https://example.com/callback', extra: true },
+    ]) expect(() => validateNaverOAuthClientCredentials(invalid)).toThrowError(expect.objectContaining({
+      code: 'oauth_credentials_invalid',
+    }));
+  });
+
   it('durably reports invalid or expired callback state without exposing state data', async () => {
     const files = await fixture();
     const report = vi.fn();
@@ -219,10 +238,122 @@ describe('NaverOAuth one-time callback state', () => {
 });
 
 describe('NaverOAuth token lifecycle', () => {
+  it('refreshes one expired token exactly once before a calendar create can run', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 1, accessToken: 'access-expired', refreshToken: 'refresh-old', expiresAt: '2026-08-25T00:00:00.000Z',
+    };
+    const fetch = vi.fn().mockResolvedValue(tokenResponse('access-current', undefined));
+    const create = vi.fn().mockResolvedValue(undefined);
+    const recover = vi.fn();
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch, now: () => Date.parse('2026-08-26T00:00:00.000Z'), health: { report: vi.fn(), recover },
+    });
+
+    const accessToken = await oauth.getValidAccessToken();
+    await create(accessToken);
+
+    expect(accessToken).toBe('access-current');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledExactlyOnceWith('access-current');
+    expect(recover).toHaveBeenCalledWith('naver-oauth');
+  });
+
+  it('uses one cross-instance refresh lease and makes one refresh request', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 1, accessToken: 'access-expired', refreshToken: 'refresh-old', expiresAt: '2026-08-25T00:00:00.000Z',
+    };
+    const fetch = vi.fn(async () => {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return tokenResponse('access-shared', undefined);
+    });
+    const options = {
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch, now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      health: { report: vi.fn(), recover: vi.fn() },
+    };
+
+    const results = await Promise.all([
+      new NaverOAuth(options).getValidAccessToken(),
+      new NaverOAuth(options).getValidAccessToken(),
+    ]);
+
+    expect(results).toEqual(['access-shared', 'access-shared']);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares one failed refresh across concurrent provider instances without a second request', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 1, accessToken: 'access-expired', refreshToken: 'refresh-old', expiresAt: '2026-08-25T00:00:00.000Z',
+    };
+    const fetch = vi.fn(async () => {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return new Response('', { status: 401 });
+    });
+    const options = {
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch, now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      health: { report: vi.fn(), recover: vi.fn() },
+    };
+
+    const results = await Promise.allSettled([
+      new NaverOAuth(options).getValidAccessToken(),
+      new NaverOAuth(options).getValidAccessToken(),
+    ]);
+
+    expect(results.every(result => result.status === 'rejected'
+      && (result.reason as { code?: unknown }).code === 'oauth_auth')).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes OAuth health and prevents calendar create when refresh fails', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 1, accessToken: 'access-expired', refreshToken: 'refresh-old', expiresAt: '2026-08-25T00:00:00.000Z',
+    };
+    const report = vi.fn();
+    const create = vi.fn();
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn().mockResolvedValue(new Response('', { status: 401 })),
+      now: () => Date.parse('2026-08-26T00:00:00.000Z'), health: { report, recover: vi.fn() },
+    });
+
+    await expect((async () => {
+      const accessToken = await oauth.getValidAccessToken();
+      await create(accessToken);
+    })()).rejects.toMatchObject({ code: 'oauth_auth' });
+
+    expect(create).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_auth', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
+  });
+
+  it('rejects malformed versioned token state before returning an access token', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 2, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: 'not-a-date',
+    } as unknown as NaverTokenSet;
+    const report = vi.fn();
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn(), health: { report, recover: vi.fn() },
+    });
+
+    await expect(oauth.getValidAccessToken()).rejects.toMatchObject({ code: 'oauth_token_invalid' });
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_token_invalid', target: 'naver-oauth', message: 'Naver OAuth is unavailable',
+    });
+  });
+
   it('reports a durable sanitized OAuth failure and records recovery after success', async () => {
     const files = await fixture();
     await files.tokenStore.write({
-      accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
+      version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
     });
     const report = vi.fn();
     const recover = vi.fn();
@@ -246,7 +377,7 @@ describe('NaverOAuth token lifecycle', () => {
   it('uses the production durable health store when no health seam is injected', async () => {
     const files = await fixture();
     await files.tokenStore.write({
-      accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
+      version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
     });
     const fetch = vi.fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(new Response(null, { status: 503 }))
@@ -279,7 +410,7 @@ describe('NaverOAuth token lifecycle', () => {
     const tokens = await oauth.handleCallback({ code: 'authorization-code', state });
 
     expect(tokens).toEqual({
-      accessToken: 'access-new', refreshToken: 'refresh-new', expiresAt: '2030-01-01T01:00:00.000Z',
+      version: 1, accessToken: 'access-new', refreshToken: 'refresh-new', expiresAt: '2030-01-01T01:00:00.000Z',
     });
     const [url, init] = fetch.mock.calls[0]!;
     expect(String(url)).toBe('https://nid.naver.com/oauth2.0/token');
@@ -294,7 +425,7 @@ describe('NaverOAuth token lifecycle', () => {
 
   it('refreshes through the token endpoint and preserves the refresh token when omitted', async () => {
     const files = await fixture();
-    await files.tokenStore.write({ accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
+    await files.tokenStore.write({ version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(JSON.stringify({
       access_token: 'access-refreshed', token_type: 'bearer', expires_in: '3600',
     }), { status: 200 }));
@@ -304,7 +435,7 @@ describe('NaverOAuth token lifecycle', () => {
     });
 
     await expect(oauth.refresh()).resolves.toEqual({
-      accessToken: 'access-refreshed', refreshToken: 'refresh-old', expiresAt: '2030-01-01T01:00:00.000Z',
+      version: 1, accessToken: 'access-refreshed', refreshToken: 'refresh-old', expiresAt: '2030-01-01T01:00:00.000Z',
     });
     const form = new URLSearchParams(String(fetch.mock.calls[0]![1]?.body));
     expect(Object.fromEntries(form)).toEqual({
@@ -314,7 +445,7 @@ describe('NaverOAuth token lifecycle', () => {
 
   it('retries refresh once only when the first failure is proven pre-send', async () => {
     const files = await fixture();
-    await files.tokenStore.write({ accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
+    await files.tokenStore.write({ version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
     const cause = Object.assign(new Error('DNS lookup failed'), { code: 'ENOTFOUND' });
     const fetch = vi.fn<typeof globalThis.fetch>()
       .mockRejectedValueOnce(new TypeError('fetch failed', { cause }))
@@ -330,11 +461,12 @@ describe('NaverOAuth token lifecycle', () => {
 
   it('revokes the token pair through the official endpoint before deleting the local copy', async () => {
     const files = await fixture();
-    await files.tokenStore.write({ accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
+    await files.tokenStore.write({ version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(null, { status: 200 }));
+    const report = vi.fn();
     const oauth = new NaverOAuth({
       clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
-      ...files, fetch,
+      ...files, fetch, health: { report, recover: vi.fn() },
     });
 
     await expect(oauth.revoke()).resolves.toBeUndefined();
@@ -343,6 +475,9 @@ describe('NaverOAuth token lifecycle', () => {
       client_id: 'client-id', client_secret: 'client-secret', token: 'refresh-old', token_type_hint: 'refresh_token',
     });
     await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+    expect(report).toHaveBeenCalledWith({
+      errorCode: 'oauth_revoked', target: 'naver-oauth', message: 'Naver OAuth authorization is revoked',
+    });
   });
 
   it.each([
@@ -378,9 +513,9 @@ describe('NaverOAuth token lifecycle', () => {
     expect(`${error.message} ${error.stack ?? ''}`).not.toMatch(/access-secret|private-body|authorization|bearer/i);
   });
 
-  it('does not delete local tokens when a successful revoke body read fails', async () => {
+  it('invalidates local tokens when a successful revoke body read fails', async () => {
     const files = await fixture();
-    const tokens = { accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' };
+    const tokens: NaverTokenSet = { version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' };
     await files.tokenStore.write(tokens);
     const response = { ok: true, status: 200, text: vi.fn().mockRejectedValue(new Error('reset')) } as unknown as Response;
     const oauth = new NaverOAuth({
@@ -388,14 +523,30 @@ describe('NaverOAuth token lifecycle', () => {
       ...files, fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(response),
     });
     await expect(oauth.revoke()).rejects.toMatchObject({ code: 'oauth_request_failed' });
-    await expect(files.tokenStore.read()).resolves.toEqual(tokens);
+    await expect(files.tokenStore.read()).rejects.toMatchObject({ code: 'secret_file_invalid' });
+  });
+
+  it('invalidates the local token even when remote revoke fails', async () => {
+    const files = await fixture();
+    files.tokenStore.value = {
+      version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z',
+    };
+    const oauth = new NaverOAuth({
+      clientId: 'client-id', clientSecret: 'client-secret', redirectUri: 'http://127.0.0.1/callback',
+      ...files, fetch: vi.fn().mockResolvedValue(new Response('', { status: 500 })),
+      health: { report: vi.fn(), recover: vi.fn() },
+    });
+
+    await expect(oauth.revoke()).rejects.toMatchObject({ code: 'oauth_server' });
+    expect(files.tokenStore.value).toBeUndefined();
+    await expect(oauth.getValidAccessToken()).rejects.toMatchObject({ code: 'oauth_token_invalid' });
   });
 
   it.each([
     [401, 'oauth_auth'], [403, 'oauth_auth'], [429, 'oauth_rate_limited'], [500, 'oauth_server'], [503, 'oauth_server'],
   ])('classifies revoke HTTP %i before a failing body read as %s', async (status, code) => {
     const files = await fixture();
-    await files.tokenStore.write({ accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
+    await files.tokenStore.write({ version: 1, accessToken: 'access-old', refreshToken: 'refresh-old', expiresAt: '2029-01-01T00:00:00.000Z' });
     const response = {
       ok: false, status,
       text: vi.fn().mockRejectedValue(new Error('Authorization: Bearer access-secret private-body')),

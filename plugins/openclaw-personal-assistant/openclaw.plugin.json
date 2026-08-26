@@ -45,9 +45,38 @@
             "type": "string",
             "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
           },
+          "naverOAuthClientFile": {
+            "type": "string",
+            "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+          },
           "naverTokenFile": {
             "type": "string",
             "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+          },
+          "calendarMappings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "apiCalendarId",
+                "caldavHref"
+              ],
+              "properties": {
+                "apiCalendarId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                },
+                "caldavHref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096
+                }
+              },
+              "additionalProperties": false
+            },
+            "minItems": 1,
+            "maxItems": 100
           }
         },
         "additionalProperties": false

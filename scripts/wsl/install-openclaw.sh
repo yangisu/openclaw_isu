@@ -56,7 +56,7 @@ validate_secret_tree() {
     || { say 'secret_directory_permissions_invalid'; return 1; }
   owner="$(id -u)"
   [[ "$(stat -c %u -- "$SECRET_DIR")" == "$owner" ]] || { say 'secret_directory_owner_invalid'; return 1; }
-  for file in telegram-token naver-caldav naver-oauth; do
+  for file in telegram-token naver-caldav naver-oauth-client naver-oauth-token; do
     path="$SECRET_DIR/$file"
     [[ -e "$path" && ! -L "$path" ]] || { say "secret_file_invalid:$file"; return 1; }
     before="$(stat -Lc '%d:%i:%F:%u:%a' -- "$path")"
@@ -168,6 +168,7 @@ if [[ "$MODE" == check ]]; then
   validate_runtime_tools
   "$OPENCLAW" config validate
   validate_active_config
+  node "$PLUGIN_ROOT/dist/cli.js" oauth status --client-file "$SECRET_DIR/naver-oauth-client" --token-file "$SECRET_DIR/naver-oauth-token"
   systemctl --user is-enabled --quiet openclaw-gateway.service
   systemctl --user is-active --quiet openclaw-gateway.service
   validate_cron_contract
@@ -182,7 +183,11 @@ if [[ "$PHASE" == prepare ]]; then
   say 'STOP_INTERACTIVE: enter credentials locally; do not paste them into chat or command-line arguments.'
   say "install -m 600 /dev/stdin '$SECRET_DIR/telegram-token'"
   say "install -m 600 /dev/stdin '$SECRET_DIR/naver-caldav'"
-  say "install -m 600 /dev/stdin '$SECRET_DIR/naver-oauth'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' oauth configure --client-file '$SECRET_DIR/naver-oauth-client' < /absolute/owner-private/naver-client-input.json"
+  say "node '$PLUGIN_ROOT/dist/cli.js' oauth begin --client-file '$SECRET_DIR/naver-oauth-client' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' oauth callback --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' < /absolute/owner-private/naver-callback.json"
+  say "node '$PLUGIN_ROOT/dist/cli.js' oauth status --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' doctor --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' --naver-client-file '$SECRET_DIR/naver-oauth-client' --naver-token-file '$SECRET_DIR/naver-oauth-token'"
   say "$OPENCLAW models auth login"
   say 'Complete Naver OAuth in the local browser, then rerun: install-openclaw.sh --finish'
   exit 2

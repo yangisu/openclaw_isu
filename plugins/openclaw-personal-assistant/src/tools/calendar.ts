@@ -1,4 +1,5 @@
 import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import { join } from 'node:path';
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
@@ -16,7 +17,11 @@ import {
   type RecurrenceRule,
 } from '../calendar/ical.js';
 import { NaverCalendarApi } from '../calendar/naver-api.js';
-import type { NaverTokenSet } from '../calendar/oauth.js';
+import {
+  NaverOAuth, validateNaverOAuthClientCredentials,
+  type NaverOAuthClientCredentials, type NaverTokenSet, type SecretStore,
+} from '../calendar/oauth.js';
+import type { SubsystemHealthJournal } from '../state/health.js';
 import {
   CalendarOutbox,
   type CalendarRequest,
@@ -80,6 +85,17 @@ interface PreparedOutbox {
 interface ConfirmingOutbox {
   confirmAndSubmit(requestId: string, senderId: string, payloadHash: string): Promise<CalendarRequest>;
   close(): void;
+}
+
+type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+export interface CalendarWriteApiDependencies {
+  credentialStore?: SecretStore<unknown>;
+  tokenStore?: SecretStore<NaverTokenSet>;
+  oauthFetch?: FetchLike;
+  calendarFetch?: FetchLike;
+  now?: () => number;
+  health?: Pick<SubsystemHealthJournal, 'report' | 'recover'>;
 }
 
 export interface CalendarPrepareDependencies {
@@ -222,15 +238,39 @@ function openPrepareOutbox(config: AssistantToolConfig): PreparedOutbox {
 }
 
 async function openConfirmOutbox(config: AssistantToolConfig): Promise<ConfirmingOutbox> {
-  const { naverTokenFile } = requireCalendarWriteConfig(config);
-  const tokens = await new SecretFileStore<NaverTokenSet>(naverTokenFile).read();
   return new CalendarOutbox({
     stateDir: config.stateDir,
-    api: new NaverCalendarApi({ accessToken: tokens.accessToken }),
+    api: await createCalendarWriteApi(config),
     caldav: {
       async listEvents() {
         throw new AssistantToolError('external_read_forbidden', 'Calendar confirmation does not read CalDAV');
       },
     },
+  });
+}
+
+export async function createCalendarWriteApi(
+  config: AssistantToolConfig,
+  dependencies: CalendarWriteApiDependencies = {},
+): Promise<NaverCalendarApi> {
+  const { naverOAuthClientFile, naverTokenFile } = requireCalendarWriteConfig(config);
+  const credentialStore = dependencies.credentialStore ?? new SecretFileStore<unknown>(naverOAuthClientFile, 16_384);
+  const tokenStore = dependencies.tokenStore ?? new SecretFileStore<NaverTokenSet>(naverTokenFile, 32_768);
+  const credentials: NaverOAuthClientCredentials = validateNaverOAuthClientCredentials(await credentialStore.read());
+  const oauth = new NaverOAuth({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: credentials.redirectUri,
+    stateDbPath: join(config.stateDir, 'naver-oauth-state.sqlite3'),
+    tokenStore,
+    ...(dependencies.oauthFetch === undefined ? {} : { fetch: dependencies.oauthFetch }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    ...(dependencies.health === undefined ? {} : { health: dependencies.health }),
+    healthStateDir: config.stateDir,
+  });
+  const accessToken = await oauth.getValidAccessToken();
+  return new NaverCalendarApi({
+    accessToken,
+    ...(dependencies.calendarFetch === undefined ? {} : { fetch: dependencies.calendarFetch }),
   });
 }

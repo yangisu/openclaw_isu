@@ -12,6 +12,7 @@ import { normalizeTelegramUserId } from '../telegram-user-id.js';
 export interface CalendarToolConfig {
   caldavBaseUrl?: string;
   caldavSecretFile?: string;
+  naverOAuthClientFile?: string;
   naverTokenFile?: string;
   calendarMappings?: CalendarCollectionMapping[];
 }
@@ -35,12 +36,12 @@ export function loadConfigFromApi(api: OpenClawPluginApi): AssistantToolConfig {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration must be an object');
   }
   const value = rawCalendar as Record<string, unknown>;
-  const allowed = new Set(['caldavBaseUrl', 'caldavSecretFile', 'naverTokenFile', 'calendarMappings']);
+  const allowed = new Set(['caldavBaseUrl', 'caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile', 'calendarMappings']);
   if (Object.keys(value).some(key => !allowed.has(key))) {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration contains an unknown field');
   }
   const calendar: CalendarToolConfig = {};
-  for (const key of ['caldavSecretFile', 'naverTokenFile'] as const) {
+  for (const key of ['caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile'] as const) {
     const path = value[key];
     if (path !== undefined) {
       if (typeof path !== 'string' || !isSafeAbsoluteWslPath(path)) {
@@ -123,13 +124,24 @@ export function requireCalendarReadConfig(config: AssistantToolConfig): {
 }
 
 export function requireCalendarWriteConfig(config: AssistantToolConfig): {
+  naverOAuthClientFile: string;
   naverTokenFile: string;
 } {
-  const { naverTokenFile } = config.calendar ?? {};
-  if (!naverTokenFile) {
+  const { naverOAuthClientFile, naverTokenFile } = config.calendar ?? {};
+  if (!naverOAuthClientFile || !naverTokenFile) {
     throw new AssistantToolError('calendar_not_configured', 'Naver calendar write access is not configured');
   }
-  return { naverTokenFile };
+  if (naverOAuthClientFile === naverTokenFile
+    || [naverOAuthClientFile, naverTokenFile].some(secretPath =>
+      [config.workspaceDir, config.stateDir, config.backupDir].some(root => isWithinRoot(root, secretPath)))) {
+    throw new AssistantToolError('invalid_calendar_config', 'Naver OAuth stores must be separate from data and backup roots');
+  }
+  return { naverOAuthClientFile, naverTokenFile };
+}
+
+function isWithinRoot(root: string, candidate: string): boolean {
+  const normalizedRoot = root.replace(/\/+$/, '');
+  return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}/`);
 }
 
 function isSafeAbsoluteWslPath(path: string): boolean {

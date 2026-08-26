@@ -23,6 +23,7 @@ export const configSchema = Type.Object({
   calendar: Type.Optional(Type.Object({
     caldavBaseUrl: Type.Optional(Type.String({ pattern: '^https://' })),
     caldavSecretFile: Type.Optional(absoluteWslPath),
+    naverOAuthClientFile: Type.Optional(absoluteWslPath),
     naverTokenFile: Type.Optional(absoluteWslPath),
     calendarMappings: Type.Optional(Type.Array(Type.Object({
       apiCalendarId: Type.String({ minLength: 1, maxLength: 1024 }),
