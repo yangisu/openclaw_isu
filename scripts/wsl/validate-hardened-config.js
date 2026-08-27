@@ -14,7 +14,9 @@ try {
   const requireFromOpenClaw = createRequire(join(dirname(openclawBin), '..', 'openclaw', 'package.json'));
   const JSON5 = requireFromOpenClaw('json5');
   const config = JSON5.parse(bytes.toString('utf8'));
-  validateSafeValue(config);
+  const safeConfig = structuredClone(config);
+  removeOwnerPrivateGatewayAuth(safeConfig);
+  validateSafeValue(safeConfig);
   const expectedTools = ['assistant_briefing', 'assistant_calendar_confirm', 'assistant_calendar_prepare', 'assistant_mutate', 'assistant_query'];
   const plugin = config.plugins?.entries?.['openclaw-personal-assistant'];
   const owner = plugin?.config?.telegramUserId;
@@ -37,6 +39,20 @@ try {
 } catch {
   process.stderr.write('active_config_not_hardened\n');
   process.exit(1);
+}
+
+function removeOwnerPrivateGatewayAuth(config) {
+  const gateway = config?.gateway;
+  const auth = gateway?.auth;
+  if (auth === undefined) return;
+  if (!gateway || typeof gateway !== 'object' || Array.isArray(gateway)
+    || !auth || typeof auth !== 'object' || Array.isArray(auth)
+    || Object.keys(auth).sort().join(',') !== 'mode,token'
+    || auth.mode !== 'token'
+    || typeof auth.token !== 'string' || !/^[0-9a-f]{48}$/.test(auth.token)) {
+    throw new Error('gateway_auth_invalid');
+  }
+  delete gateway.auth;
 }
 
 function containsPlaceholder(value) {

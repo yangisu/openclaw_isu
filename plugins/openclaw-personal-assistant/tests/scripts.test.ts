@@ -459,6 +459,32 @@ describe('deployment scripts', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('accepts OpenClaw-managed gateway auth only at the owner-private active config boundary', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-gateway-auth-config-'));
+    try {
+      privateDirectory(root);
+      const config = resolve(root, 'openclaw.json5');
+      const secretRoot = resolve(root, 'secrets');
+      const configSecretRoot = secretRoot.replaceAll('\\', '/');
+      const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
+        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
+        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal')
+        .replace("bind: 'loopback',", "bind: 'loopback',\n    mode: 'local',\n    auth: { mode: 'token', token: '0123456789abcdef0123456789abcdef0123456789abcdef' },");
+      writeFileSync(config, baseline, { mode: 0o600 });
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const accepted = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
+      expect(accepted.status, accepted.stderr).toBe(0);
+
+      const unsafePluginSecret = baseline.replace(
+        "timezone: 'Asia/Seoul',",
+        "timezone: 'Asia/Seoul',\n          token: 'plugin-secret',",
+      );
+      writeFileSync(config, unsafePluginSecret, { mode: 0o600 });
+      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' }).status).not.toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each([
     ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
     ['CalDAV read enabled before live PoC', (text: string) => text.replace('caldavReadEnabled: false', 'caldavReadEnabled: true')],
