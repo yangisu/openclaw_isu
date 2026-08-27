@@ -9,6 +9,7 @@ import type { SecretStore } from './oauth.js';
 const AUTHORIZE_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+const USERINFO_ENDPOINT = 'https://openidconnect.googleapis.com/v1/userinfo';
 const STATE_LIFETIME_MS = 10 * 60_000;
 const STATE_RETENTION_MS = 24 * 60 * 60_000;
 const TOKEN_SAFETY_WINDOW_MS = 5 * 60_000;
@@ -17,6 +18,7 @@ const MAX_REVOKE_RESPONSE_BYTES = 16 * 1024;
 const MAX_TOKEN_LENGTH = 8_192;
 
 export const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.app.created' as const;
+export const GOOGLE_OAUTH_SCOPE = `openid email ${GOOGLE_CALENDAR_SCOPE}` as const;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -31,8 +33,11 @@ export interface GoogleTokenSet {
   accessToken: string;
   refreshToken: string;
   expiresAt: string;
-  scope: typeof GOOGLE_CALENDAR_SCOPE;
+  scope: typeof GOOGLE_OAUTH_SCOPE;
+  account: string;
 }
+
+type UnverifiedGoogleTokenSet = Omit<GoogleTokenSet, 'account'>;
 
 export interface GoogleAuthorization {
   authorizationUrl: string;
@@ -50,6 +55,7 @@ export type GoogleOAuthErrorCode =
   | 'google_oauth_invalid_response'
   | 'google_oauth_token_invalid'
   | 'google_oauth_credentials_invalid'
+  | 'google_oauth_account_mismatch'
   | 'google_oauth_timeout'
   | 'google_oauth_request_failed';
 
@@ -124,7 +130,7 @@ export class GoogleOAuth {
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('client_id', this.#clientId);
     url.searchParams.set('redirect_uri', redirectUri);
-    url.searchParams.set('scope', GOOGLE_CALENDAR_SCOPE);
+    url.searchParams.set('scope', GOOGLE_OAUTH_SCOPE);
     url.searchParams.set('access_type', 'offline');
     url.searchParams.set('prompt', 'consent');
     url.searchParams.set('login_hint', this.#expectedAccount);
@@ -162,7 +168,7 @@ export class GoogleOAuth {
     ].sort();
     if (keys.join('\0') !== expectedKeys.join('\0')
       || (issuer !== null && issuer !== 'https://accounts.google.com')
-      || (grantedScope !== null && grantedScope !== GOOGLE_CALENDAR_SCOPE)) {
+      || (grantedScope !== null && !hasExactOAuthScopes(grantedScope))) {
       throw new GoogleOAuthError('google_oauth_callback_invalid', 'Google OAuth callback is invalid');
     }
     if (oauthError || !code || code.length > 8_192) {
@@ -177,8 +183,9 @@ export class GoogleOAuth {
       redirect_uri: accepted.redirectUri,
     }));
     const tokens = parseTokenResponse(response, undefined, this.#now(), true);
-    await this.#tokenStore.write(tokens);
-    return tokens;
+    const verified = { ...tokens, account: await this.#verifyAccount(tokens.accessToken) };
+    await this.#tokenStore.write(verified);
+    return verified;
   }
 
   async getValidAccessToken(safetyWindowMs = TOKEN_SAFETY_WINDOW_MS): Promise<string> {
@@ -186,7 +193,10 @@ export class GoogleOAuth {
       throw new GoogleOAuthError('google_oauth_token_invalid', 'Google OAuth token state is invalid');
     }
     const current = validateGoogleTokenSet(await this.#tokenStore.read());
-    if (Date.parse(current.expiresAt) - this.#now() > safetyWindowMs) return current.accessToken;
+    if (Date.parse(current.expiresAt) - this.#now() > safetyWindowMs) {
+      await this.#verifyAccount(current.accessToken);
+      return current.accessToken;
+    }
     if (!this.#refreshPromise) {
       this.#refreshPromise = this.#refresh(current).finally(() => { this.#refreshPromise = undefined; });
     }
@@ -235,8 +245,32 @@ export class GoogleOAuth {
       refresh_token: current.refreshToken,
     }));
     const tokens = parseTokenResponse(response, current.refreshToken, this.#now(), false);
-    await this.#tokenStore.write(tokens);
-    return tokens;
+    const verified = { ...tokens, account: await this.#verifyAccount(tokens.accessToken) };
+    await this.#tokenStore.write(verified);
+    return verified;
+  }
+
+  async #verifyAccount(accessToken: string): Promise<string> {
+    const signal = AbortSignal.timeout(this.#timeoutMs);
+    let response: Response;
+    try {
+      response = await this.#fetch(USERINFO_ENDPOINT, {
+        headers: { authorization: `Bearer ${accessToken}` }, signal,
+      });
+    } catch {
+      if (signal.aborted) throw new GoogleOAuthError('google_oauth_timeout', 'Google account verification timed out');
+      throw new GoogleOAuthError('google_oauth_request_failed', 'Google account verification failed');
+    }
+    if (!response.ok) throw oauthHttpError(response.status);
+    let value: unknown;
+    try { value = await readBoundedJson(response, MAX_TOKEN_RESPONSE_BYTES); }
+    catch { throw new GoogleOAuthError('google_oauth_invalid_response', 'Google account verification was invalid'); }
+    const identity = objectValue(value);
+    const email = boundedString(identity.email)?.trim().toLowerCase();
+    if (identity.email_verified !== true || email !== this.#expectedAccount) {
+      throw new GoogleOAuthError('google_oauth_account_mismatch', 'Google OAuth account does not match the configured account');
+    }
+    return email;
   }
 
   async #requestToken(body: URLSearchParams): Promise<unknown> {
@@ -338,17 +372,18 @@ export function validateGoogleOAuthClientCredentials(value: unknown): GoogleOAut
 
 export function validateGoogleTokenSet(value: unknown): GoogleTokenSet {
   const record = objectValue(value);
-  if (Object.keys(record).sort().join('\0') !== ['accessToken', 'expiresAt', 'refreshToken', 'scope', 'version'].join('\0')
+  if (Object.keys(record).sort().join('\0') !== ['accessToken', 'account', 'expiresAt', 'refreshToken', 'scope', 'version'].join('\0')
     || record.version !== 1
     || typeof record.accessToken !== 'string' || record.accessToken.length < 1 || record.accessToken.length > MAX_TOKEN_LENGTH
     || typeof record.refreshToken !== 'string' || record.refreshToken.length < 1 || record.refreshToken.length > MAX_TOKEN_LENGTH
     || typeof record.expiresAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(record.expiresAt)
-    || !Number.isFinite(Date.parse(record.expiresAt)) || record.scope !== GOOGLE_CALENDAR_SCOPE) {
+    || !Number.isFinite(Date.parse(record.expiresAt)) || record.scope !== GOOGLE_OAUTH_SCOPE
+    || record.account !== 'yangisu12@gmail.com') {
     throw new GoogleOAuthError('google_oauth_token_invalid', 'Google OAuth token state is invalid');
   }
   return {
     version: 1, accessToken: record.accessToken, refreshToken: record.refreshToken,
-    expiresAt: record.expiresAt, scope: GOOGLE_CALENDAR_SCOPE,
+    expiresAt: record.expiresAt, scope: GOOGLE_OAUTH_SCOPE, account: record.account,
   };
 }
 
@@ -372,25 +407,32 @@ function parseTokenResponse(
   previousRefreshToken: string | undefined,
   now: number,
   requireRefreshToken: boolean,
-): GoogleTokenSet {
+): UnverifiedGoogleTokenSet {
   const record = objectValue(value);
   const accessToken = boundedString(record.access_token);
   const refreshToken = boundedString(record.refresh_token) ?? previousRefreshToken;
   const tokenType = boundedString(record.token_type);
-  const responseScope = boundedString(record.scope) ?? (previousRefreshToken ? GOOGLE_CALENDAR_SCOPE : undefined);
+  const responseScope = boundedString(record.scope) ?? (previousRefreshToken ? GOOGLE_OAUTH_SCOPE : undefined);
   const expiresIn = typeof record.expires_in === 'number' || typeof record.expires_in === 'string'
     ? Number(record.expires_in) : Number.NaN;
   const expiresAt = now + expiresIn * 1_000;
   if (!accessToken || !refreshToken || (requireRefreshToken && !record.refresh_token)
-    || tokenType?.toLowerCase() !== 'bearer' || responseScope !== GOOGLE_CALENDAR_SCOPE
+    || tokenType?.toLowerCase() !== 'bearer' || !hasExactOAuthScopes(responseScope)
     || !Number.isSafeInteger(expiresIn) || expiresIn <= 0 || !Number.isFinite(expiresAt)
     || Math.abs(expiresAt) > 8_640_000_000_000_000) {
     throw new GoogleOAuthError('google_oauth_invalid_response', 'Google OAuth returned an incomplete token response');
   }
   return {
     version: 1, accessToken, refreshToken, expiresAt: new Date(expiresAt).toISOString(),
-    scope: GOOGLE_CALENDAR_SCOPE,
+    scope: GOOGLE_OAUTH_SCOPE,
   };
+}
+
+function hasExactOAuthScopes(value: string | undefined): boolean {
+  if (!value) return false;
+  const actual = new Set(value.split(/\s+/).filter(Boolean));
+  return actual.size === 3
+    && actual.has('openid') && actual.has('email') && actual.has(GOOGLE_CALENDAR_SCOPE);
 }
 
 function validateRedirectUri(raw: string): string {

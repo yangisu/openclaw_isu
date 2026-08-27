@@ -53,7 +53,7 @@ assistant_calendar_manage
 assistant_briefing
 ```
 
-In Google Cloud, enable Google Calendar API, configure the OAuth consent screen for `yangisu12@gmail.com`, and create an OAuth client of type **Desktop app**. Download its JSON file to an owner-private location. The CLI imports it through stdin and requests only `https://www.googleapis.com/auth/calendar.app.created`; this permits calendar creation and event access only in calendars created by this app.
+In Google Cloud, enable Google Calendar API, configure the OAuth consent screen for `yangisu12@gmail.com`, and create an OAuth client of type **Desktop app**. Download its JSON file to an owner-private location. The CLI requests `openid email` for exact account verification and `https://www.googleapis.com/auth/calendar.app.created` as its only Calendar data scope; this permits calendar creation and event access only in calendars created by this app.
 
 ```bash
 umask 077

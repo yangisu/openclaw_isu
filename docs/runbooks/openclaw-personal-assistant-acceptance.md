@@ -56,7 +56,7 @@ node plugins/openclaw-personal-assistant/dist/cli.js google calendar bootstrap \
   --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-The consent request must show only `calendar.app.created` for Calendar data and the selected account must be `yangisu12@gmail.com`. Google OAuth projects in External/Testing status issue refresh tokens that can expire after seven days when Calendar scope is present. For continuous operation, move the personal OAuth app to Production and authorize again; otherwise repeat authorization after expiry.
+The consent request must show only `calendar.app.created` for Calendar data plus `openid email` for identity verification, and the selected account must be `yangisu12@gmail.com`. Authorization and every Calendar API request must fail closed when Google UserInfo does not return that verified email. Google OAuth projects in External/Testing status issue refresh tokens that can expire after seven days when Calendar scope is present. For continuous operation, move the personal OAuth app to Production and authorize again; otherwise repeat authorization after expiry.
 
 After installation, run the zero-residue live test:
 

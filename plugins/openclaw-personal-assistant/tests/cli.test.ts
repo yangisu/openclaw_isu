@@ -224,7 +224,8 @@ describe('operational CLI', () => {
     const tokens = new CliMemoryStore<unknown>({
       version: 1, accessToken: 'private-access', refreshToken: 'private-refresh',
       expiresAt: '2030-01-01T01:00:00.000Z',
-      scope: 'https://www.googleapis.com/auth/calendar.app.created',
+      scope: 'openid email https://www.googleapis.com/auth/calendar.app.created',
+      account: 'yangisu12@gmail.com',
     });
     const fetch = vi.fn();
     const inputSecret = 'private-google-client-secret';
@@ -270,10 +271,14 @@ describe('operational CLI', () => {
     const tokens = new CliMemoryStore<unknown>({
       version: 1, accessToken: 'private-access', refreshToken: 'private-refresh',
       expiresAt: '2030-01-01T01:00:00.000Z',
-      scope: 'https://www.googleapis.com/auth/calendar.app.created',
+      scope: 'openid email https://www.googleapis.com/auth/calendar.app.created',
+      account: 'yangisu12@gmail.com',
     });
     const binding = new CliMemoryStore<unknown>();
     const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      if (String(input).includes('/userinfo')) return new Response(JSON.stringify({
+        sub: 'expected-subject', email: 'yangisu12@gmail.com', email_verified: true,
+      }), { status: 200 });
       if (init?.method === 'POST') return new Response(JSON.stringify({
         id: 'created@group.calendar.google.com', summary: 'openclaw_cal', timeZone: 'Asia/Seoul',
       }), { status: 200 });
@@ -312,6 +317,9 @@ describe('operational CLI', () => {
     };
     const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = decodeURIComponent(String(input));
+      if (url.includes('/userinfo')) return new Response(JSON.stringify({
+        sub: 'expected-subject', email: 'yangisu12@gmail.com', email_verified: true,
+      }), { status: 200 });
       if (!url.includes('/events')) return new Response(JSON.stringify({
         id: bindingValue.calendarId, summary: bindingValue.summary, timeZone: bindingValue.timeZone,
       }), { status: 200 });
@@ -333,7 +341,8 @@ describe('operational CLI', () => {
       googleTokenStore: () => new CliMemoryStore({
         version: 1 as const, accessToken: 'private-access', refreshToken: 'private-refresh',
         expiresAt: '2030-01-01T01:00:00.000Z',
-        scope: 'https://www.googleapis.com/auth/calendar.app.created' as const,
+        scope: 'openid email https://www.googleapis.com/auth/calendar.app.created' as const,
+        account: 'yangisu12@gmail.com',
       }),
       googleBindingStore: () => new CliMemoryStore(bindingValue),
       googleBindingExists: () => true,
@@ -348,7 +357,8 @@ describe('operational CLI', () => {
     expect(JSON.parse(output.stdout[0]!)).toEqual({
       status: 'PASS', created: true, updated: true, deleted: true, remaining: 0, redactedErrorCode: null,
     });
-    expect(fetch.mock.calls.map(call => call[1]?.method)).toEqual(['GET', 'POST', 'PATCH', 'DELETE', 'GET']);
+    expect(fetch.mock.calls.filter(call => !String(call[0]).includes('/userinfo'))
+      .map(call => call[1]?.method)).toEqual(['GET', 'POST', 'PATCH', 'DELETE', 'GET']);
     expect(output.stdout.join('\n')).not.toMatch(/private-secret|private-access|private-refresh/);
   });
   it('initializes only private directories and non-secret templates without overwriting data', async () => {

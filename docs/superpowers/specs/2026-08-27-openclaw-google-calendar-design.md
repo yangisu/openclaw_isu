@@ -9,8 +9,8 @@ OpenClaw 개인 비서의 네이버 Calendar/CalDAV 연동을 Google Calendar �
 
 확정된 보안 경계는 다음과 같다.
 
-- Calendar 데이터 권한은 `https://www.googleapis.com/auth/calendar.app.created` 하나만 요청한다.
-- OAuth 로그인 계정 선택에는 `login_hint=yangisu12@gmail.com`을 사용한다. 로그인 완료 후 운영자가 표시된 계정을 확인한다.
+- Calendar 데이터 권한은 `https://www.googleapis.com/auth/calendar.app.created` 하나만 요청하고, 실제 계정 검증을 위해 `openid email` 식별 범위를 함께 요청한다.
+- OAuth 로그인 계정 선택에는 `login_hint=yangisu12@gmail.com`을 사용한다. 토큰 발급 직후와 모든 Calendar API 요청 직전에 Google UserInfo의 검증된 이메일이 정확히 일치하는지 확인한다.
 - 기본 캘린더, 기존 보조 캘린더, Calendar ACL, 공유 설정에는 접근하지 않는다.
 - `openclaw_cal`의 불변 Google calendar ID를 owner-private 바인딩 파일에 저장한다.
 - 도구와 API 클라이언트 양쪽에서 저장된 calendar ID 외의 값을 거부한다.
@@ -67,7 +67,7 @@ Google은 `calendar.app.created` 범위를 이 애플리케이션이 만든 보�
 
 Google Desktop app의 권장 loopback redirect와 PKCE S256을 사용한다. CLI는 임의 loopback 포트에 일회용 HTTP 서버를 열고 시스템 브라우저용 URL을 출력한다. state와 PKCE verifier는 owner-private SQLite에 10분 만료·1회 사용으로 저장한다. callback은 정확한 loopback origin/path, `code`와 `state`만 허용하고 성공 또는 오류 안내 HTML을 반환한 뒤 서버를 닫는다.
 
-인증 요청은 `access_type=offline`, `prompt=consent`, 정확한 `calendar.app.created` scope와 계정 login hint를 사용한다. token 응답에 refresh token이 없거나 scope가 다르면 설치를 닫는다. access token은 만료 5분 전 refresh하고, 동시 refresh는 한 요청만 수행한다.
+인증 요청은 `access_type=offline`, `prompt=consent`, 정확한 `openid email calendar.app.created` scope 집합과 계정 login hint를 사용한다. token 응답에 refresh token이 없거나 scope가 다르면 설치를 닫는다. 토큰 발급·갱신 후와 Calendar API 호출 직전에 Google UserInfo의 `email_verified=true` 및 `email=yangisu12@gmail.com`을 검증한다. access token은 만료 5분 전 refresh하고, 동시 refresh는 한 요청만 수행한다.
 
 Google Cloud OAuth 동의 화면이 External/Testing 상태이면 Calendar scope refresh token은 7일 후 만료될 수 있다. 설치 안내와 doctor는 Testing 상태의 운영 위험을 명시하고, 지속 운영은 동의 화면을 Production으로 전환한 뒤 다시 인증하는 절차를 요구한다.
 
