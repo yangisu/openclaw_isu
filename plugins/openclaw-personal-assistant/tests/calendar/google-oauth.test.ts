@@ -90,7 +90,7 @@ describe('Google OAuth', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it('accepts the canonical Google issuer parameter in an authorization callback', async () => {
+  it('accepts canonical Google issuer and granted scope parameters in an authorization callback', async () => {
     const root = await mkdtemp(join(tmpdir(), 'google-oauth-issuer-'));
     const fetch = vi.fn(async () => json({
       access_token: 'access-token', refresh_token: 'refresh-token', token_type: 'Bearer',
@@ -105,7 +105,8 @@ describe('Google OAuth', () => {
     const begin = oauth.begin('http://127.0.0.1:43125/google/callback');
     const state = new URL(begin.authorizationUrl).searchParams.get('state');
     const callback = `http://127.0.0.1:43125/google/callback?state=${state}`
-      + '&iss=https%3A%2F%2Faccounts.google.com&code=authorization-code';
+      + '&iss=https%3A%2F%2Faccounts.google.com&code=authorization-code'
+      + `&scope=${encodeURIComponent(GOOGLE_CALENDAR_SCOPE)}`;
 
     await expect(oauth.handleCallback(callback)).resolves.toMatchObject({
       accessToken: 'access-token', refreshToken: 'refresh-token',

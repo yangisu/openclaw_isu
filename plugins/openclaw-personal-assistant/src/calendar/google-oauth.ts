@@ -156,9 +156,13 @@ export class GoogleOAuth {
     const code = callback.searchParams.get('code');
     const oauthError = callback.searchParams.get('error');
     const issuer = callback.searchParams.get('iss');
-    const expectedKeys = oauthError ? ['error', 'state'] : issuer ? ['code', 'iss', 'state'] : ['code', 'state'];
+    const grantedScope = callback.searchParams.get('scope');
+    const expectedKeys = oauthError ? ['error', 'state'] : [
+      'code', ...(issuer === null ? [] : ['iss']), ...(grantedScope === null ? [] : ['scope']), 'state',
+    ].sort();
     if (keys.join('\0') !== expectedKeys.join('\0')
-      || (issuer !== null && issuer !== 'https://accounts.google.com')) {
+      || (issuer !== null && issuer !== 'https://accounts.google.com')
+      || (grantedScope !== null && grantedScope !== GOOGLE_CALENDAR_SCOPE)) {
       throw new GoogleOAuthError('google_oauth_callback_invalid', 'Google OAuth callback is invalid');
     }
     if (oauthError || !code || code.length > 8_192) {
