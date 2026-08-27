@@ -92,6 +92,12 @@ export function parseWindowsReparseClassification(output: string): boolean {
   throw new BackupError('reparse_classification_failed', 'Windows reparse classification returned an invalid result');
 }
 
+export const WINDOWS_REPARSE_CLASSIFICATION_SCRIPT =
+  '$p=$env:OPENCLAW_PS_PATH;[bool]([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint)';
+
+export const WINDOWS_ACL_EVIDENCE_SCRIPT =
+  '$p=$env:OPENCLAW_PS_PATH;$a=[IO.Directory]::GetAccessControl($p);$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value;$r=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|%{@{sid=$_.IdentityReference.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4';
+
 export interface BackupAclVerifier {
   verifyPrivateDirectory(path: string): Promise<void>;
   verifyBackupRoot(path: string): Promise<void>;
@@ -1258,8 +1264,7 @@ const DEFAULT_PATH_SAFETY: PathSafety = {
     try {
       const output = await runExecFileCapture({
         executable: 'powershell.exe',
-        args: ['-NoProfile', '-NonInteractive', '-Command',
-          '$p=$env:OPENCLAW_PS_PATH;[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)'],
+        args: ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_REPARSE_CLASSIFICATION_SCRIPT],
         env: withWslInteropEnv({ OPENCLAW_PS_PATH: windowsPath }),
         timeoutMs: 10_000,
       });
@@ -1544,8 +1549,7 @@ async function verifyWindowsAclPath(path: string): Promise<void> {
   if (windowsPath) {
       const output = await runExecFileCapture({
         executable: 'powershell.exe',
-        args: ['-NoProfile', '-NonInteractive', '-Command',
-          '$p=$env:OPENCLAW_PS_PATH;$a=Get-Acl -LiteralPath $p;$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.Owner;if($o -notmatch "^S-"){$o=([Security.Principal.NTAccount]$o).Translate([Security.Principal.SecurityIdentifier]).Value};$r=@($a.Access|%{$s=$_.IdentityReference;if($s -isnot [Security.Principal.SecurityIdentifier]){$s=$s.Translate([Security.Principal.SecurityIdentifier])};@{sid=$s.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4'],
+        args: ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ACL_EVIDENCE_SCRIPT],
         env: withWslInteropEnv({ OPENCLAW_PS_PATH: windowsPath }),
         timeoutMs: 10_000,
       });

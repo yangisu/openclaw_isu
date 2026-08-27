@@ -23,6 +23,8 @@ import {
   restoreBackup,
   validateWindowsBackupAcl,
   verifyBackup,
+  WINDOWS_ACL_EVIDENCE_SCRIPT,
+  WINDOWS_REPARSE_CLASSIFICATION_SCRIPT,
   writeAll,
   type AgeRunner,
   type BackupPublicationOps,
@@ -619,6 +621,24 @@ describe('encrypted verified backup', () => {
       { rules: valid.rules.map((rule, index) => index ? { ...rule, type: 'Deny' } : rule) },
       { protected: false }, { rules: valid.rules.map((rule, index) => index ? { ...rule, inherited: true } : rule) },
     ]) expect(() => validateWindowsBackupAcl(JSON.stringify({ ...valid, ...mutation }))).toThrowError(expect.objectContaining({ code: 'acl_unsafe' }));
+  });
+
+  (process.platform === 'win32' ? it : it.skip)('collects Windows path evidence without PowerShell module autoload', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-powershell-evidence-'));
+    roots.push(root);
+    const env = { ...process.env, PSModulePath: '', OPENCLAW_PS_PATH: root };
+    const reparse = execFileSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_REPARSE_CLASSIFICATION_SCRIPT],
+      { encoding: 'utf8', env });
+    expect(parseWindowsReparseClassification(reparse)).toBe(false);
+    const acl = execFileSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ACL_EVIDENCE_SCRIPT],
+      { encoding: 'utf8', env });
+    const evidence = JSON.parse(acl) as { currentSid: string; ownerSid: string; protected: boolean; rules: unknown[] };
+    expect(evidence.currentSid).toMatch(/^S-/);
+    expect(evidence.ownerSid).toMatch(/^S-/);
+    expect(typeof evidence.protected).toBe('boolean');
+    expect(Array.isArray(evidence.rules)).toBe(true);
   });
 
   it('strictly parses production NTFS volume and file identity evidence', () => {
