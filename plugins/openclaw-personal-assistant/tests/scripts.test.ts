@@ -298,7 +298,7 @@ describe('deployment scripts', () => {
 
   it('accepts only one enabled Cron row with the exact installed trigger bytes', () => {
     const trigger = resolve(repo, 'scripts/wsl/briefing-cron-trigger.js');
-    const script = readFileSync(trigger, 'utf8');
+    const script = readFileSync(trigger, 'utf8').replace(/\r?\n$/, '');
     const valid = { jobs: [{
       declarationKey: 'openclaw-personal-assistant-hourly-briefing', name: 'Personal assistant hourly briefing', enabled: true,
       schedule: { expr: '0 8-22 * * *', tz: 'Asia/Seoul', staggerMs: 0 }, sessionTarget: 'isolated',
@@ -321,8 +321,8 @@ describe('deployment scripts', () => {
   it('requires exactly the two non-model maintenance command jobs in addition to briefing', () => {
     const dailyTrigger = resolve(repo, 'scripts/wsl/maintenance-daily-cron-trigger.js');
     const monthlyTrigger = resolve(repo, 'scripts/wsl/maintenance-monthly-cron-trigger.js');
-    const dailyScript = readFileSync(dailyTrigger, 'utf8');
-    const monthlyScript = readFileSync(monthlyTrigger, 'utf8');
+    const dailyScript = readFileSync(dailyTrigger, 'utf8').replace(/\r?\n$/, '');
+    const monthlyScript = readFileSync(monthlyTrigger, 'utf8').replace(/\r?\n$/, '');
     const node = '/usr/bin/node';
     const cli = '/opt/ocpa/dist/cli.js';
     const plugin = '/opt/ocpa';
@@ -336,7 +336,7 @@ describe('deployment scripts', () => {
         kind: 'command', argv: [node, cli, 'maintenance', kind, '--config', config], cwd: plugin,
         timeoutSeconds: 1800, noOutputTimeoutSeconds: 600, outputMaxBytes: 65536,
       },
-      delivery: { mode: 'none' }, trigger: { script: kind === 'daily' ? dailyScript : monthlyScript },
+      delivery: { mode: 'none', channel: 'last' }, trigger: { script: kind === 'daily' ? dailyScript : monthlyScript },
     });
     const valid = { jobs: [job('daily'), job('monthly')] };
     const args = [maintenanceCronValidator, dailyTrigger, monthlyTrigger, node, cli, plugin, config];

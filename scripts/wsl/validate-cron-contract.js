@@ -13,7 +13,7 @@ try {
   if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > 256 * 1024
     || realpathSync(triggerPath) !== triggerPath
     || (process.platform !== 'win32' && typeof process.getuid === 'function' && info.uid !== process.getuid())) throw new Error('trigger');
-  const installedScript = readFileSync(triggerPath, 'utf8');
+  const installedScript = normalizeRuntimeScript(readFileSync(triggerPath, 'utf8'));
   const installedHash = createHash('sha256').update(installedScript).digest('hex');
   const input = readBoundedStdin(1024 * 1024);
   const value = JSON.parse(input);
@@ -29,6 +29,10 @@ try {
 } catch {
   process.stderr.write('cron_contract_invalid\n');
   process.exit(1);
+}
+
+function normalizeRuntimeScript(script) {
+  return script.replace(/\r?\n$/, '');
 }
 
 function readBoundedStdin(cap) {

@@ -33,7 +33,8 @@ try {
       || payload.cwd !== pluginRoot || payload.timeoutSeconds !== 1800
       || payload.noOutputTimeoutSeconds !== 600 || payload.outputMaxBytes !== 65536
       || Object.keys(payload).sort().join('\0') !== payloadKeys.join('\0')
-      || job.delivery?.mode !== 'none' || Object.keys(job.delivery).join('\0') !== 'mode'
+      || job.delivery?.mode !== 'none' || job.delivery?.channel !== 'last'
+      || Object.keys(job.delivery).sort().join('\0') !== 'channel\0mode'
       || job.trigger?.script !== expected[kind].trigger.script
       || createHash('sha256').update(job.trigger.script).digest('hex') !== expected[kind].trigger.sha256) {
       throw new Error('contract');
@@ -52,7 +53,7 @@ function safeScript(path) {
     || (process.platform !== 'win32' && typeof process.getuid === 'function' && info.uid !== process.getuid())) {
     throw new Error('trigger');
   }
-  const script = readFileSync(path, 'utf8');
+  const script = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
   return { script, sha256: createHash('sha256').update(script).digest('hex') };
 }
 
