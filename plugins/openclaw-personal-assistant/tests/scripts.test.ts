@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
 const repo = resolve(import.meta.dirname, '../../..');
@@ -22,6 +23,22 @@ const privateAcl = resolve(repo, 'scripts/windows/set-private-directory-acl.ps1'
 const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
 
 describe('deployment scripts', () => {
+  function evaluateCronTrigger(relativePath: string, instant: string): unknown {
+    const script = readFileSync(resolve(repo, relativePath), 'utf8');
+    let result: unknown;
+    class FixedDate extends Date {
+      constructor(value?: string | number) {
+        super(value === undefined ? instant : value);
+      }
+    }
+    runInNewContext(script, {
+      Date: FixedDate,
+      Intl: undefined,
+      json(value: unknown) { result = structuredClone(value); },
+    });
+    return result;
+  }
+
   function privateDirectory(path: string): void {
     chmodSync(path, 0o700);
     if (process.platform === 'win32') {
@@ -302,12 +319,20 @@ describe('deployment scripts', () => {
 
   it('suppresses OpenClaw startup catch-up outside an exact Seoul hour', () => {
     const source = readFileSync(installer, 'utf8');
-    const trigger = resolve(repo, 'scripts/wsl/briefing-cron-trigger.js');
     expect(source).toContain('--trigger-script "$CRON_TRIGGER"');
-    expect(readFileSync(trigger, 'utf8')).toContain("timeZone: 'Asia/Seoul'");
-    expect(readFileSync(trigger, 'utf8')).toContain('minute === 0');
+    expect(evaluateCronTrigger('scripts/wsl/briefing-cron-trigger.js', '2026-08-27T00:00:00Z')).toEqual({ fire: true });
+    expect(evaluateCronTrigger('scripts/wsl/briefing-cron-trigger.js', '2026-08-27T00:01:00Z')).toEqual({ fire: false });
+    expect(evaluateCronTrigger('scripts/wsl/briefing-cron-trigger.js', '2026-08-27T13:00:00Z')).toEqual({ fire: true });
+    expect(evaluateCronTrigger('scripts/wsl/briefing-cron-trigger.js', '2026-08-27T14:00:00Z')).toEqual({ fire: false });
     const config = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8');
     expect(config).toContain('triggers: { enabled: true }');
+  });
+
+  it('evaluates maintenance triggers without Intl across the Seoul date boundary', () => {
+    expect(evaluateCronTrigger('scripts/wsl/maintenance-daily-cron-trigger.js', '2026-08-26T18:00:00Z')).toEqual({ fire: true });
+    expect(evaluateCronTrigger('scripts/wsl/maintenance-daily-cron-trigger.js', '2026-08-26T18:01:00Z')).toEqual({ fire: false });
+    expect(evaluateCronTrigger('scripts/wsl/maintenance-monthly-cron-trigger.js', '2026-09-30T19:00:00Z')).toEqual({ fire: true });
+    expect(evaluateCronTrigger('scripts/wsl/maintenance-monthly-cron-trigger.js', '2026-10-01T19:00:00Z')).toEqual({ fire: false });
   });
 
   it('accepts only one enabled Cron row with the exact installed trigger bytes', () => {
