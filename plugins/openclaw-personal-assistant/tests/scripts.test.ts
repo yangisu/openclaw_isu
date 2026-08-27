@@ -513,6 +513,7 @@ describe('deployment scripts', () => {
       const configSecretRoot = secretRoot.replaceAll('\\', '/');
       const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
         .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
+        .replace('pdfMaxBytesMb: 10, pdfMaxPages: 20', 'pdfMaxBytesMb: 10, pdfMaxPages: 20, maxConcurrent: 4, models: {}')
         .replace("bind: 'loopback',", "bind: 'loopback',\n    mode: 'local',\n    auth: { mode: 'token', token: '0123456789abcdef0123456789abcdef0123456789abcdef' },");
       writeFileSync(config, baseline, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');

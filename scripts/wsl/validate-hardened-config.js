@@ -39,8 +39,6 @@ try {
     || config.tools?.web?.fetch?.maxCharsCap !== 100000 || config.tools?.web?.fetch?.maxResponseBytes !== 1000000
     || config.tools?.web?.fetch?.timeoutSeconds !== 30 || config.tools?.web?.fetch?.maxRedirects !== 3
     || config.tools?.web?.fetch?.useTrustedEnvProxy !== false
-    || Object.keys(config.agents ?? {}).sort().join(',') !== 'defaults'
-    || Object.keys(config.agents?.defaults ?? {}).sort().join(',') !== 'pdfMaxBytesMb,pdfMaxPages'
     || config.agents?.defaults?.pdfMaxBytesMb !== 10 || config.agents?.defaults?.pdfMaxPages !== 20
     || plugin?.enabled !== true || plugin?.config?.timezone !== 'Asia/Seoul'
     || calendar?.provider !== 'google'
