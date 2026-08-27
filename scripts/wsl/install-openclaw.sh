@@ -224,12 +224,28 @@ fi
 validate_secret_tree
 validate_config_file "$CONFIG_FILE"
 node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
-"$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
-run "$OPENCLAW" config patch --file "$CONFIG_FILE"
-
 run npm --prefix "$PLUGIN_ROOT" ci
 run npm --prefix "$PLUGIN_ROOT" run plugin:validate
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
+
+GOOGLE_UPGRADE_BATCH="$(node -e '
+  const [pluginRoot, secretDir] = process.argv.slice(1);
+  process.stdout.write(JSON.stringify([
+    { path: "plugins.load.paths", value: [pluginRoot] },
+    { path: "plugins.entries.openclaw-personal-assistant.config.calendar", value: {
+      provider: "google",
+      googleOAuthClientFile: `${secretDir}/google-oauth-client`,
+      googleTokenFile: `${secretDir}/google-oauth-token`,
+      googleCalendarBindingFile: `${secretDir}/google-calendar-binding`,
+      expectedAccount: "yangisu12@gmail.com",
+    } },
+  ]));
+' "$PLUGIN_ROOT" "$SECRET_DIR")"
+"$OPENCLAW" config set --batch-json "$GOOGLE_UPGRADE_BATCH" --dry-run >/dev/null
+run "$OPENCLAW" config set --batch-json "$GOOGLE_UPGRADE_BATCH"
+"$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
+run "$OPENCLAW" config patch --file "$CONFIG_FILE"
+
 validate_config_file "$ACTIVE_CONFIG_FILE"
 validate_active_config_path
 node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"

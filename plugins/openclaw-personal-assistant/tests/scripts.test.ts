@@ -276,15 +276,20 @@ describe('deployment scripts', () => {
     expect(checkBlock).not.toMatch(/run plugin:validate|run (?:plugin:)?build/);
   });
 
-  it('applies required plugin config before linking and waits for gateway Cron readiness', () => {
+  it('atomically selects the upgraded plugin and replaces calendar config before the full patch', () => {
     const source = readFileSync(installer, 'utf8');
     const patch = source.indexOf('run "$OPENCLAW" config patch --file "$CONFIG_FILE"');
     const install = source.indexOf('run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"');
+    const upgrade = source.indexOf('run "$OPENCLAW" config set --batch-json "$GOOGLE_UPGRADE_BATCH"');
     const service = source.indexOf('run systemctl --user enable --now openclaw-gateway.service');
     const readyProbe = source.indexOf('"$OPENCLAW" cron list --json >/dev/null 2>&1', service);
     const cronAdd = source.indexOf('run "$OPENCLAW" cron add', service);
     expect(patch).toBeGreaterThan(-1);
-    expect(patch).toBeLessThan(install);
+    expect(install).toBeGreaterThan(-1);
+    expect(upgrade).toBeGreaterThan(install);
+    expect(patch).toBeGreaterThan(upgrade);
+    expect(source).toContain('plugins.load.paths');
+    expect(source).toContain('plugins.entries.openclaw-personal-assistant.config.calendar');
     expect(readyProbe).toBeGreaterThan(service);
     expect(readyProbe).toBeLessThan(cronAdd);
     expect(source.slice(service, cronAdd)).toContain('gateway_not_ready');
