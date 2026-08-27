@@ -82,15 +82,17 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     const registerTool = vi.fn();
     const registerService = vi.fn();
     const registerCommand = vi.fn();
+    const registerInteractiveHandler = vi.fn();
     const on = vi.fn();
     plugin.register({
       config: {}, pluginConfig: config, registrationMode: 'full',
-      registerTool, registerService, registerCommand, on,
+      registerTool, registerService, registerCommand, registerInteractiveHandler, on,
     } as never);
 
     expect(registerTool).toHaveBeenCalledTimes(6);
     expect(registerService).not.toHaveBeenCalled();
-    expect(registerCommand).not.toHaveBeenCalled();
+    expect(registerCommand).toHaveBeenCalledTimes(4);
+    expect(registerInteractiveHandler).toHaveBeenCalledTimes(1);
     expect(on).not.toHaveBeenCalled();
   });
 

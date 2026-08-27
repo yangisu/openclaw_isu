@@ -3,6 +3,8 @@ import {
 } from 'openclaw/plugin-sdk/plugin-entry';
 
 import { configSchema, registerAssistantTools } from './tools/register.js';
+import { registerAssistantCommands } from './commands/register.js';
+import { registerStudyInteractiveHandler } from './commands/telegram-study.js';
 
 const entry: OpenClawPluginDefinition = definePluginEntry({
   id: 'openclaw-personal-assistant',
@@ -13,6 +15,10 @@ const entry: OpenClawPluginDefinition = definePluginEntry({
   ),
   register(api) {
     registerAssistantTools(api);
+    if (api.registrationMode === 'full') {
+      registerAssistantCommands(api);
+      registerStudyInteractiveHandler(api);
+    }
   },
 });
 
