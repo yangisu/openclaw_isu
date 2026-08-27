@@ -18,15 +18,11 @@ export const configSchema = Type.Object({
   telegramUserId: Type.String({ pattern: TELEGRAM_USER_ID_PATTERN, maxLength: 19 }),
   timezone: Type.Literal('Asia/Seoul'),
   calendar: Type.Optional(Type.Object({
-    caldavReadEnabled: Type.Optional(Type.Boolean()),
-    caldavBaseUrl: Type.Optional(Type.String({ pattern: '^https://' })),
-    caldavSecretFile: Type.Optional(absoluteWslPath),
-    naverOAuthClientFile: Type.Optional(absoluteWslPath),
-    naverTokenFile: Type.Optional(absoluteWslPath),
-    calendarMappings: Type.Optional(Type.Array(Type.Object({
-      apiCalendarId: Type.String({ minLength: 1, maxLength: 1024 }),
-      caldavHref: Type.String({ minLength: 1, maxLength: 4096 }),
-    }, { additionalProperties: false }), { minItems: 1, maxItems: 10 })),
+    provider: Type.Literal('google'),
+    googleOAuthClientFile: absoluteWslPath,
+    googleTokenFile: absoluteWslPath,
+    googleCalendarBindingFile: absoluteWslPath,
+    expectedAccount: Type.Literal('yangisu12@gmail.com'),
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 

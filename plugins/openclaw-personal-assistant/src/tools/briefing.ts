@@ -12,7 +12,6 @@ import type {
   BriefingTask,
 } from '../briefing/build.js';
 import { deliverClaimedBriefing, type BriefingDurableSender } from '../briefing/delivery.js';
-import { CalDavClient } from '../calendar/caldav.js';
 import type { CalendarEvent } from '../calendar/ical.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
 import { AlertLedger, BriefingService, type AlertJournal } from '../state/alerts.js';
@@ -22,9 +21,9 @@ import {
   AssistantToolError,
   assertOwnerOrTrustedBriefingCron,
   loadConfigFromApi,
-  requireCalendarReadConfig,
   type AssistantToolConfig,
 } from './trust.js';
+import { openGoogleCalendarReader } from './query.js';
 
 export const briefingParameters = Type.Object({}, { additionalProperties: false });
 
@@ -77,19 +76,17 @@ export function createBriefingTool(
         health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
         let events: CalendarEvent[] = [];
         try {
-          const calendar = (dependencies.openCalendar ?? openCalendar)(config);
+          const calendar = (dependencies.openCalendar ?? openGoogleCalendarReader)(config);
           events = await calendar.listEvents({
             start: now.toISOString(),
             end: new Date(now.valueOf() + 7 * 86_400_000).toISOString(),
           }, signal);
-          health.recover('naver-caldav');
+          health.recover('google-calendar');
         } catch (error) {
           health.report({
             errorCode: publicErrorCode(error),
-            target: 'naver-caldav',
-            message: publicErrorCode(error) === 'caldav_read_disabled'
-              ? 'Calendar reads are disabled pending authorized live validation'
-              : 'Calendar synchronization is unavailable',
+            target: 'google-calendar',
+            message: 'Google Calendar synchronization is unavailable',
           });
         }
 
@@ -125,16 +122,6 @@ export function createBriefingTool(
 
 function openRepository(config: AssistantToolConfig): BriefingRepository {
   return new WorkspaceRepository(config);
-}
-
-function openCalendar(config: AssistantToolConfig): BriefingCalendar {
-  const calendar = requireCalendarReadConfig(config);
-  const client = new CalDavClient({
-    baseUrl: calendar.caldavBaseUrl,
-    secretFile: calendar.caldavSecretFile,
-    calendarMappings: calendar.calendarMappings,
-  });
-  return { listEvents: (range, signal) => client.listMappedEvents(range, signal) };
 }
 
 function taskFromRecord(record: ParsedRecord): BriefingTask[] {

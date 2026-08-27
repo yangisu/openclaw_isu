@@ -48,6 +48,7 @@ import {
   AssistantToolError,
   assertOwner,
   loadConfigFromApi,
+  requireGoogleCalendarConfig,
   requireCalendarWriteConfig,
   type AssistantToolConfig,
 } from './trust.js';
@@ -473,10 +474,7 @@ function openGoogleLedger(config: AssistantToolConfig): GoogleCalendarLedger {
 }
 
 async function openGoogleApi(config: AssistantToolConfig): Promise<CalendarManageApi> {
-  const calendar = config.calendar as (CalendarToolGoogleConfig | undefined);
-  if (!calendar || calendar.provider !== 'google') {
-    throw new AssistantToolError('calendar_not_configured', 'Google Calendar is not configured');
-  }
+  const calendar = requireGoogleCalendarConfig(config);
   const credentials = validateGoogleOAuthClientCredentials(
     await new SecretFileStore<unknown>(calendar.googleOAuthClientFile, 16_384).read(),
   );
@@ -492,12 +490,4 @@ async function openGoogleApi(config: AssistantToolConfig): Promise<CalendarManag
     tokenStore,
   });
   return new GoogleCalendarApi({ binding, accessToken: () => oauth.getValidAccessToken() });
-}
-
-interface CalendarToolGoogleConfig {
-  provider: 'google';
-  googleOAuthClientFile: string;
-  googleTokenFile: string;
-  googleCalendarBindingFile: string;
-  expectedAccount: string;
 }

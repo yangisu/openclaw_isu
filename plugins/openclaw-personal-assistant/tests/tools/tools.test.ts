@@ -22,6 +22,14 @@ const config = {
   timezone: 'Asia/Seoul',
 } as const;
 
+const googleCalendarConfig = {
+  provider: 'google',
+  googleOAuthClientFile: '/home/user/.openclaw/secrets/google-oauth-client',
+  googleTokenFile: '/home/user/.openclaw/secrets/google-oauth-token',
+  googleCalendarBindingFile: '/home/user/.openclaw/secrets/google-calendar-binding',
+  expectedAccount: 'yangisu12@gmail.com',
+} as const;
+
 function api(overrides: Record<string, unknown> = {}) {
   const runtimeConfig = { channels: { telegram: { enabled: true } } };
   return { config: runtimeConfig, pluginConfig: { ...config, ...overrides } } as never;
@@ -221,7 +229,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     }));
   });
 
-  it('keeps local briefing output and reports a CalDAV failure instead of an empty calendar', async () => {
+  it('keeps local briefing output and reports a Google Calendar failure instead of an empty calendar', async () => {
     const query = vi.fn(async ({ kind }: { kind: string }) => kind === 'task' ? [{
       id: 'T-20260825-001', title: 'Local report', orderedFields: [], body: '',
       fields: { type: 'task', status: 'open', priority: 'high', due_at: '2026-08-25T12:00:00+09:00' },
@@ -230,14 +238,11 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     const closeAlerts = vi.fn();
     const active: Array<{ errorCode: string; target: string; message: string }> = [];
     let sentText = '';
-    const tool = createBriefingTool(api({ calendar: {
-      caldavBaseUrl: 'https://caldav.example.test',
-      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-    } }), briefingOwnerContext, {
+    const tool = createBriefingTool(api({ calendar: googleCalendarConfig }), briefingOwnerContext, {
       now: () => new Date('2026-08-25T09:00:00+09:00'),
       openRepository: () => ({ query, close: closeRepository }),
       openCalendar: () => ({ async listEvents() {
-        throw Object.assign(new Error('private network detail'), { code: 'CALDAV_TIMEOUT' });
+        throw Object.assign(new Error('private network detail'), { code: 'calendar_timeout' });
       } }),
       openHealth: () => ({
         report(error) { active.splice(0, active.length, error); },
@@ -259,20 +264,20 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       },
     });
 
-    const result = await tool.execute('call-briefing-caldav-failure', {});
+    const result = await tool.execute('call-briefing-google-failure', {});
 
     expect(result.details).toMatchObject({
       send: false, delivered: true, deliveryStatus: 'sent',
       allowed: true, trust: 'quoted_untrusted_data',
     });
     expect(sentText).toContain('Local report');
-    expect(sentText).toContain('CALDAV_TIMEOUT (naver-caldav)');
+    expect(sentText).toContain('calendar_timeout (google-calendar)');
     expect(sentText).not.toContain('private network detail');
     expect(closeRepository).toHaveBeenCalledTimes(1);
     expect(closeAlerts).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps CalDAV disabled before credentials or network while local query and briefing continue with warning', async () => {
+  it('keeps Google Calendar closed before credentials while local query and briefing continue with warning', async () => {
     const fetch = vi.fn();
     const originalFetch = globalThis.fetch;
     globalThis.fetch = fetch;
@@ -281,19 +286,14 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       report(error: typeof active[number]) { active.splice(0, active.length, error); },
       recover: vi.fn(), listActive: () => [...active], close: vi.fn(),
     };
-    const gatedApi = api({ calendar: {
-      caldavReadEnabled: false,
-      caldavBaseUrl: 'https://caldav.example.test/',
-      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-      calendarMappings: [{ apiCalendarId: 'personal', caldavHref: 'https://caldav.example.test/personal/' }],
-    } });
+    const gatedApi = api({ calendar: googleCalendarConfig });
     try {
       const query = createQueryTool(gatedApi, ownerContext, {
         openRepository: () => ({ async query() { return []; }, close() {} }), openHealth: () => health,
       });
       await expect(query.execute('disabled-calendar-query', {
         kind: 'calendar', from: '2026-08-25T00:00:00+09:00', to: '2026-08-26T00:00:00+09:00',
-      })).rejects.toMatchObject({ code: 'caldav_read_disabled' });
+      })).rejects.toMatchObject({ code: expect.stringMatching(/^secret_|calendar_|google_/) });
       await expect(query.execute('local-record-query', { kind: 'records', recordType: 'task' }))
         .resolves.toMatchObject({ details: { kind: 'records', items: [] } });
       let text = '';
@@ -310,13 +310,13 @@ describe('OpenClaw personal-assistant tool boundary', () => {
         },
       });
       await briefing.execute('disabled-calendar-briefing', {});
-      expect(text).toContain('caldav_read_disabled (naver-caldav)');
+      expect(text).toContain('(google-calendar)');
       expect(fetch).not.toHaveBeenCalled();
-      expect(health.recover).not.toHaveBeenCalledWith('naver-caldav');
+      expect(health.recover).not.toHaveBeenCalledWith('google-calendar');
     } finally { globalThis.fetch = originalFetch; }
   });
 
-  it('reads durable subsystem errors and clears CalDAV health only after a successful read', async () => {
+  it('reads durable subsystem errors and clears Google Calendar health only after a successful read', async () => {
     const stateDir = `/tmp/openclaw-tool-health-${randomUUID()}`;
     temporaryStateDirs.push(stateDir);
     let deliveredPayloads: string[] = [];
@@ -325,13 +325,10 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',
     });
     health.report({
-      errorCode: 'CALDAV_TIMEOUT', target: 'naver-caldav', message: 'Calendar synchronization is unavailable',
+      errorCode: 'calendar_timeout', target: 'google-calendar', message: 'Calendar synchronization is unavailable',
     });
     health.close();
-    const scopedApi = api({ stateDir, calendar: {
-      caldavBaseUrl: 'https://caldav.example.test',
-      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-    } });
+    const scopedApi = api({ stateDir, calendar: googleCalendarConfig });
     const tool = createBriefingTool(scopedApi, briefingOwnerContext, {
       now: () => new Date('2026-08-25T09:00:00+09:00'),
       openRepository: () => ({ async query() { return []; }, close() {} }),
@@ -349,7 +346,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
 
     expect(result.details).toMatchObject({ send: false, delivered: true, deliveryStatus: 'sent' });
     expect(deliveredPayloads.join('\n')).toContain('BACKUP_STALE (backup)');
-    expect(deliveredPayloads.join('\n')).not.toContain('CALDAV_TIMEOUT');
+    expect(deliveredPayloads.join('\n')).not.toContain('calendar_timeout');
     const reopened = new SubsystemHealthStore(stateDir);
     expect(reopened.listActive()).toEqual([{
       errorCode: 'BACKUP_STALE', target: 'backup', message: 'Backup has not completed',
@@ -365,7 +362,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       kind: 'timed' as const, status: 'CONFIRMED',
     }]);
     const openCalendar = vi.fn(() => ({ listEvents }));
-    const query = createQueryTool(api({ calendar: { caldavReadEnabled: true } }), ownerContext, { openCalendar });
+    const query = createQueryTool(api({ calendar: googleCalendarConfig }), ownerContext, { openCalendar });
 
     const controller = new AbortController();
     const result = await query.execute('call-2', {
@@ -386,7 +383,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
 
   it('rejects a calendar query over 31 days before opening the calendar reader', async () => {
     const openCalendar = vi.fn();
-    const query = createQueryTool(api({ calendar: { caldavReadEnabled: true } }), ownerContext, { openCalendar });
+    const query = createQueryTool(api({ calendar: googleCalendarConfig }), ownerContext, { openCalendar });
     await expect(query.execute('long-calendar-query', {
       kind: 'calendar', from: '2026-01-01T00:00:00Z', to: '2026-02-02T00:00:00Z',
     })).rejects.toMatchObject({ code: 'invalid_calendar_range' });
@@ -781,16 +778,26 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     }
   });
 
-  it('accepts only structurally explicit calendar collection mappings in the plugin schema', () => {
+  it('accepts only the dedicated Google calendar configuration in the plugin schema', async () => {
     const calendar = {
-      caldavBaseUrl: 'https://caldav.example.test/',
-      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-      calendarMappings: [{ apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' }],
+      provider: 'google',
+      googleOAuthClientFile: '/home/user/.openclaw/secrets/google-oauth-client',
+      googleTokenFile: '/home/user/.openclaw/secrets/google-oauth-token',
+      googleCalendarBindingFile: '/home/user/.openclaw/secrets/google-calendar-binding',
+      expectedAccount: 'yangisu12@gmail.com',
     };
     expect(Value.Check(configSchema, { ...config, calendar })).toBe(true);
-    expect(Value.Check(configSchema, {
-      ...config, calendar: { ...calendar, calendarMappings: [{ ...calendar.calendarMappings[0], inferredId: 'personal' }] },
-    })).toBe(false);
+    expect(Value.Check(configSchema, { ...config, calendar: { ...calendar, expectedAccount: 'other@gmail.com' } })).toBe(false);
+    expect(Value.Check(configSchema, { ...config, calendar: {
+      caldavBaseUrl: 'https://caldav.example.test/',
+      caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
+    } })).toBe(false);
+    const openCalendar = vi.fn(() => ({ async listEvents() { return []; } }));
+    const query = createQueryTool(api({ calendar }), ownerContext, { openCalendar });
+    await expect(query.execute('google-query', {
+      kind: 'calendar', from: '2026-08-27T00:00:00.000Z', to: '2026-08-28T00:00:00.000Z',
+    })).resolves.toMatchObject({ details: { kind: 'calendar', items: [] } });
+    expect(openCalendar).toHaveBeenCalledTimes(1);
   });
 });
 

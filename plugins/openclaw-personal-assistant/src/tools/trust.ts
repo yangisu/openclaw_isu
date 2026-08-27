@@ -4,12 +4,16 @@ import type {
 } from 'openclaw/plugin-sdk/plugin-entry';
 import { isCronSessionKey } from 'openclaw/plugin-sdk/routing';
 
-import {
-  loadCalendarMappings, loadConfig, type AssistantConfig, type CalendarCollectionMapping,
-} from '../config.js';
+import { loadConfig, type AssistantConfig, type CalendarCollectionMapping } from '../config.js';
 import { normalizeTelegramUserId } from '../telegram-user-id.js';
 
 export interface CalendarToolConfig {
+  provider?: 'google';
+  googleOAuthClientFile?: string;
+  googleTokenFile?: string;
+  googleCalendarBindingFile?: string;
+  expectedAccount?: 'yangisu12@gmail.com';
+  // Dormant legacy fields remain typed for old migration helpers but are rejected by loadConfigFromApi.
   caldavReadEnabled?: boolean;
   caldavBaseUrl?: string;
   caldavSecretFile?: string;
@@ -37,43 +41,37 @@ export function loadConfigFromApi(api: OpenClawPluginApi): AssistantToolConfig {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration must be an object');
   }
   const value = rawCalendar as Record<string, unknown>;
-  const allowed = new Set(['caldavReadEnabled', 'caldavBaseUrl', 'caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile', 'calendarMappings']);
-  if (Object.keys(value).some(key => !allowed.has(key))) {
+  const allowed = [
+    'expectedAccount', 'googleCalendarBindingFile', 'googleOAuthClientFile', 'googleTokenFile', 'provider',
+  ];
+  if (Object.keys(value).sort().join('\0') !== allowed.join('\0')) {
     throw new AssistantToolError('invalid_calendar_config', 'Calendar configuration contains an unknown field');
   }
-  const calendar: CalendarToolConfig = {};
-  if (value.caldavReadEnabled !== undefined) {
-    if (typeof value.caldavReadEnabled !== 'boolean') {
-      throw new AssistantToolError('invalid_calendar_config', 'Invalid caldavReadEnabled');
-    }
-    calendar.caldavReadEnabled = value.caldavReadEnabled;
+  if (value.provider !== 'google' || value.expectedAccount !== 'yangisu12@gmail.com') {
+    throw new AssistantToolError('invalid_calendar_config', 'Calendar provider or account is invalid');
   }
-  for (const key of ['caldavSecretFile', 'naverOAuthClientFile', 'naverTokenFile'] as const) {
+  const paths: Record<string, string> = {};
+  for (const key of ['googleOAuthClientFile', 'googleTokenFile', 'googleCalendarBindingFile'] as const) {
     const path = value[key];
-    if (path !== undefined) {
-      if (typeof path !== 'string' || !isSafeAbsoluteWslPath(path)) {
-        throw new AssistantToolError('invalid_calendar_config', `Invalid ${key}`);
-      }
-      calendar[key] = path;
+    if (typeof path !== 'string' || !isSafeAbsoluteWslPath(path)
+      || [config.workspaceDir, config.stateDir, config.backupDir].some(root => isWithinRoot(root, path))) {
+      throw new AssistantToolError('invalid_calendar_config', `Invalid ${key}`);
     }
+    paths[key] = path;
   }
-  if (value.caldavBaseUrl !== undefined) {
-    if (typeof value.caldavBaseUrl !== 'string' || !isHttpsUrl(value.caldavBaseUrl)) {
-      throw new AssistantToolError('invalid_calendar_config', 'CalDAV base URL must use HTTPS');
-    }
-    calendar.caldavBaseUrl = value.caldavBaseUrl;
+  if (new Set(Object.values(paths)).size !== 3) {
+    throw new AssistantToolError('invalid_calendar_config', 'Google Calendar secret files must be distinct');
   }
-  if (value.calendarMappings !== undefined) {
-    if (!calendar.caldavBaseUrl) {
-      throw new AssistantToolError('invalid_calendar_config', 'Calendar mappings require a CalDAV base URL');
-    }
-    try {
-      calendar.calendarMappings = loadCalendarMappings(calendar.caldavBaseUrl, value.calendarMappings);
-    } catch {
-      throw new AssistantToolError('invalid_calendar_config', 'Invalid calendarMappings');
-    }
-  }
-  return { ...config, calendar };
+  return {
+    ...config,
+    calendar: {
+      provider: 'google',
+      googleOAuthClientFile: paths.googleOAuthClientFile!,
+      googleTokenFile: paths.googleTokenFile!,
+      googleCalendarBindingFile: paths.googleCalendarBindingFile!,
+      expectedAccount: 'yangisu12@gmail.com',
+    },
+  };
 }
 
 export function assertOwner(
@@ -133,6 +131,27 @@ export function requireCalendarReadConfig(config: AssistantToolConfig): {
   return { caldavBaseUrl, caldavSecretFile, calendarMappings };
 }
 
+export function requireGoogleCalendarConfig(config: AssistantToolConfig): {
+  provider: 'google';
+  googleOAuthClientFile: string;
+  googleTokenFile: string;
+  googleCalendarBindingFile: string;
+  expectedAccount: 'yangisu12@gmail.com';
+} {
+  const calendar = config.calendar;
+  if (calendar?.provider !== 'google' || calendar.expectedAccount !== 'yangisu12@gmail.com'
+    || !calendar.googleOAuthClientFile || !calendar.googleTokenFile || !calendar.googleCalendarBindingFile) {
+    throw new AssistantToolError('calendar_not_configured', 'Google Calendar is not configured');
+  }
+  return {
+    provider: 'google',
+    googleOAuthClientFile: calendar.googleOAuthClientFile,
+    googleTokenFile: calendar.googleTokenFile,
+    googleCalendarBindingFile: calendar.googleCalendarBindingFile,
+    expectedAccount: 'yangisu12@gmail.com',
+  };
+}
+
 export function requireCalendarWriteConfig(config: AssistantToolConfig): {
   naverOAuthClientFile: string;
   naverTokenFile: string;
@@ -156,12 +175,4 @@ function isWithinRoot(root: string, candidate: string): boolean {
 
 function isSafeAbsoluteWslPath(path: string): boolean {
   return path.startsWith('/') && !path.split('/').some(part => part === '..');
-}
-
-function isHttpsUrl(value: string): boolean {
-  try {
-    return new URL(value).protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
