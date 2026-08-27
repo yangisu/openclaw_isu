@@ -1557,8 +1557,13 @@ async function verifyWindowsAclPath(path: string): Promise<void> {
   }
 }
 
+export async function syncFileDurably(path: string): Promise<void> {
+  const handle = await open(path, 'r');
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
 const defaultDurability: BackupDurability = {
-  async syncFile(path) { const handle = await open(path, 'r+'); try { await handle.sync(); } finally { await handle.close(); } },
+  syncFile: syncFileDurably,
   async syncDirectory(path) {
     let handle;
     try {

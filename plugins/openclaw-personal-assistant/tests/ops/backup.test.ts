@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, unlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,6 +21,7 @@ import {
   parseWindowsReparseClassification,
   publicationUnknownTarget,
   restoreBackup,
+  syncFileDurably,
   validateWindowsBackupAcl,
   verifyBackup,
   WINDOWS_ACL_EVIDENCE_SCRIPT,
@@ -621,6 +622,15 @@ describe('encrypted verified backup', () => {
       { rules: valid.rules.map((rule, index) => index ? { ...rule, type: 'Deny' } : rule) },
       { protected: false }, { rules: valid.rules.map((rule, index) => index ? { ...rule, inherited: true } : rule) },
     ]) expect(() => validateWindowsBackupAcl(JSON.stringify({ ...valid, ...mutation }))).toThrowError(expect.objectContaining({ code: 'acl_unsafe' }));
+  });
+
+  (process.platform === 'win32' ? it.skip : it)('durably syncs a read-only restored Git object', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-readonly-sync-'));
+    roots.push(root);
+    const path = join(root, 'git-object');
+    await writeFile(path, 'immutable object');
+    await chmod(path, 0o444);
+    await expect(syncFileDurably(path)).resolves.toBeUndefined();
   });
 
   (process.platform === 'win32' ? it : it.skip)('collects Windows path evidence without PowerShell module autoload', async () => {
