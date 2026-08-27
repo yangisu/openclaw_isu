@@ -90,6 +90,29 @@ describe('Google OAuth', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it('accepts the canonical Google issuer parameter in an authorization callback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'google-oauth-issuer-'));
+    const fetch = vi.fn(async () => json({
+      access_token: 'access-token', refresh_token: 'refresh-token', token_type: 'Bearer',
+      expires_in: 3600, scope: GOOGLE_CALENDAR_SCOPE,
+    }));
+    const oauth = new GoogleOAuth({
+      clientId: 'client.apps.googleusercontent.com', clientSecret: 'secret',
+      expectedAccount: 'yangisu12@gmail.com', stateDbPath: join(root, 'state.sqlite3'),
+      tokenStore: new MemoryStore<GoogleTokenSet>(), fetch,
+      now: () => Date.parse('2026-08-27T00:00:00.000Z'),
+    });
+    const begin = oauth.begin('http://127.0.0.1:43125/google/callback');
+    const state = new URL(begin.authorizationUrl).searchParams.get('state');
+    const callback = `http://127.0.0.1:43125/google/callback?state=${state}`
+      + '&iss=https%3A%2F%2Faccounts.google.com&code=authorization-code';
+
+    await expect(oauth.handleCallback(callback)).resolves.toMatchObject({
+      accessToken: 'access-token', refreshToken: 'refresh-token',
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('refreshes inside the five-minute window and preserves the prior refresh token', async () => {
     const root = await mkdtemp(join(tmpdir(), 'google-oauth-refresh-'));
     const tokens = new MemoryStore<GoogleTokenSet>({

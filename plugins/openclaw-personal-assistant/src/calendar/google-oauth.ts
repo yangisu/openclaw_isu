@@ -155,8 +155,10 @@ export class GoogleOAuth {
     const keys = [...callback.searchParams.keys()].sort();
     const code = callback.searchParams.get('code');
     const oauthError = callback.searchParams.get('error');
-    const expectedKeys = oauthError ? ['error', 'state'] : ['code', 'state'];
-    if (keys.join('\0') !== expectedKeys.join('\0')) {
+    const issuer = callback.searchParams.get('iss');
+    const expectedKeys = oauthError ? ['error', 'state'] : issuer ? ['code', 'iss', 'state'] : ['code', 'state'];
+    if (keys.join('\0') !== expectedKeys.join('\0')
+      || (issuer !== null && issuer !== 'https://accounts.google.com')) {
       throw new GoogleOAuthError('google_oauth_callback_invalid', 'Google OAuth callback is invalid');
     }
     if (oauthError || !code || code.length > 8_192) {
