@@ -113,7 +113,8 @@ describe('Google OAuth', () => {
     const state = new URL(begin.authorizationUrl).searchParams.get('state');
     const callback = `http://127.0.0.1:43125/google/callback?state=${state}`
       + '&iss=https%3A%2F%2Faccounts.google.com&code=authorization-code'
-      + `&scope=${encodeURIComponent(`email ${GOOGLE_CALENDAR_SCOPE} openid`)}`;
+      + `&scope=${encodeURIComponent(`email https://www.googleapis.com/auth/userinfo.email openid ${GOOGLE_CALENDAR_SCOPE}`)}`
+      + '&authuser=0&prompt=consent';
 
     await expect(oauth.handleCallback(callback)).resolves.toMatchObject({
       accessToken: 'access-token', refreshToken: 'refresh-token',

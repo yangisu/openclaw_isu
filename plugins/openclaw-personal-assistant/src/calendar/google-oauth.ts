@@ -16,6 +16,7 @@ const TOKEN_SAFETY_WINDOW_MS = 5 * 60_000;
 const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
 const MAX_REVOKE_RESPONSE_BYTES = 16 * 1024;
 const MAX_TOKEN_LENGTH = 8_192;
+const GOOGLE_USERINFO_EMAIL_SCOPE = 'https://www.googleapis.com/auth/userinfo.email';
 
 export const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.app.created' as const;
 export const GOOGLE_OAUTH_SCOPE = `openid email ${GOOGLE_CALENDAR_SCOPE}` as const;
@@ -163,12 +164,17 @@ export class GoogleOAuth {
     const oauthError = callback.searchParams.get('error');
     const issuer = callback.searchParams.get('iss');
     const grantedScope = callback.searchParams.get('scope');
+    const authUser = callback.searchParams.get('authuser');
+    const prompt = callback.searchParams.get('prompt');
     const expectedKeys = oauthError ? ['error', 'state'] : [
       'code', ...(issuer === null ? [] : ['iss']), ...(grantedScope === null ? [] : ['scope']), 'state',
+      ...(authUser === null ? [] : ['authuser']), ...(prompt === null ? [] : ['prompt']),
     ].sort();
     if (keys.join('\0') !== expectedKeys.join('\0')
       || (issuer !== null && issuer !== 'https://accounts.google.com')
-      || (grantedScope !== null && !hasExactOAuthScopes(grantedScope))) {
+      || (grantedScope !== null && !hasExactOAuthScopes(grantedScope))
+      || (authUser !== null && !/^\d+$/.test(authUser))
+      || (prompt !== null && prompt !== 'consent')) {
       throw new GoogleOAuthError('google_oauth_callback_invalid', 'Google OAuth callback is invalid');
     }
     if (oauthError || !code || code.length > 8_192) {
@@ -431,8 +437,10 @@ function parseTokenResponse(
 function hasExactOAuthScopes(value: string | undefined): boolean {
   if (!value) return false;
   const actual = new Set(value.split(/\s+/).filter(Boolean));
-  return actual.size === 3
-    && actual.has('openid') && actual.has('email') && actual.has(GOOGLE_CALENDAR_SCOPE);
+  const allowed = new Set(['openid', 'email', GOOGLE_USERINFO_EMAIL_SCOPE, GOOGLE_CALENDAR_SCOPE]);
+  return actual.has('openid') && actual.has(GOOGLE_CALENDAR_SCOPE)
+    && (actual.has('email') || actual.has(GOOGLE_USERINFO_EMAIL_SCOPE))
+    && [...actual].every(scope => allowed.has(scope));
 }
 
 function validateRedirectUri(raw: string): string {
