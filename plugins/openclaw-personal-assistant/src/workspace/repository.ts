@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFile,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -29,6 +30,13 @@ import type {
   TaskRecord,
 } from '../domain.js';
 import { parseDocument, serializeDocument, validateRecord } from '../markdown/codec.js';
+import { decodeResourceFiles, encodeResourceFiles } from '../resources/codec.js';
+import {
+  canonicalizeResourceUrl,
+  type ResourceSaveInput,
+  type StoredResource,
+  validateResourceId,
+} from '../resources/types.js';
 import { OperationLedger, type LedgerOperation } from '../state/operations.js';
 import {
   WorkspaceLockCoordinator,
@@ -67,6 +75,14 @@ export interface MutationResult {
   gitCommit?: string;
 }
 
+export interface ResourceMutationResult {
+  operationId: string;
+  id: string;
+  replayed: boolean;
+  resource: StoredResource;
+  gitCommit?: string;
+}
+
 export interface RepositoryOptions {
   now?: () => Date;
   checkpoint?: (phase: RepositoryCheckpoint) => void | Promise<void>;
@@ -90,12 +106,23 @@ interface PreparedFile {
   contents: string;
 }
 
-interface PreparedMutation {
+interface PreparedMutationBase {
   version: 1;
-  action: 'add-task' | 'add-record' | 'update-record' | 'archive-record';
-  result: MutationResult;
   files: PreparedFile[];
 }
+
+interface PreparedRecordMutation extends PreparedMutationBase {
+  action: 'add-task' | 'add-record' | 'update-record' | 'archive-record';
+  result: MutationResult;
+}
+
+interface PreparedResourceMutation extends PreparedMutationBase {
+  action: 'save-resource';
+  result: ResourceMutationResult;
+}
+
+type PreparedMutation = PreparedRecordMutation | PreparedResourceMutation;
+type PreparedMutationResult = MutationResult | ResourceMutationResult;
 
 interface WorkspaceRecordLocation {
   kind: RecordKind;
@@ -673,6 +700,45 @@ export class WorkspaceRepository {
     );
   }
 
+  async saveResource(
+    operationId: string,
+    input: ResourceSaveInput,
+  ): Promise<ResourceMutationResult> {
+    validateOperationId(operationId);
+    if (input.operationId !== operationId) {
+      throw new WorkspaceRepositoryError(
+        'operation_id_mismatch',
+        'resource input operation ID must match the repository operation ID',
+      );
+    }
+    const safeInput: ResourceSaveInput = {
+      operationId,
+      url: input.url,
+      title: input.title,
+      summary: input.summary,
+      claims: [...input.claims],
+      tags: [...input.tags],
+      contentType: input.contentType,
+      extractedText: input.extractedText,
+      extractedAt: input.extractedAt,
+    };
+    return this.mutate(
+      operationId,
+      { action: 'save-resource', input: safeInput },
+      'save-resource',
+      async () => this.prepareSaveResource(operationId, safeInput),
+    );
+  }
+
+  async readResource(id: string): Promise<StoredResource> {
+    validateResourceId(id);
+    return this.withLock(async () => this.readResourceUnlocked(id));
+  }
+
+  async listResources(): Promise<StoredResource[]> {
+    return this.withLock(async () => this.listResourcesUnlocked());
+  }
+
   async query(criteria: QueryCriteria = {}): Promise<ParsedRecord[]> {
     return this.withLock(async () => {
       const index = await this.buildWorkspaceIdIndex();
@@ -701,9 +767,23 @@ export class WorkspaceRepository {
   private async mutate(
     operationId: string,
     payload: unknown,
+    action: PreparedRecordMutation['action'],
+    prepare: (index: WorkspaceIdIndex) => Promise<PreparedRecordMutation>,
+  ): Promise<MutationResult>;
+
+  private async mutate(
+    operationId: string,
+    payload: unknown,
+    action: PreparedResourceMutation['action'],
+    prepare: (index: WorkspaceIdIndex) => Promise<PreparedResourceMutation>,
+  ): Promise<ResourceMutationResult>;
+
+  private async mutate(
+    operationId: string,
+    payload: unknown,
     action: PreparedMutation['action'],
     prepare: (index: WorkspaceIdIndex) => Promise<PreparedMutation>,
-  ): Promise<MutationResult> {
+  ): Promise<PreparedMutationResult> {
     validateOperationId(operationId);
     return this.withLock(async () => {
       const index = await this.buildWorkspaceIdIndex();
@@ -765,7 +845,7 @@ export class WorkspaceRepository {
     prepared: PreparedMutation,
     replayed: boolean,
     recovering: boolean,
-  ): Promise<MutationResult> {
+  ): Promise<PreparedMutationResult> {
     let current = this.ledger.get<PreparedMutation>(operationId)!;
     if (current.phase === 'committed' || current.phase === 'replied') {
       return this.replayedResult(current);
@@ -815,15 +895,14 @@ export class WorkspaceRepository {
       gitCommit = this.commitPrepared(operationId, prepared);
       await this.options.checkpoint?.('afterGitCommit');
     }
-    const committed: PreparedMutation = {
-      ...prepared,
-      result: { ...prepared.result, gitCommit },
-    };
+    const committed: PreparedMutation = prepared.action === 'save-resource'
+      ? { ...prepared, result: { ...prepared.result, gitCommit } }
+      : { ...prepared, result: { ...prepared.result, gitCommit } };
     this.ledger.markCommitted(operationId, committed);
     return { ...committed.result, replayed };
   }
 
-  private replayedResult(operation: LedgerOperation<PreparedMutation>): MutationResult {
+  private replayedResult(operation: LedgerOperation<PreparedMutation>): PreparedMutationResult {
     if (!isPrepared(operation.result)) {
       throw new WorkspaceRepositoryError(
         'operation_reconcile_conflict',
@@ -838,7 +917,7 @@ export class WorkspaceRepository {
     input: AddRecordInput,
     index: WorkspaceIdIndex,
     action: 'add-task' | 'add-record',
-  ): Promise<PreparedMutation> {
+  ): Promise<PreparedRecordMutation> {
     const relativePath = managedFile(input.kind);
     this.assertGitPathClean(relativePath);
     const loaded = await this.readDocument(input.kind, relativePath);
@@ -878,7 +957,7 @@ export class WorkspaceRepository {
     targetId: string,
     patch: RecordPatch,
     index: WorkspaceIdIndex,
-  ): Promise<PreparedMutation> {
+  ): Promise<PreparedRecordMutation> {
     const kind = kindFromId(targetId);
     validateRecordPatch(kind, patch);
     const relativePath = this.activeRecordPath(index, kind, targetId);
@@ -933,7 +1012,7 @@ export class WorkspaceRepository {
     targetId: string,
     reason: string,
     index: WorkspaceIdIndex,
-  ): Promise<PreparedMutation> {
+  ): Promise<PreparedRecordMutation> {
     if (reason.length === 0) {
       throw new WorkspaceRepositoryError('invalid_archive_reason', 'archive reason cannot be empty');
     }
@@ -971,12 +1050,74 @@ export class WorkspaceRepository {
     ]);
   }
 
+  private async prepareSaveResource(
+    operationId: string,
+    input: ResourceSaveInput,
+  ): Promise<PreparedResourceMutation> {
+    const canonicalUrl = canonicalizeResourceUrl(input.url);
+    const resources = await this.listResourcesUnlocked();
+    const existing = resources.find(resource => resource.url === canonicalUrl);
+    let id: string;
+    if (existing) {
+      id = existing.id;
+    } else {
+      const date = dateInSeoul(this.now());
+      const used = new Set(resources.map(resource => resource.id));
+      let sequence = 1;
+      id = `R-${date}-${String(sequence).padStart(3, '0')}`;
+      while (used.has(id)) {
+        sequence += 1;
+        if (sequence > 999) {
+          throw new WorkspaceRepositoryError(
+            'resource_id_exhausted',
+            `resource IDs exhausted for ${date}`,
+          );
+        }
+        id = `R-${date}-${String(sequence).padStart(3, '0')}`;
+      }
+    }
+
+    const relativeRoot = `resources/${id}`;
+    this.assertGitPathClean(relativeRoot);
+    await this.assertResourceRootSafe();
+    await this.assertResourceDirectorySafe(id, true);
+    const metadataPath = `${relativeRoot}/resource.json`;
+    const contentPath = `${relativeRoot}/content.md`;
+    const oldMetadata = await this.readText(metadataPath);
+    const oldContent = await this.readText(contentPath);
+    if ((oldMetadata === null) !== (oldContent === null)) {
+      throw new WorkspaceRepositoryError(
+        'resource_incomplete',
+        `resource ${id} is missing one required file`,
+      );
+    }
+    const timestamp = timestampInSeoul(this.now());
+    const encoded = encodeResourceFiles(
+      { ...input, url: canonicalUrl },
+      {
+        id,
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      },
+    );
+    const resource = decodeResourceFiles(encoded.metadata, encoded.content);
+    return {
+      version: 1,
+      action: 'save-resource',
+      result: { operationId, id, replayed: false, resource },
+      files: [
+        this.preparedFile(metadataPath, oldMetadata, encoded.metadata),
+        this.preparedFile(contentPath, oldContent, encoded.content),
+      ],
+    };
+  }
+
   private preparedMutation(
     operationId: string,
-    action: PreparedMutation['action'],
+    action: PreparedRecordMutation['action'],
     record: ParsedRecord,
     files: PreparedFile[],
-  ): PreparedMutation {
+  ): PreparedRecordMutation {
     return {
       version: 1,
       action,
@@ -1166,6 +1307,106 @@ export class WorkspaceRepository {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;
     }
+  }
+
+  private async assertResourceRootSafe(): Promise<void> {
+    const root = join(this.config.workspaceDir, 'resources');
+    try {
+      const info = await lstat(root);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new WorkspaceRepositoryError(
+          'unsafe_resource_path',
+          'resource root must be a real directory',
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
+
+  private async assertResourceDirectorySafe(id: string, allowMissing: boolean): Promise<void> {
+    validateResourceId(id);
+    const directory = join(this.config.workspaceDir, 'resources', id);
+    try {
+      const info = await lstat(directory);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new WorkspaceRepositoryError(
+          'unsafe_resource_path',
+          `resource ${id} must be a real directory`,
+        );
+      }
+    } catch (error) {
+      if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new WorkspaceRepositoryError('resource_not_found', `resource ${id} was not found`);
+      }
+      throw error;
+    }
+  }
+
+  private async readResourceUnlocked(id: string): Promise<StoredResource> {
+    await this.assertResourceRootSafe();
+    await this.assertResourceDirectorySafe(id, false);
+    const directory = join(this.config.workspaceDir, 'resources', id);
+    const entries = await readdir(directory, { withFileTypes: true });
+    const names = entries.map(entry => entry.name).sort();
+    if (entries.some(entry => entry.isSymbolicLink() || !entry.isFile())
+      || names.length !== 2 || names[0] !== 'content.md' || names[1] !== 'resource.json') {
+      throw new WorkspaceRepositoryError(
+        'resource_incomplete',
+        `resource ${id} must contain only resource.json and content.md`,
+      );
+    }
+    const metadata = await readFile(join(directory, 'resource.json'), 'utf8');
+    const content = await readFile(join(directory, 'content.md'), 'utf8');
+    return decodeResourceFiles(metadata, content);
+  }
+
+  private async listResourcesUnlocked(): Promise<StoredResource[]> {
+    await this.assertResourceRootSafe();
+    const root = join(this.config.workspaceDir, 'resources');
+    let entries;
+    try {
+      entries = await readdir(root, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    const ids: string[] = [];
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new WorkspaceRepositoryError(
+          'unsafe_resource_path',
+          `resource root contains an unsafe entry: ${entry.name}`,
+        );
+      }
+      try {
+        validateResourceId(entry.name);
+      } catch (error) {
+        throw new WorkspaceRepositoryError(
+          'unsafe_resource_path',
+          `resource root contains an invalid directory: ${entry.name}`,
+          error,
+        );
+      }
+      ids.push(entry.name);
+    }
+    const resources: StoredResource[] = [];
+    const urls = new Map<string, string>();
+    for (const id of ids.sort()) {
+      const resource = await this.readResourceUnlocked(id);
+      const duplicate = urls.get(resource.url);
+      if (duplicate) {
+        throw new WorkspaceRepositoryError(
+          'resource_url_conflict',
+          `canonical URL occurs in both ${duplicate} and ${id}`,
+        );
+      }
+      urls.set(resource.url, id);
+      resources.push(resource);
+    }
+    return resources;
   }
 
   private async withLock<T>(work: () => Promise<T>, operationId?: string): Promise<T> {
@@ -1440,6 +1681,36 @@ export class WorkspaceRepository {
         target: /^\d{4}-\d{2}-\d{2}\.md$/,
       },
     ];
+    await this.assertResourceRootSafe();
+    try {
+      const resourceEntries = await readdir(
+        join(this.config.workspaceDir, 'resources'),
+        { withFileTypes: true },
+      );
+      for (const entry of resourceEntries) {
+        if (entry.isSymbolicLink() || !entry.isDirectory()) {
+          throw new WorkspaceRepositoryError(
+            'unsafe_resource_path',
+            `resource root contains an unsafe entry: ${entry.name}`,
+          );
+        }
+        try {
+          validateResourceId(entry.name);
+        } catch (error) {
+          throw new WorkspaceRepositoryError(
+            'unsafe_resource_path',
+            `resource root contains an invalid directory: ${entry.name}`,
+            error,
+          );
+        }
+        directories.push({
+          path: join(this.config.workspaceDir, 'resources', entry.name),
+          target: /^(?:resource\.json|content\.md)$/,
+        });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     for (const directory of directories) {
       let names: string[];
       try {
