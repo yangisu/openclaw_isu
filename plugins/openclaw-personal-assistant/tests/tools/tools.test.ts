@@ -52,7 +52,7 @@ afterEach(async () => {
 });
 
 describe('OpenClaw personal-assistant tool boundary', () => {
-  it('registers exactly five statically owned optional tools', () => {
+  it('registers exactly four statically owned optional tools', () => {
     const registrations: Array<{ name?: string; optional?: boolean }> = [];
     plugin.register({
       config: {}, pluginConfig: config, registrationMode: 'tool-discovery',
@@ -63,13 +63,12 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     expect(registrations).toEqual([
       { name: 'assistant_query', optional: true },
       { name: 'assistant_mutate', optional: true },
-      { name: 'assistant_calendar_prepare', optional: true },
-      { name: 'assistant_calendar_confirm', optional: true },
+      { name: 'assistant_calendar_manage', optional: true },
       { name: 'assistant_briefing', optional: true },
     ]);
   });
 
-  it('registers five tools plus a full-mode service and owner command without model correlation hooks', () => {
+  it('registers only the four Google-era tools in full mode', () => {
     const registerTool = vi.fn();
     const registerService = vi.fn();
     const registerCommand = vi.fn();
@@ -79,41 +78,10 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       registerTool, registerService, registerCommand, on,
     } as never);
 
-    expect(registerTool).toHaveBeenCalledTimes(5);
-    expect(registerService).toHaveBeenCalledTimes(1);
-    expect(registerCommand).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'assistant-confirm', acceptsArgs: true, requireAuth: true, exposeSenderIsOwner: true,
-    }));
+    expect(registerTool).toHaveBeenCalledTimes(4);
+    expect(registerService).not.toHaveBeenCalled();
+    expect(registerCommand).not.toHaveBeenCalled();
     expect(on).not.toHaveBeenCalled();
-  });
-
-  it('keeps the owner command fail-closed for incomplete, non-owner, and forwarded-unverifiable contexts', async () => {
-    const commands: Array<{ handler(context: Record<string, unknown>): Promise<{ text?: string }> | { text?: string } }> = [];
-    plugin.register({
-      config: {}, pluginConfig: config, registrationMode: 'full',
-      registerTool() {}, registerService() {}, registerCommand(command: unknown) { commands.push(command as never); },
-    } as never);
-    const command = commands[0]!;
-    const base = {
-      channel: 'telegram', channelId: 'telegram', isAuthorizedSender: true, senderIsOwner: true,
-      senderId: config.telegramUserId, from: `telegram:${config.telegramUserId}`,
-      to: `telegram:${config.telegramUserId}`, args: '11111111-1111-4111-8111-111111111111',
-      commandBody: '/assistant-confirm 11111111-1111-4111-8111-111111111111', config: {},
-      requestConversationBinding: async () => ({ status: 'error' }),
-      detachConversationBinding: async () => ({ removed: false }),
-      getCurrentConversationBinding: async () => null,
-    };
-
-    for (const context of [
-      base,
-      { ...base, senderIsOwner: false },
-      { ...base, senderId: '999', from: 'telegram:999' },
-      { ...base, args: 'not-a-request-id' },
-    ]) {
-      const result = await command.handler(context);
-      expect(result.text).toMatch(/unavailable/i);
-      expect(result.text).not.toMatch(/11111111|123456789|not-a-request-id/);
-    }
   });
 
   it.each([

@@ -3,10 +3,7 @@ import { Type } from 'typebox';
 
 import { TELEGRAM_USER_ID_PATTERN } from '../telegram-user-id.js';
 import {
-  calendarConfirmParameters,
-  calendarPrepareParameters,
-  createCalendarConfirmTool,
-  createCalendarPrepareTool,
+  createCalendarManageTool,
 } from './calendar.js';
 import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
@@ -36,11 +33,8 @@ export const configSchema = Type.Object({
 export function registerAssistantTools(api: OpenClawPluginApi): void {
   api.registerTool(context => createQueryTool(api, context), { name: 'assistant_query', optional: true });
   api.registerTool(context => createMutationTool(api, context), { name: 'assistant_mutate', optional: true });
-  api.registerTool(context => createCalendarPrepareTool(api, context), {
-    name: 'assistant_calendar_prepare', optional: true,
-  });
-  api.registerTool(context => createCalendarConfirmTool(api, context), {
-    name: 'assistant_calendar_confirm', optional: true,
+  api.registerTool(context => createCalendarManageTool(api, context), {
+    name: 'assistant_calendar_manage', optional: true,
   });
   api.registerTool(context => createBriefingTool(api, context), { name: 'assistant_briefing', optional: true });
 }
