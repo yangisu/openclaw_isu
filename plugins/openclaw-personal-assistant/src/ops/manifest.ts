@@ -70,7 +70,7 @@ export function parseManifest(source: string): BackupManifest {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw manifestError();
     const entry = item as Record<string, unknown>;
     if (!exactKeys(entry, ['path', 'userVersion', 'schemaFingerprint'])
-      || !/^state\/(?:operations|calendar-outbox|alerts|subsystem-health)\.sqlite3$/.test(String(entry.path))
+      || !/^state\/(?:operations|calendar-outbox|alerts|subsystem-health|resource-catalog|study)\.sqlite3$/.test(String(entry.path))
       || !Number.isSafeInteger(entry.userVersion)
       || Number(entry.userVersion) < 0 || !/^[0-9a-f]{64}$/.test(String(entry.schemaFingerprint))) throw manifestError();
     return { path: String(entry.path), userVersion: Number(entry.userVersion), schemaFingerprint: String(entry.schemaFingerprint) };
@@ -81,8 +81,9 @@ export function parseManifest(source: string): BackupManifest {
     || sqlite.some(entry => !files.some(file => file.path === entry.path))
     || REQUIRED_FILES.some(path => !files.some(file => file.path === path))
     || REQUIRED_DATABASES.some(path => !sqlite.some(entry => entry.path === path))
-    || (files.some(file => file.path === 'state/subsystem-health.sqlite3')
-      !== sqlite.some(entry => entry.path === 'state/subsystem-health.sqlite3'))) throw manifestError();
+    || ['subsystem-health', 'resource-catalog', 'study'].some(name =>
+      files.some(file => file.path === `state/${name}.sqlite3`)
+        !== sqlite.some(entry => entry.path === `state/${name}.sqlite3`))) throw manifestError();
   return {
     version: 1, createdAt: input.createdAt, gitHead: String(input.gitHead),
     schemaVersion: input.schemaVersion, exclusionsVersion: input.exclusionsVersion,
@@ -104,7 +105,9 @@ function isSorted(paths: readonly string[]): boolean {
 
 function isAllowedBackupPath(path: string): boolean {
   if (!isSafeRelativePath(path)) return false;
-  if (REQUIRED_FILES.includes(path as never) || path === 'state/subsystem-health.sqlite3') return true;
+  if (REQUIRED_FILES.includes(path as never)
+    || /^state\/(?:subsystem-health|resource-catalog|study)\.sqlite3$/.test(path)) return true;
+  if (/^workspace\/resources\/R-\d{8}-\d{3}\/(?:resource\.json|content\.md)$/.test(path)) return true;
   if (/^workspace\/(?:memory|archive)\/(?:[^/]+\/)*[^/]+\.md$/.test(path)) return true;
   if (path === 'git/repository.bundle') return true;
   return false;

@@ -265,15 +265,17 @@ describe('deployment scripts', () => {
     expect(result.stdout).toContain('DRY_RUN');
     expect(result.stdout).toContain('OpenClaw 2026.7.1');
     expect(result.stdout).toContain('Node >=24.15.0 <25.0.0');
-    expect(result.stdout).toContain('assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query');
+    expect(result.stdout).toContain('assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query,assistant_resource_store,assistant_study_manage');
     expect(result.stdout).toContain('0 8-22 * * *');
   });
 
-  it('validates the actual OpenClaw runtime inspect names-array shape as exactly four optional tools', () => {
+  it('validates the actual OpenClaw runtime inspect names-array shape as exactly six optional tools', () => {
     const valid = { tools: [
       { names: ['assistant_query'], optional: true }, { names: ['assistant_mutate'], optional: true },
       { names: ['assistant_calendar_manage'], optional: true },
       { names: ['assistant_briefing'], optional: true },
+      { names: ['assistant_resource_store'], optional: true },
+      { names: ['assistant_study_manage'], optional: true },
     ] };
     expect(spawnSync(process.execPath, [runtimeToolsValidator], { input: JSON.stringify(valid), encoding: 'utf8' }).status).toBe(0);
     valid.tools[0]!.optional = false;
@@ -534,6 +536,12 @@ describe('deployment scripts', () => {
     ['wrong Google binding path', (text: string) => text.replace('/google-calendar-binding', '/wrong-binding')],
     ['wrong Google account', (text: string) => text.replace('yangisu12@gmail.com', 'other@gmail.com')],
     ['duplicate secret path', (text: string) => text.replace('/google-oauth-token', '/google-oauth-client')],
+    ['broader inline buttons', (text: string) => text.replace("inlineButtons: 'dm'", "inlineButtons: 'all'")],
+    ['larger web character cap', (text: string) => text.replace('maxCharsCap: 100000', 'maxCharsCap: 200000')],
+    ['trusted proxy', (text: string) => text.replace('useTrustedEnvProxy: false', 'useTrustedEnvProxy: true')],
+    ['web search provider', (text: string) => text.replace('web: { fetch:', 'web: { search: { enabled: true }, fetch:')],
+    ['browser tool', (text: string) => text.replace("'web_fetch',", "'web_fetch',\n      'browser',")],
+    ['larger PDF limit', (text: string) => text.replace('pdfMaxBytesMb: 10', 'pdfMaxBytesMb: 20')],
     ['placeholder', (text: string) => text.replace("timezone: 'Asia/Seoul'", "timezone: '<replace-timezone>'")],
   ])('rejects %s through the full hardened config contract used by --check', (_label, mutate) => {
     const root = mkdtempSync(resolve(tmpdir(), 'ocpa-check-config-'));

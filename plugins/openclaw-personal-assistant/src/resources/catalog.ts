@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -35,6 +36,12 @@ CREATE TABLE resources (
 ) STRICT;
 PRAGMA user_version = 1;
 `;
+
+export const RESOURCE_CATALOG_BACKUP_SCHEMA_FINGERPRINT = (() => {
+  const database = new DatabaseSync(':memory:');
+  try { database.exec(SCHEMA); return databaseSchemaFingerprint(database); }
+  finally { database.close(); }
+})();
 
 interface CatalogRow {
   id: string;
@@ -128,8 +135,40 @@ function assertCompatible(database: DatabaseSync): void {
   if (integrity.integrity_check !== 'ok'
     || userVersion !== SCHEMA_VERSION
     || tables.map(row => row.name).join(',') !== 'resources,schema_meta'
-    || meta?.version !== SCHEMA_VERSION) {
+    || meta?.version !== SCHEMA_VERSION
+    || databaseSchemaFingerprint(database) !== RESOURCE_CATALOG_BACKUP_SCHEMA_FINGERPRINT) {
     throw new ResourceArchiveError('resource_catalog_schema_mismatch', 'resource catalog schema is incompatible');
+  }
+}
+
+function databaseSchemaFingerprint(database: DatabaseSync): string {
+  const rows = database.prepare(`
+    SELECT type, name, sql FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+    ORDER BY type, name
+  `).all() as unknown as Array<{ type: string; name: string; sql: string }>;
+  return createHash('sha256').update(rows.map(row =>
+    `${row.type}:${row.name}:${row.sql.replace(/\s+/gu, ' ').trim().toLowerCase()}`
+  ).join('\n')).digest('hex');
+}
+
+export function validateResourceCatalogBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    assertCompatible(database);
+    const rows = database.prepare(`
+      SELECT claims_json, tags_json FROM resources ORDER BY id
+    `).all() as unknown as Array<{ claims_json: string; tags_json: string }>;
+    for (const row of rows) {
+      parsedStringArray(row.claims_json, 'claims');
+      parsedStringArray(row.tags_json, 'tags');
+    }
+    return { userVersion: SCHEMA_VERSION, schemaFingerprint: RESOURCE_CATALOG_BACKUP_SCHEMA_FINGERPRINT };
+  } finally {
+    database.close();
   }
 }
 

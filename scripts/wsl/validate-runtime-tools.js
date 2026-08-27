@@ -9,7 +9,10 @@ try {
       || typeof tool.names[0] !== 'string') throw new Error('shape');
     return [{ name: tool.names[0], optional: tool.optional }];
   }).sort((left, right) => left.name.localeCompare(right.name));
-  const expected = ['assistant_briefing', 'assistant_calendar_manage', 'assistant_mutate', 'assistant_query']
+  const expected = [
+    'assistant_briefing', 'assistant_calendar_manage', 'assistant_mutate',
+    'assistant_query', 'assistant_resource_store', 'assistant_study_manage',
+  ]
     .map(name => ({ name, optional: true }));
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('contract');
   process.stdout.write(`${JSON.stringify({ status: 'PASS', count: actual.length, tools: actual })}\n`);

@@ -81,6 +81,12 @@ INSERT INTO study_settings VALUES (1, 'Asia/Seoul', 8, 2, 50, 10, 15, 2, 22);
 PRAGMA user_version = 1;
 `;
 
+export const STUDY_BACKUP_SCHEMA_FINGERPRINT = (() => {
+  const database = new DatabaseSync(':memory:');
+  try { database.exec(SCHEMA); return studySchemaFingerprint(database); }
+  finally { database.close(); }
+})();
+
 interface BlockRow {
   id: string;
   study_id: string;
@@ -456,19 +462,7 @@ export class StudyStore {
   }
 
   private assertSchema(): void {
-    const version = Number(
-      (this.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
-    );
-    const integrity = this.database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
-    const names = (this.database.prepare(`
-      SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-      ORDER BY name
-    `).all() as unknown as Array<{ name: string }>).map(row => row.name).join(',');
-    if (version !== SCHEMA_VERSION || integrity.integrity_check !== 'ok'
-      || names !== 'study_audit,study_blocks,study_operations,study_reports,study_settings') {
-      fail('study_schema_mismatch', 'study database schema is incompatible');
-    }
+    assertStudyDatabase(this.database);
   }
 
   private assertOpen(): void {
@@ -609,6 +603,47 @@ export class StudyStore {
       ) VALUES (?, ?, ?, ?, ?, ?)
     `).run(operationId, blockId, action, from, to, occurredAt);
   }
+}
+
+export function validateStudyBackupDatabase(path: string): {
+  userVersion: number;
+  schemaFingerprint: string;
+} {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    assertStudyDatabase(database);
+    return { userVersion: SCHEMA_VERSION, schemaFingerprint: STUDY_BACKUP_SCHEMA_FINGERPRINT };
+  } finally {
+    database.close();
+  }
+}
+
+function assertStudyDatabase(database: DatabaseSync): void {
+  const version = Number(
+    (database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+  );
+  const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown };
+  const names = (database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all() as unknown as Array<{ name: string }>).map(row => row.name).join(',');
+  if (version !== SCHEMA_VERSION || integrity.integrity_check !== 'ok'
+    || names !== 'study_audit,study_blocks,study_operations,study_reports,study_settings'
+    || studySchemaFingerprint(database) !== STUDY_BACKUP_SCHEMA_FINGERPRINT) {
+    fail('study_schema_mismatch', 'study database schema is incompatible');
+  }
+}
+
+function studySchemaFingerprint(database: DatabaseSync): string {
+  const rows = database.prepare(`
+    SELECT type, name, sql FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
+    ORDER BY type, name
+  `).all() as unknown as Array<{ type: string; name: string; sql: string }>;
+  return createHash('sha256').update(rows.map(row =>
+    `${row.type}:${row.name}:${row.sql.replace(/\s+/gu, ' ').trim().toLowerCase()}`
+  ).join('\n')).digest('hex');
 }
 
 export { DEFAULT_STUDY_SETTINGS };

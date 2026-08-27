@@ -122,7 +122,7 @@ validate_active_config() {
     || { say 'active_config_not_hardened'; return 1; }
   local configured_tools owner_id allow_from
   configured_tools="$($OPENCLAW config get tools.allow --json)"
-  node -e 'const x=JSON.parse(process.argv[1]);const e=["assistant_briefing","assistant_calendar_manage","assistant_mutate","assistant_query"];if(!Array.isArray(x)||JSON.stringify([...x].sort())!==JSON.stringify(e))process.exit(1)' "$configured_tools" \
+  node -e 'const x=JSON.parse(process.argv[1]);const e=["assistant_briefing","assistant_calendar_manage","assistant_mutate","assistant_query","assistant_resource_store","assistant_study_manage","pdf","web_fetch"];if(!Array.isArray(x)||JSON.stringify([...x].sort())!==JSON.stringify(e))process.exit(1)' "$configured_tools" \
     || { say 'configured_tool_contract_invalid'; return 1; }
   owner_id="$(config_scalar plugins.entries.openclaw-personal-assistant.config.telegramUserId)"
   [[ "$owner_id" =~ ^[1-9][0-9]{0,18}$ ]] || { say 'telegram_owner_id_invalid'; return 1; }
@@ -152,7 +152,7 @@ validate_maintenance_cron_contract() {
 if [[ "$MODE" == "dry-run" ]]; then
   say "DRY_RUN verify Ubuntu $EXPECTED_UBUNTU, Node >=$MIN_NODE <$MAX_NODE, systemd, lingering"
   say "DRY_RUN verify package-local OpenClaw $EXPECTED_OPENCLAW"
-  say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query"
+  say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query,assistant_resource_store,assistant_study_manage"
   say "DRY_RUN install owner-private token/config files and user systemd service"
   say "DRY_RUN declare briefing Cron row: $CRON_EXPR $CRON_TZ staggerMs=0 isolated announce telegram owner"
   say 'DRY_RUN declare command Cron rows: daily 0 3 * * * and monthly 0 4 1 * * Asia/Seoul, exact, no delivery/catch-up'

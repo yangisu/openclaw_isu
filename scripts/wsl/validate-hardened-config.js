@@ -17,7 +17,10 @@ try {
   const safeConfig = structuredClone(config);
   removeOwnerPrivateGatewayAuth(safeConfig);
   validateSafeValue(safeConfig);
-  const expectedTools = ['assistant_briefing', 'assistant_calendar_manage', 'assistant_mutate', 'assistant_query'];
+  const expectedTools = [
+    'assistant_briefing', 'assistant_calendar_manage', 'assistant_mutate',
+    'assistant_query', 'assistant_resource_store', 'assistant_study_manage', 'pdf', 'web_fetch',
+  ];
   const plugin = config.plugins?.entries?.['openclaw-personal-assistant'];
   const owner = plugin?.config?.telegramUserId;
   const calendar = plugin?.config?.calendar;
@@ -25,9 +28,20 @@ try {
     || config.channels?.telegram?.enabled !== true || config.channels?.telegram?.tokenFile !== join(secretDir, 'telegram-token').replaceAll('\\', '/')
     || config.channels?.telegram?.dmPolicy !== 'allowlist' || config.channels?.telegram?.groupPolicy !== 'disabled'
     || config.channels?.telegram?.configWrites !== false || !/^[1-9][0-9]{0,18}$/.test(String(owner))
+    || JSON.stringify(config.channels?.telegram?.capabilities) !== JSON.stringify({ inlineButtons: 'dm' })
     || JSON.stringify(config.channels?.telegram?.allowFrom) !== JSON.stringify([`tg:${owner}`])
     || config.commands?.bash !== false || config.commands?.config !== false || config.commands?.mcp !== false || config.commands?.plugins !== false
     || config.tools?.elevated?.enabled !== false || JSON.stringify([...(config.tools?.allow ?? [])].sort()) !== JSON.stringify(expectedTools)
+    || Object.keys(config.tools ?? {}).sort().join(',') !== 'allow,elevated,web'
+    || Object.keys(config.tools?.web ?? {}).sort().join(',') !== 'fetch'
+    || Object.keys(config.tools?.web?.fetch ?? {}).sort().join(',') !== 'enabled,maxChars,maxCharsCap,maxRedirects,maxResponseBytes,timeoutSeconds,useTrustedEnvProxy'
+    || config.tools?.web?.fetch?.enabled !== true || config.tools?.web?.fetch?.maxChars !== 100000
+    || config.tools?.web?.fetch?.maxCharsCap !== 100000 || config.tools?.web?.fetch?.maxResponseBytes !== 1000000
+    || config.tools?.web?.fetch?.timeoutSeconds !== 30 || config.tools?.web?.fetch?.maxRedirects !== 3
+    || config.tools?.web?.fetch?.useTrustedEnvProxy !== false
+    || Object.keys(config.agents ?? {}).sort().join(',') !== 'defaults'
+    || Object.keys(config.agents?.defaults ?? {}).sort().join(',') !== 'pdfMaxBytesMb,pdfMaxPages'
+    || config.agents?.defaults?.pdfMaxBytesMb !== 10 || config.agents?.defaults?.pdfMaxPages !== 20
     || plugin?.enabled !== true || plugin?.config?.timezone !== 'Asia/Seoul'
     || calendar?.provider !== 'google'
     || calendar?.googleOAuthClientFile !== join(secretDir, 'google-oauth-client').replaceAll('\\', '/')

@@ -13,6 +13,7 @@
       allowFrom: ['tg:6520016662'],
       groupPolicy: 'disabled',
       configWrites: false,
+      capabilities: { inlineButtons: 'dm' },
     },
   },
   commands: {
@@ -27,9 +28,23 @@
       'assistant_mutate',
       'assistant_calendar_manage',
       'assistant_briefing',
+      'assistant_resource_store',
+      'assistant_study_manage',
+      'web_fetch',
+      'pdf',
     ],
+    web: { fetch: {
+      enabled: true,
+      maxChars: 100000,
+      maxCharsCap: 100000,
+      maxResponseBytes: 1000000,
+      timeoutSeconds: 30,
+      maxRedirects: 3,
+      useTrustedEnvProxy: false,
+    } },
     elevated: { enabled: false },
   },
+  agents: { defaults: { pdfMaxBytesMb: 10, pdfMaxPages: 20 } },
   plugins: {
     entries: {
       'openclaw-personal-assistant': {

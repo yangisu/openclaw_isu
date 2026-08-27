@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { chmod, copyFile, readFile, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, truncate, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -33,6 +34,8 @@ import {
   type IdentityBoundDeleter,
 } from '../../src/ops/backup.js';
 import { openRepository, type WorkspaceRepository } from '../../src/workspace/repository.js';
+import { ResourceCatalog } from '../../src/resources/catalog.js';
+import { StudyStore, validateStudyBackupDatabase } from '../../src/study/store.js';
 
 const roots: string[] = [];
 const repositories: WorkspaceRepository[] = [];
@@ -186,6 +189,88 @@ afterEach(async () => {
 });
 
 describe('encrypted verified backup', () => {
+  it('backs up strict resources and study state, then rebuilds a missing catalog only in the isolated restore', async () => {
+    const f = await fixture();
+    const saved = await f.repository.saveResource('backup-resource-1', {
+      operationId: 'backup-resource-1', url: 'https://example.test/backup', title: '백업 자료',
+      summary: '격리 복원 검색 검증', claims: ['로컬 원문을 보관한다.'], tags: ['backupprobe'],
+      contentType: 'web', extractedText: '복원 뒤 다시 검색할 본문',
+      extractedAt: '2026-08-27T09:00:00+09:00',
+    });
+    const study = new StudyStore(f.stateDir);
+    closeables.push(study);
+    study.plan('backup-study-1', 'S-20260827-001', [{
+      title: '백업 공부', startAt: '2026-08-27T10:00:00+09:00', durationMinutes: 50,
+    }]);
+    const backup = await createBackup({
+      ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-27T00:00:00.000Z'),
+    });
+    expect(backup.manifest.files.map(entry => entry.path)).toEqual(expect.arrayContaining([
+      `workspace/resources/${saved.id}/resource.json`,
+      `workspace/resources/${saved.id}/content.md`,
+      'state/study.sqlite3',
+    ]));
+    expect(backup.manifest.files).not.toContainEqual(expect.objectContaining({
+      path: 'state/resource-catalog.sqlite3',
+    }));
+
+    const restoreRoot = join(f.root, 'resource-restore');
+    await mkdir(restoreRoot, { mode: 0o700 });
+    const restored = await restoreBackup({
+      archivePath: backup.archivePath, restoreRoot, identityFile: 'test-key', ageRunner: f.age,
+    });
+    validateStudyBackupDatabase(join(restored.restorePath, 'state', 'study.sqlite3'));
+    const catalog = new ResourceCatalog(join(restored.restorePath, 'state'));
+    try {
+      expect(catalog.search('backupprobe', 5)).toMatchObject([{ id: saved.id }]);
+    } finally { catalog.close(); }
+    await expect(stat(join(f.stateDir, 'resource-catalog.sqlite3'))).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 30_000);
+
+  it('rejects resource content tampering even when archive and manifest hashes are rewritten', async () => {
+    const f = await fixture();
+    const saved = await f.repository.saveResource('tampered-resource-1', {
+      operationId: 'tampered-resource-1', url: 'https://example.test/tampered', title: '변조 자료',
+      summary: '변조 검증', claims: [], tags: ['tamper'], contentType: 'web',
+      extractedText: '원래 본문', extractedAt: '2026-08-27T09:00:00+09:00',
+    });
+    const backup = await createBackup({
+      ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-27T00:00:00.000Z'),
+    });
+    const path = `workspace/resources/${saved.id}/content.md`;
+    const tamperingAge = new FakeAge('test-key', bundle => {
+      const content = bundle.files.find(entry => entry.path === path)!;
+      content.data = Buffer.from('바뀐 본문\n');
+      content.size = content.data.byteLength;
+      content.sha256 = createHash('sha256').update(content.data).digest('hex');
+      mutateManifest(bundle, manifest => {
+        const file = (manifest.files as Array<Record<string, unknown>>).find(entry => entry.path === path)!;
+        file.size = content.size;
+        file.sha256 = content.sha256;
+      });
+    });
+
+    await expect(verifyBackup({
+      archivePath: backup.archivePath, identityFile: 'test-key', ageRunner: tamperingAge,
+    })).rejects.toMatchObject({ code: 'resource_archive_invalid' });
+  }, 30_000);
+
+  it('rejects a corrupt study schema before publishing a backup', async () => {
+    const f = await fixture();
+    const study = new StudyStore(f.stateDir);
+    study.close();
+    const database = new DatabaseSync(join(f.stateDir, 'study.sqlite3'));
+    database.exec('DROP TABLE study_reports;');
+    database.close();
+
+    await expect(createBackup({
+      ...f, recipient: 'age1test', identityFile: 'test-key', ageRunner: f.age,
+      now: () => new Date('2026-08-27T00:00:00.000Z'),
+    })).rejects.toMatchObject({ code: 'sqlite_schema_mismatch' });
+  }, 30_000);
+
   it('completes short writes and rejects a zero-progress writer', async () => {
     const written: number[] = [];
     const handle = { async write(_bytes: Uint8Array, offset: number, length: number) {

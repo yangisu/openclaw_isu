@@ -78,7 +78,9 @@
       "assistant_query",
       "assistant_mutate",
       "assistant_calendar_manage",
-      "assistant_briefing"
+      "assistant_briefing",
+      "assistant_resource_store",
+      "assistant_study_manage"
     ]
   },
   "toolMetadata": {
@@ -92,6 +94,12 @@
       "optional": true
     },
     "assistant_briefing": {
+      "optional": true
+    },
+    "assistant_resource_store": {
+      "optional": true
+    },
+    "assistant_study_manage": {
       "optional": true
     }
   }

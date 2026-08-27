@@ -28,12 +28,13 @@ describe('hardened OpenClaw example config', () => {
       allowFrom: ['tg:6520016662'],
       groupPolicy: 'disabled',
       configWrites: false,
+      capabilities: { inlineButtons: 'dm' },
     });
     expect(config.channels.telegram.allowFrom[0]).toMatch(/^tg:[1-9][0-9]*$/);
     expect(JSON.stringify(config.channels.telegram)).not.toContain('*');
   });
 
-  it('exposes exactly four assistant tools and no dangerous command or elevation surface', async () => {
+  it('exposes exactly six assistant tools plus bounded fetch/PDF and no dangerous surface', async () => {
     const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
     expect(config.commands).toEqual({ bash: false, config: false, mcp: false, plugins: false });
     expect(config.tools).toEqual({
@@ -42,9 +43,19 @@ describe('hardened OpenClaw example config', () => {
         'assistant_mutate',
         'assistant_calendar_manage',
         'assistant_briefing',
+        'assistant_resource_store',
+        'assistant_study_manage',
+        'web_fetch',
+        'pdf',
       ],
+      web: { fetch: {
+        enabled: true, maxChars: 100000, maxCharsCap: 100000,
+        maxResponseBytes: 1000000, timeoutSeconds: 30, maxRedirects: 3,
+        useTrustedEnvProxy: false,
+      } },
       elevated: { enabled: false },
     });
+    expect(config.agents).toEqual({ defaults: { pdfMaxBytesMb: 10, pdfMaxPages: 20 } });
     expect(config.tools.allow).not.toContain('*');
   });
 

@@ -16,6 +16,10 @@ import { parseDocument, type RecordKind } from '../markdown/codec.js';
 import { validateAlertBackupDatabase } from '../state/alerts.js';
 import { validateHealthBackupDatabase, type SubsystemHealthJournal } from '../state/health.js';
 import { validateOperationBackupDatabase } from '../state/operations.js';
+import { ResourceCatalog, validateResourceCatalogBackupDatabase } from '../resources/catalog.js';
+import { decodeResourceFiles } from '../resources/codec.js';
+import type { StoredResource } from '../resources/types.js';
+import { validateStudyBackupDatabase } from '../study/store.js';
 import type { WorkspaceRepository } from '../workspace/repository.js';
 import {
   BACKUP_EXCLUSIONS_VERSION, BACKUP_SCHEMA_VERSION, isSafeRelativePath, parseManifest, sha256,
@@ -28,7 +32,9 @@ const ROOT_MARKDOWN = new Map<string, RecordKind>([
   ['USER.md', 'preference'], ['MEMORY.md', 'memory'], ['INBOX.md', 'inbox'],
 ]);
 const REQUIRED_DATABASES = ['operations.sqlite3', 'calendar-outbox.sqlite3', 'alerts.sqlite3'] as const;
-const OPTIONAL_DATABASES = ['subsystem-health.sqlite3'] as const;
+const OPTIONAL_DATABASES = [
+  'subsystem-health.sqlite3', 'resource-catalog.sqlite3', 'study.sqlite3',
+] as const;
 const ARCHIVE_NAME = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\.age$/;
 const TEMP_PREFIX = 'openclaw-backup-';
 const MARKDOWN_MAX_BYTES = 8 * 1024 * 1024;
@@ -392,6 +398,7 @@ export async function restoreBackup(input: RestoreBackupInput): Promise<{ restor
     restoreStaging = join(root, `.restore-${restoreId}.tmp`);
     await mkdir(restoreStaging, { mode: 0o700 });
     await copyTreeVerified(verified.snapshotRoot, restoreStaging);
+    await ensureRestoredResourceCatalog(restoreStaging);
     await materializeGitBundle(restoreStaging, verified.manifest.gitHead);
     await syncTree(restoreStaging, input.durability ?? defaultDurability);
     await rename(restoreStaging, restorePath);
@@ -766,6 +773,12 @@ async function stageSnapshot(input: CreateBackupInput, snapshotRoot: string): Pr
       input.destinationWriteCheckpoint,
     );
   }
+  const resources = join(workspaceRoot, 'resources');
+  if (await exists(resources)) await copyResourceTree(
+    resources, join(snapshotRoot, 'workspace', 'resources'),
+    input.secretCanaries ?? [], pathSafety, input.sourceReadCheckpoint,
+    input.destinationWriteCheckpoint,
+  );
   const gitDirectory = join(workspaceRoot, '.git');
   const gitInfo = await lstat(gitDirectory, { bigint: true });
   if (!gitInfo.isDirectory() || gitInfo.isSymbolicLink()
@@ -904,6 +917,7 @@ async function verifySnapshotLayout(snapshotRoot: string, canaries: readonly str
     }
   }
   await validateMarkdown(snapshotRoot);
+  await validateResourceArchive(snapshotRoot);
   await verifyGitBundle(
     join(snapshotRoot, 'git', 'repository.bundle'), manifest.gitHead, canaries,
   );
@@ -917,6 +931,7 @@ async function validateMarkdown(snapshotRoot: string): Promise<void> {
   const seen = new Map<RecordKind, Set<string>>();
   for (const path of await listFiles(workspace)) {
     if (!path.endsWith('.md')) continue;
+    if (path.startsWith('resources/')) continue;
     const name = basename(path);
     const kind = path.startsWith('memory/')
       ? 'daily'
@@ -933,6 +948,49 @@ async function validateMarkdown(snapshotRoot: string): Promise<void> {
   }
 }
 
+async function validateResourceArchive(snapshotRoot: string): Promise<StoredResource[]> {
+  const root = join(snapshotRoot, 'workspace', 'resources');
+  if (!(await exists(root))) return [];
+  const paths = await listFiles(root);
+  const ids = [...new Set(paths.map(path => path.split('/')[0]!))].sort();
+  if (paths.length !== ids.length * 2 || paths.some(path =>
+    !/^R-\d{8}-\d{3}\/(?:resource\.json|content\.md)$/u.test(path))) {
+    throw new BackupError('resource_archive_invalid', 'Resource snapshot layout is invalid');
+  }
+  const resources: StoredResource[] = [];
+  for (const id of ids) {
+    const expected = [`${id}/content.md`, `${id}/resource.json`];
+    if (JSON.stringify(paths.filter(path => path.startsWith(`${id}/`)).sort()) !== JSON.stringify(expected)) {
+      throw new BackupError('resource_archive_invalid', `Resource ${id} does not contain an exact file pair`);
+    }
+    try {
+      const resource = decodeResourceFiles(
+        await readTextBounded(join(root, id, 'resource.json'), 64 * 1024),
+        await readTextBounded(join(root, id, 'content.md'), 1024 * 1024),
+      );
+      if (resource.id !== id) throw new Error('resource ID/path mismatch');
+      resources.push(resource);
+    } catch {
+      throw new BackupError('resource_archive_invalid', `Resource ${id} failed strict validation`);
+    }
+  }
+  return resources;
+}
+
+async function ensureRestoredResourceCatalog(restoreRoot: string): Promise<void> {
+  const resources = await validateResourceArchive(restoreRoot);
+  const stateDir = join(restoreRoot, 'state');
+  const catalogPath = join(stateDir, 'resource-catalog.sqlite3');
+  if (await exists(catalogPath)) {
+    validateResourceCatalogBackupDatabase(catalogPath);
+    return;
+  }
+  if (resources.length === 0) return;
+  const catalog = new ResourceCatalog(stateDir);
+  try { catalog.sync(resources); }
+  finally { catalog.close(); }
+}
+
 function inspectSqlite(path: string): { userVersion: number; schemaFingerprint: string } {
   const name = basename(path);
   try {
@@ -940,6 +998,8 @@ function inspectSqlite(path: string): { userVersion: number; schemaFingerprint: 
     if (name === 'calendar-outbox.sqlite3') return validateOutboxBackupDatabase(path);
     if (name === 'alerts.sqlite3') return validateAlertBackupDatabase(path);
     if (name === 'subsystem-health.sqlite3') return validateHealthBackupDatabase(path);
+    if (name === 'resource-catalog.sqlite3') return validateResourceCatalogBackupDatabase(path);
+    if (name === 'study.sqlite3') return validateStudyBackupDatabase(path);
     throw new BackupError('sqlite_schema_mismatch', 'Unexpected SQLite snapshot path');
   } catch (error) {
     if (error instanceof BackupError) throw error;
@@ -1164,6 +1224,33 @@ async function copyAllowedMarkdownTree(
       destinationCheckpoint,
     );
   }
+}
+
+async function copyResourceTree(
+  source: string,
+  destination: string,
+  canaries: readonly string[],
+  pathSafety: PathSafety,
+  checkpoint?: (path: string) => void | Promise<void>,
+  destinationCheckpoint?: (path: string) => void | Promise<void>,
+): Promise<void> {
+  const root = await canonicalDirectoryUnder(source, dirname(source), pathSafety);
+  const paths = await listSourceFiles(root, '', pathSafety);
+  const ids = [...new Set(paths.map(path => path.split('/')[0]!))];
+  if (paths.length !== ids.length * 2 || paths.some(path =>
+    !/^R-\d{8}-\d{3}\/(?:resource\.json|content\.md)$/u.test(path))) {
+    throw new BackupError('resource_archive_invalid', 'Workspace resource layout is invalid');
+  }
+  for (const id of ids) {
+    const expected = [`${id}/content.md`, `${id}/resource.json`];
+    if (JSON.stringify(paths.filter(path => path.startsWith(`${id}/`)).sort()) !== JSON.stringify(expected)) {
+      throw new BackupError('resource_archive_invalid', `Resource ${id} does not contain an exact file pair`);
+    }
+  }
+  for (const path of paths) await copyStable(
+    join(root, ...path.split('/')), join(destination, ...path.split('/')),
+    canaries, pathSafety, checkpoint, destinationCheckpoint,
+  );
 }
 
 async function listSourceFiles(
