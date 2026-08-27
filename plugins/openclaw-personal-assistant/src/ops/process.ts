@@ -18,6 +18,20 @@ export interface ExecFileRequest {
   signal?: AbortSignal;
 }
 
+export function withWslInteropEnv(
+  values: Readonly<Record<string, string>>,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const names = Object.keys(values);
+  if (names.some(name => !/^[A-Z][A-Z0-9_]*$/.test(name))) {
+    throw new BoundedProcessError('process_env_invalid', 'invalid WSL interop environment name');
+  }
+  const existing = (base.WSLENV ?? '').split(':').filter(Boolean);
+  const declared = new Set(existing.map(entry => entry.split('/')[0]));
+  const additions = names.filter(name => !declared.has(name));
+  return { ...base, ...values, WSLENV: [...existing, ...additions].join(':') };
+}
+
 /** Executes one binary without a shell and never exposes unbounded child output. */
 export async function runExecFile(request: ExecFileRequest): Promise<void> {
   await runExecFileCapture(request);

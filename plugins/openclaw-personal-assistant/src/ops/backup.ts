@@ -21,7 +21,7 @@ import {
   BACKUP_EXCLUSIONS_VERSION, BACKUP_SCHEMA_VERSION, isSafeRelativePath, parseManifest, sha256,
   type BackupFileEntry, type BackupManifest, type BackupSqliteEntry,
 } from './manifest.js';
-import { runExecFile, runExecFileCapture } from './process.js';
+import { runExecFile, runExecFileCapture, withWslInteropEnv } from './process.js';
 
 const ROOT_MARKDOWN = new Map<string, RecordKind>([
   ['TASKS.md', 'task'], ['STUDY.md', 'study'], ['NOTES.md', 'note'],
@@ -1260,7 +1260,7 @@ const DEFAULT_PATH_SAFETY: PathSafety = {
         executable: 'powershell.exe',
         args: ['-NoProfile', '-NonInteractive', '-Command',
           '$p=$env:OPENCLAW_PS_PATH;[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)'],
-        env: { ...process.env, OPENCLAW_PS_PATH: windowsPath },
+        env: withWslInteropEnv({ OPENCLAW_PS_PATH: windowsPath }),
         timeoutMs: 10_000,
       });
       return parseWindowsReparseClassification(output);
@@ -1546,7 +1546,7 @@ async function verifyWindowsAclPath(path: string): Promise<void> {
         executable: 'powershell.exe',
         args: ['-NoProfile', '-NonInteractive', '-Command',
           '$p=$env:OPENCLAW_PS_PATH;$a=Get-Acl -LiteralPath $p;$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.Owner;if($o -notmatch "^S-"){$o=([Security.Principal.NTAccount]$o).Translate([Security.Principal.SecurityIdentifier]).Value};$r=@($a.Access|%{$s=$_.IdentityReference;if($s -isnot [Security.Principal.SecurityIdentifier]){$s=$s.Translate([Security.Principal.SecurityIdentifier])};@{sid=$s.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4'],
-        env: { ...process.env, OPENCLAW_PS_PATH: windowsPath },
+        env: withWslInteropEnv({ OPENCLAW_PS_PATH: windowsPath }),
         timeoutMs: 10_000,
       });
       validateWindowsBackupAcl(output);
@@ -1620,7 +1620,7 @@ const defaultIdentityBoundDeleter: IdentityBoundDeleter = {
     try {
       const output = (await runExecFileCapture({ executable: target.executable,
         args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT],
-        env: { ...process.env, OPENCLAW_PS_ACTION: 'capture', OPENCLAW_PS_PATH: target.path }, timeoutMs: 10_000 })).trim();
+        env: withWslInteropEnv({ OPENCLAW_PS_ACTION: 'capture', OPENCLAW_PS_PATH: target.path }), timeoutMs: 10_000 })).trim();
       return parseNtfsFileIdentity(output);
     } catch { throw new BackupError('retention_identity_delete_unavailable', 'Authoritative NTFS file identity could not be captured'); }
   },
@@ -1630,8 +1630,8 @@ const defaultIdentityBoundDeleter: IdentityBoundDeleter = {
     try {
       await runExecFileCapture({ executable: target.executable,
         args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT],
-        env: { ...process.env, OPENCLAW_PS_ACTION: 'delete', OPENCLAW_PS_PATH: target.path,
-          OPENCLAW_PS_EXPECTED: `${expected.volumeId}|${expected.fileId}` }, timeoutMs: 10_000 });
+        env: withWslInteropEnv({ OPENCLAW_PS_ACTION: 'delete', OPENCLAW_PS_PATH: target.path,
+          OPENCLAW_PS_EXPECTED: `${expected.volumeId}|${expected.fileId}` }), timeoutMs: 10_000 });
     } catch { throw new BackupError('retention_identity_changed', 'NTFS identity-bound deletion failed closed'); }
   },
 };
