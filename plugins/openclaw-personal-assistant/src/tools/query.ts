@@ -15,6 +15,8 @@ import {
 import type { CalendarEvent } from '../calendar/ical.js';
 import { SecretFileStore } from '../secrets/file-store.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
+import { ResourceCatalog } from '../resources/catalog.js';
+import type { ResourceSearchHit, StoredResource } from '../resources/types.js';
 import { WorkspaceRepository } from '../workspace/repository.js';
 import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
 import {
@@ -45,12 +47,33 @@ export const queryParameters = Type.Union([
     from: Type.String({ minLength: 20, maxLength: 40 }),
     to: Type.String({ minLength: 20, maxLength: 40 }),
   }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal('resource_search'),
+    query: Type.String({ minLength: 1, maxLength: 1_000 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal('resource_read'),
+    resourceId: Type.String({
+      pattern: '^R-[0-9]{8}-[0-9]{3}$',
+      minLength: 14,
+      maxLength: 14,
+    }),
+  }, { additionalProperties: false }),
 ]);
 
 type QueryParameters = Static<typeof queryParameters>;
 
 export interface QueryRepository {
   query(criteria: { kind?: RecordKind; id?: string; includeArchived?: boolean }): Promise<ParsedRecord[]>;
+  listResources(): Promise<StoredResource[]>;
+  readResource(id: string): Promise<StoredResource>;
+  close(): void;
+}
+
+export interface QueryCatalog {
+  sync(resources: StoredResource[]): void;
+  search(query: string, limit: number): ResourceSearchHit[];
   close(): void;
 }
 
@@ -62,12 +85,13 @@ export interface QueryToolDependencies {
   openRepository?: (config: AssistantToolConfig) => QueryRepository;
   openCalendar?: (config: AssistantToolConfig) => CalendarReader;
   openHealth?: (config: AssistantToolConfig) => SubsystemHealthJournal;
+  openCatalog?: (config: AssistantToolConfig) => QueryCatalog;
 }
 
 interface QueryResult {
-  kind: 'records' | 'calendar';
+  kind: 'records' | 'calendar' | 'resource_search' | 'resource_read';
   trust: 'quoted_untrusted_data';
-  items: ParsedRecord[] | CalendarEvent[];
+  items: ParsedRecord[] | CalendarEvent[] | ResourceSearchHit[] | StoredResource[];
 }
 
 export function createQueryTool(
@@ -109,6 +133,25 @@ export function createQueryTool(
 
       const repository = (dependencies.openRepository ?? openRepository)(config);
       try {
+        if (params.kind === 'resource_read') {
+          const resource = await repository.readResource(params.resourceId);
+          return jsonResult({
+            kind: 'resource_read', trust: 'quoted_untrusted_data', items: [resource],
+          });
+        }
+        if (params.kind === 'resource_search') {
+          const resources = await repository.listResources();
+          const catalog = (dependencies.openCatalog ?? openCatalog)(config);
+          try {
+            catalog.sync(resources);
+            const items = catalog.search(params.query, params.limit ?? 5);
+            return jsonResult({
+              kind: 'resource_search', trust: 'quoted_untrusted_data', items,
+            });
+          } finally {
+            catalog.close();
+          }
+        }
         const items = await repository.query({
           ...(params.recordType === undefined ? {} : { kind: params.recordType }),
           ...(params.targetId === undefined ? {} : { id: params.targetId }),
@@ -124,6 +167,10 @@ export function createQueryTool(
 
 function openRepository(config: AssistantToolConfig): QueryRepository {
   return new WorkspaceRepository(config);
+}
+
+function openCatalog(config: AssistantToolConfig): QueryCatalog {
+  return new ResourceCatalog(config.stateDir);
 }
 
 export function openGoogleCalendarReader(config: AssistantToolConfig): CalendarReader {

@@ -8,6 +8,7 @@ import {
 import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
 import { briefingParameters, createBriefingTool } from './briefing.js';
+import { createResourceTool } from './resource.js';
 
 const absoluteWslPath = Type.String({ pattern: '^/(?!.*(?:^|/)\\.\\.(?:/|$)).+' });
 
@@ -33,4 +34,7 @@ export function registerAssistantTools(api: OpenClawPluginApi): void {
     name: 'assistant_calendar_manage', optional: true,
   });
   api.registerTool(context => createBriefingTool(api, context), { name: 'assistant_briefing', optional: true });
+  api.registerTool(context => createResourceTool(api, context), {
+    name: 'assistant_resource_store', optional: true,
+  });
 }

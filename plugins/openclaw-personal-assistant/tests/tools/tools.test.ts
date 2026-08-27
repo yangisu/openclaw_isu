@@ -60,7 +60,7 @@ afterEach(async () => {
 });
 
 describe('OpenClaw personal-assistant tool boundary', () => {
-  it('registers exactly four statically owned optional tools', () => {
+  it('registers exactly five statically owned optional tools before study integration', () => {
     const registrations: Array<{ name?: string; optional?: boolean }> = [];
     plugin.register({
       config: {}, pluginConfig: config, registrationMode: 'tool-discovery',
@@ -73,10 +73,11 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       { name: 'assistant_mutate', optional: true },
       { name: 'assistant_calendar_manage', optional: true },
       { name: 'assistant_briefing', optional: true },
+      { name: 'assistant_resource_store', optional: true },
     ]);
   });
 
-  it('registers only the four Google-era tools in full mode', () => {
+  it('registers only the five approved tools before study integration in full mode', () => {
     const registerTool = vi.fn();
     const registerService = vi.fn();
     const registerCommand = vi.fn();
@@ -86,7 +87,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       registerTool, registerService, registerCommand, on,
     } as never);
 
-    expect(registerTool).toHaveBeenCalledTimes(4);
+    expect(registerTool).toHaveBeenCalledTimes(5);
     expect(registerService).not.toHaveBeenCalled();
     expect(registerCommand).not.toHaveBeenCalled();
     expect(on).not.toHaveBeenCalled();
