@@ -1,6 +1,6 @@
 # OpenClaw personal assistant installation runbook
 
-This runbook targets Ubuntu 24.04 in WSL2, Node.js 24.15 or newer (but below 25), and the package-local OpenClaw 2026.7.1 installed by this checkout. Run every command locally. Never paste a bot token, OAuth code, client secret, CalDAV application password, or `age` private key into chat, a shell argument, Git, Markdown, or a log.
+This runbook targets Ubuntu 24.04 in WSL2, Node.js 24.15 or newer (but below 25), and the package-local OpenClaw 2026.7.1 installed by this checkout. Run every command locally. Never paste a bot token, OAuth code, OAuth client JSON, refresh token, or `age` private key into chat, a shell argument, Git, Markdown, or a log.
 
 ## 1. Preflight without changing state
 
@@ -44,49 +44,43 @@ Perform the printed commands in the local terminal. Use a hidden prompt or an ed
 plugins/openclaw-personal-assistant/node_modules/.bin/openclaw models auth login
 ```
 
-Edit the generated config locally: replace `/home/user` with the real WSL home and replace the documented owner placeholder `123456789` with the one numeric Telegram owner ID. Keep Telegram DMs allowlisted, groups disabled, config writes disabled, shell/config/MCP/plugin commands disabled, elevated tools disabled, the Gateway loopback-only, and exactly these five optional tools:
+Edit the generated config locally: replace `/home/user` with the real WSL home. Keep Telegram DMs allowlisted to `6520016662`, groups disabled, config writes disabled, shell/config/MCP/plugin commands disabled, elevated tools disabled, the Gateway loopback-only, and exactly these four optional tools:
 
 ```text
 assistant_query
 assistant_mutate
-assistant_calendar_prepare
-assistant_calendar_confirm
+assistant_calendar_manage
 assistant_briefing
 ```
 
-Register the exact Naver OAuth callback and calendar permission in the Naver developer console. The plugin owns only the Naver OAuth lifecycle; ChatGPT model OAuth remains entirely OpenClaw-managed and is not proven by plugin PoC evidence.
-
-Create a temporary owner-only JSON file with exactly `version`, `clientId`, `clientSecret`, and `redirectUri`, where `version` is `1` and `redirectUri` exactly matches the registered callback. Use a local editor and mode `600`; do not type its contents as shell arguments. Then run the package CLI with the sensitive document on stdin:
+In Google Cloud, enable Google Calendar API, configure the OAuth consent screen for `yangisu12@gmail.com`, and create an OAuth client of type **Desktop app**. Download its JSON file to an owner-private location. The CLI imports it through stdin and requests only `https://www.googleapis.com/auth/calendar.app.created`; this permits calendar creation and event access only in calendars created by this app.
 
 ```bash
 umask 077
-editor /absolute/owner-private/naver-client-input.json
-node plugins/openclaw-personal-assistant/dist/cli.js oauth configure \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  < /absolute/owner-private/naver-client-input.json
-node plugins/openclaw-personal-assistant/dist/cli.js oauth begin \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
+node plugins/openclaw-personal-assistant/dist/cli.js google oauth configure \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  < /absolute/owner-private/google-desktop-client.json
+node plugins/openclaw-personal-assistant/dist/cli.js google oauth authorize \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/google-oauth-token" \
   --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-Complete the displayed authorization URL locally. Put only `{"callbackUrl":"<the complete returned callback URL>"}` in another owner-only temporary file, then pass it on stdin. The CLI requires the exact scheme, host, port, and path, one state, and either one code or one error; state is single-use for ten minutes.
+Open the displayed URL locally, verify that Google shows exactly `yangisu12@gmail.com`, and approve access. The loopback callback validates PKCE, exact state, and the exact returned scope before atomically storing an owner-only token; the least-privilege Calendar-only scope cannot independently disclose the account email, so the displayed-account check is an explicit operator gate. If the consent screen remains in Google **Testing** status, its refresh token normally expires after seven days; publish the app to Production for durable unattended use.
 
 ```bash
-editor /absolute/owner-private/naver-callback.json
-node plugins/openclaw-personal-assistant/dist/cli.js oauth callback \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
-  --state "$HOME/.openclaw/state/openclaw-personal-assistant" \
-  < /absolute/owner-private/naver-callback.json
-node plugins/openclaw-personal-assistant/dist/cli.js oauth status \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+node plugins/openclaw-personal-assistant/dist/cli.js google oauth status \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/google-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
+node plugins/openclaw-personal-assistant/dist/cli.js google calendar bootstrap \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/google-oauth-token" \
+  --binding-file "$HOME/.openclaw/secrets/google-calendar-binding" \
   --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-`oauth status` is strictly read-only. It reads the hardened app/token stores and reports `fresh`, `refreshable`, or `unusable`; it does not contact Naver, refresh a token, create a lease/health database, or rewrite either store. `refreshable` includes an expired or near-expiry token with a valid refresh token and is healthy for installer checks. Use the explicit `oauth refresh` command when mutation and network access are intended.
-
-Securely remove the two temporary input files after the local commands succeed. The versioned app credential and token stores remain under the owner-only secret directory, outside the workspace, Git, and normal backups. `openclaw.personal-assistant.json5` contains only their paths. The production token provider refreshes tokens only for an actual calendar operation or explicit refresh, but calendar creation is currently disabled: OpenClaw 2026.7.1 does not attest that an owner command was direct rather than forwarded. Neither `/assistant-confirm` nor the `assistant_calendar_confirm` tool can perform an external write, and `AC-09` remains `NOT_VERIFIED`.
+`google oauth status` is read-only. Bootstrap creates one secondary calendar named `openclaw_cal` with timezone `Asia/Seoul`, records only its returned ID in the owner-private binding, and is idempotent. It never adopts a pre-existing user-created calendar, even if it has the same name. Delete the temporary downloaded OAuth client JSON only after the hardened copy is verified.
 
 ## 4. Finish installation
 
@@ -115,7 +109,7 @@ systemctl --user is-active openclaw-gateway.service
 loginctl show-user "$USER" -p Linger
 ```
 
-Runtime inspection must contain exactly five optional tools. A successful command is not a substitute for checking its JSON and exit code.
+Runtime inspection must contain exactly four optional tools. A successful command is not a substitute for checking its JSON and exit code.
 
 Install the Windows startup task only after the WSL checks pass. This may request the current Windows user's password because the task must run whether that user is logged on or not:
 
@@ -127,43 +121,28 @@ Do not change the principal to `SYSTEM`. Do not add a firewall inbound rule or p
 
 ## 5. PoC gates
 
-The legacy `poc` command accepts only a local report containing exactly `status`, `observedChecks`, `redactedErrorCode`, and `timestamp`, with no additional or nested fields. It is report-only: it cannot open a runtime gate and `doctor` does not use it as operational proof. Checks containing control/format characters, URLs, OAuth codes, keys, or token-like values are rejected rather than redacted or persisted:
+After bootstrap, run the bounded live PoC. It creates one uniquely named event in the pinned app-created calendar, updates that event conditionally with its ETag, deletes it conditionally, and verifies that no matching event remains:
 
 ```bash
-node plugins/openclaw-personal-assistant/dist/cli.js poc openai --state "$HOME/.openclaw/state/openclaw-personal-assistant" --evidence /absolute/path/openai-redacted.json
-node plugins/openclaw-personal-assistant/dist/cli.js poc caldav --state "$HOME/.openclaw/state/openclaw-personal-assistant" --evidence /absolute/path/caldav-redacted.json
-node plugins/openclaw-personal-assistant/dist/cli.js doctor \
-  --state "$HOME/.openclaw/state/openclaw-personal-assistant" \
-  --naver-client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --naver-token-file "$HOME/.openclaw/secrets/naver-oauth-token"
-```
-
-`doctor` verifies the real versioned Naver app store and token freshness read-only. `naver-create` remains unknown until authoritative production integration evidence exists; arbitrary `poc --evidence` cannot change it. OpenAI model authentication is inspected with the package-local OpenClaw commands and live Gateway behavior, not claimed as plugin-controlled. Consequently `doctor` remains nonzero while any required gate is unknown, closed, or expired.
-
-Use explicit refresh or revoke locally when required. Neither command accepts a token, code, or secret argument. Revoke deletes the local token only after a verified successful remote response. Timeout, transport loss, or a non-success response retains the private token store for an explicit retry, records degraded OAuth health, and keeps calendar creation closed.
-
-```bash
-node plugins/openclaw-personal-assistant/dist/cli.js oauth refresh \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
-  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
-node plugins/openclaw-personal-assistant/dist/cli.js oauth revoke \
-  --client-file "$HOME/.openclaw/secrets/naver-oauth-client" \
-  --token-file "$HOME/.openclaw/secrets/naver-oauth-token" \
+node plugins/openclaw-personal-assistant/dist/cli.js google calendar poc \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/google-oauth-token" \
+  --binding-file "$HOME/.openclaw/secrets/google-calendar-binding" \
   --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-There is no automated create PoC while the confirmation boundary is fail-closed. If a future approved OpenClaw release provides direct, non-forwarded owner provenance and the production boundary is implemented and reviewed, create exactly one clearly named test event after the single-use confirmation, verify there is no duplicate, and delete that one event yourself in the Naver app. The assistant does not modify or delete Naver events.
+Success ends with `remaining: 0`. Runtime writes are exposed only through `assistant_calendar_manage` and require the exact numeric Telegram owner. The tool accepts `create`, `update`, or `delete`, never accepts a calendar ID or attendees, always uses the pinned binding, requires ETags for update/delete, and records a metadata-only idempotency ledger before and after remote mutation. A stale ETag fails closed instead of overwriting a concurrent change.
 
-CalDAV reads are independently fail-closed at initial installation: `calendar.caldavReadEnabled` must remain `false`, and query, briefing, and recovery perform no credential read or network request while it is false. Disabled recovery still opens the local outbox, converts stale `submitting` rows to `pending_reconcile`, records the durable owner warning, and then remains idle without reconciliation. The default installer/finish and ordinary `--check` reject an initially enabled config.
-
-Only after the authorized live CalDAV PoC has been performed and recorded by the operator may the owner deliberately change `calendar.caldavReadEnabled` to `true` in the private active config. Then use the explicit post-live read-only check:
+To disconnect Google Calendar, revoke remotely first and remove the local token only after a verified success:
 
 ```bash
-bash scripts/wsl/install-openclaw.sh --check --caldav-enabled
+node plugins/openclaw-personal-assistant/dist/cli.js google oauth revoke \
+  --client-file "$HOME/.openclaw/secrets/google-oauth-client" \
+  --token-file "$HOME/.openclaw/secrets/google-oauth-token" \
+  --state "$HOME/.openclaw/state/openclaw-personal-assistant"
 ```
 
-This flag only selects the expected hardened value; it never changes config or imports evidence. Ordinary `--check` continues to require `false`, while `--check --caldav-enabled` requires `true`. Reversed, additional, or unsupported flags fail. Live activation remains `NOT_VERIFIED` to automation, and legacy `poc --evidence` cannot change the runtime flag. On failure, return the field to `false`; local query and briefing functions continue and expose the durable limited-mode reason.
+Timeout, transport loss, or a non-success response retains the private token for an explicit retry. The dedicated Google calendar and its events are not deleted by revoke or uninstall.
 
 ## 6. Backup and restore boundary
 
