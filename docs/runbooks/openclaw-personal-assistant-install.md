@@ -44,14 +44,20 @@ Perform the printed commands in the local terminal. Use a hidden prompt or an ed
 plugins/openclaw-personal-assistant/node_modules/.bin/openclaw models auth login
 ```
 
-Edit the generated config locally: replace `/home/user` with the real WSL home. Keep Telegram DMs allowlisted to `6520016662`, groups disabled, config writes disabled, shell/config/MCP/plugin commands disabled, elevated tools disabled, the Gateway loopback-only, and exactly these four optional tools:
+Edit the generated config locally: replace `/home/user` with the real WSL home. Keep Telegram DMs allowlisted to `6520016662`, groups disabled, config writes disabled, inline buttons limited to DMs, shell/config/MCP/plugin commands disabled, elevated tools disabled, the Gateway loopback-only, and exactly these six optional plugin tools plus the bounded built-in fetch/PDF readers:
 
 ```text
 assistant_query
 assistant_mutate
 assistant_calendar_manage
 assistant_briefing
+assistant_resource_store
+assistant_study_manage
+web_fetch
+pdf
 ```
+
+Keep web fetch limited to 100,000 characters, 1,000,000 response bytes, 30 seconds, and three redirects with trusted environment proxies disabled. Keep PDF input limited to 10 MB and 20 pages. Do not enable browser, search, shell, private-network, or paid-provider fallbacks for link collection.
 
 In Google Cloud, enable Google Calendar API, configure the OAuth consent screen for `yangisu12@gmail.com`, and create an OAuth client of type **Desktop app**. Download its JSON file to an owner-private location. The CLI requests `openid email` for exact account verification and `https://www.googleapis.com/auth/calendar.app.created` as its only Calendar data scope; this permits calendar creation and event access only in calendars created by this app.
 
@@ -109,7 +115,15 @@ systemctl --user is-active openclaw-gateway.service
 loginctl show-user "$USER" -p Linger
 ```
 
-Runtime inspection must contain exactly four optional tools. A successful command is not a substitute for checking its JSON and exit code.
+Runtime inspection must contain exactly six optional plugin tools. The active allowlist additionally contains only `web_fetch` and `pdf`. A successful command is not a substitute for checking its JSON and exit code.
+
+## Personal assistant commands
+
+- `/save URL` reads a public HTTP(S) page or PDF as untrusted data and stores at most 100,000 extracted characters under a stable `R-YYYYMMDD-NNN` ID. It is best-effort for public non-JavaScript pages; login walls, client-rendered pages, oversized files, and inaccessible URLs fail without a browser or paid fallback.
+- `/find 검색어` searches local titles, tags, summaries, claims, and saved text. `/memo 내용 #태그` stores a quick local note.
+- `/study add 계획` divides only the owner-supplied plan into blocks. The study day is 08:00 through the following 02:00 in `Asia/Seoul`, with 50-minute focus, 10-minute breaks, 15-minute follow-ups up to twice, a 22:00 interim report, and a 02:00 final report. Use `/study status|done|snooze|skip`; reminder buttons map to the same actions and print text fallbacks.
+
+To stop coaching without deleting data, disable the plugin and restart the Gateway. Re-enabling it resumes from persisted resources, notes, study history, and settings.
 
 Install the Windows startup task only after the WSL checks pass. This may request the current Windows user's password because the task must run whether that user is logged on or not:
 
@@ -184,7 +198,7 @@ Automated maintenance reads the public age recipient and the identity-file path 
 node plugins/openclaw-personal-assistant/dist/cli.js maintenance check --config "$HOME/.openclaw/maintenance.json"
 ```
 
-Daily maintenance creates and verifies the encrypted archive, performs an isolated sample restore, and only then applies verified retention (latest 30 points, minimum 2). `publication_unknown`, missing media/identity, backup, restore, or durable-health failure closes backup health and performs no retention. Monthly maintenance verifies the exact selected archive and performs a full isolated restore, recording schema/hash-bound evidence; it never applies to the live workspace. A cross-process lock prevents overlap and temporary restore roots are cleaned by the verified restore API. These schedules are installed automation, but their real age/media/ACL execution remains `NOT_VERIFIED` until observed on the target host.
+Daily maintenance creates and verifies the encrypted archive, including strict resource file pairs and study state, performs an isolated sample restore, and only then applies verified retention (latest 30 points, minimum 2). A missing resource search catalog is rebuilt only inside that isolated restore. `publication_unknown`, missing media/identity, resource/hash/schema damage, backup, restore, or durable-health failure closes backup health and performs no retention. Monthly maintenance verifies the exact selected archive and performs a full isolated restore, recording schema/hash-bound evidence; it never applies to the live workspace. A cross-process lock prevents overlap and temporary restore roots are cleaned by the verified restore API. These schedules are installed automation, but their real age/media/ACL execution remains `NOT_VERIFIED` until observed on the target host.
 
 ## 7. Rollback and uninstall
 

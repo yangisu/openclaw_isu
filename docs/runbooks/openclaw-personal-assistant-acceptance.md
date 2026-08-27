@@ -83,7 +83,7 @@ The following observations are still required by the approved design. They are m
 - `AC-23`: actual observations at Asia/Seoul 08:00 and 22:00, absence at 23:00, `staggerMs: 0`, and no catch-up/replay after sleep.
 - `AC-31` is a non-live retention contract: only verified archives older than 30 days are eligible, at least two recovery points remain, and symlink/junction targets are rejected. Separately record protected NTFS ACL, current-user plus Administrators only, production same-open-handle deletion, device identity, and physical-media availability before enabling retention on the target.
 
-The local test evidence covers the remaining safe component contracts, including owner authorization, Google mutation-ledger transitions, untrusted-content isolation, warning deduplication, Markdown round trips, exact one-byte backup corruption, and retention boundaries. Component tests are diagnostic evidence only when the acceptance criterion also requires production wiring. In particular, a green unit test cannot promote these rows:
+The local test evidence covers the remaining safe component contracts, including owner authorization, Google mutation-ledger transitions, untrusted-content isolation, warning deduplication, Markdown round trips, resource codec/search/rebuild, study-day clock/state/delivery recovery, command and Telegram callback registration, exact one-byte backup corruption, resource/study restore validation, and retention boundaries. These checks perform no Google Calendar write. Component tests are diagnostic evidence only when the acceptance criterion also requires production wiring. In particular, a green unit test cannot promote these rows:
 
 - `AC-18` remains `NOT_VERIFIED`: component and built-runtime tests exercise recovery and the durable owner-warning sink, but the complete production behavior has not yet been attested by an acceptance boundary.
 - `AC-20` remains `NOT_VERIFIED` until the built plugin runtime connects Google OAuth/API failures to the durable calendar-only gate and owner-facing reason while local functions stay available.
@@ -96,7 +96,7 @@ The local test evidence covers the remaining safe component contracts, including
 Before tagging a local release, require:
 
 1. `index.json` has exactly 32 records, no FAIL, and no NOT_VERIFIED.
-2. Runtime inspection shows exactly four optional tools.
+2. Runtime inspection shows exactly six optional plugin tools, commands `find`, `memo`, `save`, and `study`, one study service, and the Telegram `ocstudy` handler. The active allowlist contains only those tools plus `web_fetch` and `pdf`.
 3. Google OAuth status is fresh or refreshable and the dedicated binding verifies successfully.
 4. Reboot plus 30-minute idle, exact 08:00/22:00 observations, a zero-residue Google create/update/delete PoC, real encrypted isolated restore, ACL/same-handle deletion, and device-disaster status are all directly observed.
 5. No secret or credential-bearing URL appears in Git, Markdown, logs, command descriptions, evidence, decrypted manifests, or backup material.
