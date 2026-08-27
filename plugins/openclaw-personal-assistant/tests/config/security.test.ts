@@ -25,7 +25,7 @@ describe('hardened OpenClaw example config', () => {
       enabled: true,
       tokenFile: '/home/user/.openclaw/secrets/telegram-token',
       dmPolicy: 'allowlist',
-      allowFrom: ['tg:123456789'],
+      allowFrom: ['tg:6520016662'],
       groupPolicy: 'disabled',
       configWrites: false,
     });
@@ -33,15 +33,14 @@ describe('hardened OpenClaw example config', () => {
     expect(JSON.stringify(config.channels.telegram)).not.toContain('*');
   });
 
-  it('exposes exactly five assistant tools and no dangerous command or elevation surface', async () => {
+  it('exposes exactly four assistant tools and no dangerous command or elevation surface', async () => {
     const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
     expect(config.commands).toEqual({ bash: false, config: false, mcp: false, plugins: false });
     expect(config.tools).toEqual({
       allow: [
         'assistant_query',
         'assistant_mutate',
-        'assistant_calendar_prepare',
-        'assistant_calendar_confirm',
+        'assistant_calendar_manage',
         'assistant_briefing',
       ],
       elevated: { enabled: false },
@@ -55,14 +54,15 @@ describe('hardened OpenClaw example config', () => {
     expect(source).not.toMatch(/(?:password|clientSecret|accessToken|refreshToken)\s*:/i);
   });
 
-  it('declares an explicit owner-approved API-to-CalDAV collection mapping', async () => {
+  it('pins the least-privilege Google account and owner-private credential paths', async () => {
     const config = JSON5.parse(await readFile(configPath, 'utf8')) as any;
-    expect(config.plugins.entries['openclaw-personal-assistant'].config.calendar.calendarMappings).toEqual([
-      {
-        apiCalendarId: 'OWNER_APPROVED_NAVER_API_CALENDAR_ID',
-        caldavHref: 'https://caldav.calendar.naver.com/OWNER_APPROVED_CALDAV_COLLECTION/',
-      },
-    ]);
+    expect(config.plugins.entries['openclaw-personal-assistant'].config.calendar).toEqual({
+      provider: 'google',
+      googleOAuthClientFile: '/home/user/.openclaw/secrets/google-oauth-client',
+      googleTokenFile: '/home/user/.openclaw/secrets/google-oauth-token',
+      googleCalendarBindingFile: '/home/user/.openclaw/secrets/google-calendar-binding',
+      expectedAccount: 'yangisu12@gmail.com',
+    });
   });
 });
 

@@ -4,8 +4,7 @@ IFS=$'\n\t'
 
 MODE="install"
 PHASE="prepare"
-CALDAV_EXPECTATION="disabled"
-usage() { printf '%s\n' 'usage: install-openclaw.sh [--dry-run|--check [--caldav-enabled]|--finish]' >&2; exit 64; }
+usage() { printf '%s\n' 'usage: install-openclaw.sh [--dry-run|--check|--finish]' >&2; exit 64; }
 case "$#" in
   0) ;;
   1) case "$1" in
@@ -14,9 +13,6 @@ case "$#" in
     --finish) PHASE="finish" ;;
     *) usage ;;
   esac ;;
-  2) [[ "$1" == --check && "$2" == --caldav-enabled ]] || usage
-    MODE="check"
-    CALDAV_EXPECTATION="enabled" ;;
   *) usage ;;
 esac
 
@@ -72,7 +68,7 @@ validate_secret_tree() {
     || { say 'secret_directory_permissions_invalid'; return 1; }
   owner="$(id -u)"
   [[ "$(stat -c %u -- "$SECRET_DIR")" == "$owner" ]] || { say 'secret_directory_owner_invalid'; return 1; }
-  for file in telegram-token naver-caldav naver-oauth-client naver-oauth-token; do
+  for file in telegram-token google-oauth-client google-oauth-token google-calendar-binding; do
     path="$SECRET_DIR/$file"
     [[ -e "$path" && ! -L "$path" ]] || { say "secret_file_invalid:$file"; return 1; }
     before="$(stat -Lc '%d:%i:%F:%u:%a' -- "$path")"
@@ -126,7 +122,7 @@ validate_active_config() {
     || { say 'active_config_not_hardened'; return 1; }
   local configured_tools owner_id allow_from
   configured_tools="$($OPENCLAW config get tools.allow --json)"
-  node -e 'const x=JSON.parse(process.argv[1]);const e=["assistant_briefing","assistant_calendar_confirm","assistant_calendar_prepare","assistant_mutate","assistant_query"];if(!Array.isArray(x)||JSON.stringify([...x].sort())!==JSON.stringify(e))process.exit(1)' "$configured_tools" \
+  node -e 'const x=JSON.parse(process.argv[1]);const e=["assistant_briefing","assistant_calendar_manage","assistant_mutate","assistant_query"];if(!Array.isArray(x)||JSON.stringify([...x].sort())!==JSON.stringify(e))process.exit(1)' "$configured_tools" \
     || { say 'configured_tool_contract_invalid'; return 1; }
   owner_id="$(config_scalar plugins.entries.openclaw-personal-assistant.config.telegramUserId)"
   [[ "$owner_id" =~ ^[1-9][0-9]{0,18}$ ]] || { say 'telegram_owner_id_invalid'; return 1; }
@@ -156,7 +152,7 @@ validate_maintenance_cron_contract() {
 if [[ "$MODE" == "dry-run" ]]; then
   say "DRY_RUN verify Ubuntu $EXPECTED_UBUNTU, Node >=$MIN_NODE <$MAX_NODE, systemd, lingering"
   say "DRY_RUN verify package-local OpenClaw $EXPECTED_OPENCLAW"
-  say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_confirm,assistant_calendar_prepare,assistant_mutate,assistant_query"
+  say "DRY_RUN build mixed plugin and inspect exact optional tools: assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query"
   say "DRY_RUN install owner-private token/config files and user systemd service"
   say "DRY_RUN declare briefing Cron row: $CRON_EXPR $CRON_TZ staggerMs=0 isolated announce telegram owner"
   say 'DRY_RUN declare command Cron rows: daily 0 3 * * * and monthly 0 4 1 * * Asia/Seoul, exact, no delivery/catch-up'
@@ -187,7 +183,7 @@ if [[ "$MODE" == check ]]; then
   validate_secret_tree
   validate_config_file "$ACTIVE_CONFIG_FILE"
   validate_active_config_path
-  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" "$CALDAV_EXPECTATION"
+  node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
   [[ -f "$PLUGIN_ROOT/dist/index.js" && ! -L "$PLUGIN_ROOT/dist/index.js" ]] || { say 'plugin_build_missing'; exit 1; }
   [[ -z "$(find "$PLUGIN_ROOT/src" -type f -newer "$PLUGIN_ROOT/dist/index.js" -print -quit)" ]] || { say 'plugin_build_stale'; exit 1; }
   npm --prefix "$PLUGIN_ROOT" run typecheck
@@ -195,7 +191,7 @@ if [[ "$MODE" == check ]]; then
   validate_runtime_tools
   "$OPENCLAW" config validate
   validate_active_config
-  node "$PLUGIN_ROOT/dist/cli.js" oauth status --client-file "$SECRET_DIR/naver-oauth-client" --token-file "$SECRET_DIR/naver-oauth-token" --state "$OPENCLAW_HOME/state/openclaw-personal-assistant"
+  node "$PLUGIN_ROOT/dist/cli.js" google oauth status --client-file "$SECRET_DIR/google-oauth-client" --token-file "$SECRET_DIR/google-oauth-token" --state "$OPENCLAW_HOME/state/openclaw-personal-assistant"
   node "$PLUGIN_ROOT/dist/cli.js" maintenance check --config "$MAINTENANCE_CONFIG_FILE"
   systemctl --user is-enabled --quiet openclaw-gateway.service
   systemctl --user is-active --quiet openclaw-gateway.service
@@ -214,22 +210,20 @@ if [[ ! -e "$MAINTENANCE_CONFIG_FILE" ]]; then run install -m 600 "$MAINTENANCE_
 if [[ "$PHASE" == prepare ]]; then
   say 'STOP_INTERACTIVE: enter credentials locally; do not paste them into chat or command-line arguments.'
   say "install -m 600 /dev/stdin '$SECRET_DIR/telegram-token'"
-  say "install -m 600 /dev/stdin '$SECRET_DIR/naver-caldav'"
-  say "node '$PLUGIN_ROOT/dist/cli.js' oauth configure --client-file '$SECRET_DIR/naver-oauth-client' < /absolute/owner-private/naver-client-input.json"
-  say "node '$PLUGIN_ROOT/dist/cli.js' oauth begin --client-file '$SECRET_DIR/naver-oauth-client' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
-  say "node '$PLUGIN_ROOT/dist/cli.js' oauth callback --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' < /absolute/owner-private/naver-callback.json"
-  say "node '$PLUGIN_ROOT/dist/cli.js' oauth status --client-file '$SECRET_DIR/naver-oauth-client' --token-file '$SECRET_DIR/naver-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
-  say "node '$PLUGIN_ROOT/dist/cli.js' doctor --state '$OPENCLAW_HOME/state/openclaw-personal-assistant' --naver-client-file '$SECRET_DIR/naver-oauth-client' --naver-token-file '$SECRET_DIR/naver-oauth-token'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' google oauth configure --client-file '$SECRET_DIR/google-oauth-client' < /absolute/owner-private/google-desktop-client.json"
+  say "node '$PLUGIN_ROOT/dist/cli.js' google oauth authorize --client-file '$SECRET_DIR/google-oauth-client' --token-file '$SECRET_DIR/google-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' google oauth status --client-file '$SECRET_DIR/google-oauth-client' --token-file '$SECRET_DIR/google-oauth-token' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
+  say "node '$PLUGIN_ROOT/dist/cli.js' google calendar bootstrap --client-file '$SECRET_DIR/google-oauth-client' --token-file '$SECRET_DIR/google-oauth-token' --binding-file '$SECRET_DIR/google-calendar-binding' --state '$OPENCLAW_HOME/state/openclaw-personal-assistant'"
   say "Edit '$MAINTENANCE_CONFIG_FILE' locally: set this user's workspace/state/restore paths, mounted offline-media identity path, and approved age recipient; never paste the identity into chat or argv."
   say "node '$PLUGIN_ROOT/dist/cli.js' maintenance check --config '$MAINTENANCE_CONFIG_FILE'"
   say "$OPENCLAW models auth login"
-  say 'Complete Naver OAuth in the local browser, then rerun: install-openclaw.sh --finish'
+  say 'Complete Google OAuth and calendar bootstrap in the local browser, then rerun: install-openclaw.sh --finish'
   exit 2
 fi
 
 validate_secret_tree
 validate_config_file "$CONFIG_FILE"
-node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR" disabled
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR"
 "$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
 run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 
@@ -238,7 +232,7 @@ run npm --prefix "$PLUGIN_ROOT" run plugin:validate
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
 validate_config_file "$ACTIVE_CONFIG_FILE"
 validate_active_config_path
-node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" disabled
+node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"
 run "$OPENCLAW" config validate
 validate_active_config
 OWNER_ID="$($OPENCLAW config get plugins.entries.openclaw-personal-assistant.config.telegramUserId | tr -d '"[:space:]')"

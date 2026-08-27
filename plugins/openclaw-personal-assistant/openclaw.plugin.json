@@ -1,7 +1,7 @@
 {
   "id": "openclaw-personal-assistant",
   "name": "OpenClaw Personal Assistant",
-  "description": "Owner-scoped local records, Naver calendar, and briefings.",
+  "description": "Owner-scoped local records, dedicated Google calendar, and briefings.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
@@ -36,50 +36,33 @@
       },
       "calendar": {
         "type": "object",
+        "required": [
+          "provider",
+          "googleOAuthClientFile",
+          "googleTokenFile",
+          "googleCalendarBindingFile",
+          "expectedAccount"
+        ],
         "properties": {
-          "caldavReadEnabled": {
-            "type": "boolean"
-          },
-          "caldavBaseUrl": {
+          "provider": {
             "type": "string",
-            "pattern": "^https://"
+            "enum": ["google"]
           },
-          "caldavSecretFile": {
+          "googleOAuthClientFile": {
             "type": "string",
             "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
           },
-          "naverOAuthClientFile": {
+          "googleTokenFile": {
             "type": "string",
             "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
           },
-          "naverTokenFile": {
+          "googleCalendarBindingFile": {
             "type": "string",
             "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$)).+"
           },
-          "calendarMappings": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": [
-                "apiCalendarId",
-                "caldavHref"
-              ],
-              "properties": {
-                "apiCalendarId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 1024
-                },
-                "caldavHref": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 4096
-                }
-              },
-              "additionalProperties": false
-            },
-            "minItems": 1,
-            "maxItems": 10
+          "expectedAccount": {
+            "type": "string",
+            "enum": ["yangisu12@gmail.com"]
           }
         },
         "additionalProperties": false
@@ -94,8 +77,7 @@
     "tools": [
       "assistant_query",
       "assistant_mutate",
-      "assistant_calendar_prepare",
-      "assistant_calendar_confirm",
+      "assistant_calendar_manage",
       "assistant_briefing"
     ]
   },
@@ -106,10 +88,7 @@
     "assistant_mutate": {
       "optional": true
     },
-    "assistant_calendar_prepare": {
-      "optional": true
-    },
-    "assistant_calendar_confirm": {
+    "assistant_calendar_manage": {
       "optional": true
     },
     "assistant_briefing": {

@@ -64,7 +64,6 @@ describe('deployment scripts', () => {
   ];
   const acceptanceNotVerifiedCriteria = [
     ...liveCriteria,
-    'AC-09',
     'AC-18', 'AC-20', 'AC-29',
   ].sort();
 
@@ -249,14 +248,14 @@ describe('deployment scripts', () => {
     expect(result.stdout).toContain('DRY_RUN');
     expect(result.stdout).toContain('OpenClaw 2026.7.1');
     expect(result.stdout).toContain('Node >=24.15.0 <25.0.0');
-    expect(result.stdout).toContain('assistant_briefing,assistant_calendar_confirm,assistant_calendar_prepare,assistant_mutate,assistant_query');
+    expect(result.stdout).toContain('assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query');
     expect(result.stdout).toContain('0 8-22 * * *');
   });
 
-  it('validates the actual OpenClaw runtime inspect names-array shape as exactly five optional tools', () => {
+  it('validates the actual OpenClaw runtime inspect names-array shape as exactly four optional tools', () => {
     const valid = { tools: [
       { names: ['assistant_query'], optional: true }, { names: ['assistant_mutate'], optional: true },
-      { names: ['assistant_calendar_prepare'], optional: true }, { names: ['assistant_calendar_confirm'], optional: true },
+      { names: ['assistant_calendar_manage'], optional: true },
       { names: ['assistant_briefing'], optional: true },
     ] };
     expect(spawnSync(process.execPath, [runtimeToolsValidator], { input: JSON.stringify(valid), encoding: 'utf8' }).status).toBe(0);
@@ -291,13 +290,14 @@ describe('deployment scripts', () => {
     expect(source.slice(service, cronAdd)).toContain('gateway_not_ready');
   });
 
-  it('keeps the installed manifest CalDAV activation and fan-out bounds aligned with runtime config', () => {
+  it('keeps the installed manifest aligned with the dedicated Google calendar config', () => {
     const manifest = JSON.parse(readFileSync(resolve(repo, 'plugins/openclaw-personal-assistant/openclaw.plugin.json'), 'utf8')) as {
       configSchema: { properties: { calendar: { properties: Record<string, { type?: string; maxItems?: number }> } } };
     };
     const calendar = manifest.configSchema.properties.calendar.properties;
-    expect(calendar.caldavReadEnabled).toEqual({ type: 'boolean' });
-    expect(calendar.calendarMappings?.maxItems).toBe(10);
+    expect(calendar.provider).toEqual({ type: 'string', enum: ['google'] });
+    expect(calendar.expectedAccount).toEqual({ type: 'string', enum: ['yangisu12@gmail.com'] });
+    expect(calendar.googleCalendarBindingFile?.type).toBe('string');
   });
 
   it('suppresses OpenClaw startup catch-up outside an exact Seoul hour', () => {
@@ -403,16 +403,15 @@ describe('deployment scripts', () => {
     expect(source).toContain('OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"');
   });
 
-  it('pauses for the stdin-only Naver OAuth lifecycle and validates both private OAuth stores', () => {
+  it('pauses for the stdin-only Google OAuth lifecycle and validates all private Google stores', () => {
     const source = readFileSync(installer, 'utf8');
-    expect(source).toContain('naver-oauth-client naver-oauth-token');
-    expect(source).toContain('oauth configure --client-file');
-    expect(source).toContain('oauth begin --client-file');
-    expect(source).toContain('oauth callback --client-file');
-    expect(source).toContain('oauth status --client-file');
-    expect(source).toContain('--token-file "$SECRET_DIR/naver-oauth-token"');
-    expect(source).toContain('doctor --state');
-    expect(source).not.toMatch(/oauth callback[^\n]*(?:--code(?:\s|=)|--token(?:\s|=)|--client-secret(?:\s|=))/);
+    expect(source).toContain('google-oauth-client google-oauth-token google-calendar-binding');
+    expect(source).toContain('google oauth configure --client-file');
+    expect(source).toContain('google oauth authorize --client-file');
+    expect(source).toContain('google oauth status --client-file');
+    expect(source).toContain('google calendar bootstrap --client-file');
+    expect(source).toContain('--token-file "$SECRET_DIR/google-oauth-token"');
+    expect(source).not.toMatch(/google oauth authorize[^\n]*(?:--code(?:\s|=)|--token(?:\s|=)|--client-secret(?:\s|=))/);
   });
 
   it('accepts only the exact active path reported by openclaw config file across POSIX and Windows forms', () => {
@@ -467,7 +466,7 @@ describe('deployment scripts', () => {
         .replace("bind: 'loopback'", "bind: 'lan'");
       writeFileSync(config, unsafe, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
+      const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('active_config_not_hardened');
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -482,12 +481,10 @@ describe('deployment scripts', () => {
       const configSecretRoot = secretRoot.replaceAll('\\', '/');
       const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
         .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
-        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
-        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal')
         .replace("bind: 'loopback',", "bind: 'loopback',\n    mode: 'local',\n    auth: { mode: 'token', token: '0123456789abcdef0123456789abcdef0123456789abcdef' },");
       writeFileSync(config, baseline, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const accepted = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
+      const accepted = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(accepted.status, accepted.stderr).toBe(0);
 
       const unsafePluginSecret = baseline.replace(
@@ -495,27 +492,18 @@ describe('deployment scripts', () => {
         "timezone: 'Asia/Seoul',\n          token: 'plugin-secret',",
       );
       writeFileSync(config, unsafePluginSecret, { mode: 0o600 });
-      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' }).status).not.toBe(0);
+      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' }).status).not.toBe(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each([
     ['disabled Telegram', (text: string) => text.replace('enabled: true,\n      tokenFile:', 'enabled: false,\n      tokenFile:')],
-    ['CalDAV read enabled before live PoC', (text: string) => text.replace('caldavReadEnabled: false', 'caldavReadEnabled: true')],
-    ['wrong CalDAV secret path', (text: string) => text.replace('/naver-caldav', '/wrong-caldav')],
-    ['wrong Naver client path', (text: string) => text.replace('/naver-oauth-client', '/wrong-client')],
-    ['wrong Naver token path', (text: string) => text.replace('/naver-oauth-token', '/wrong-token')],
-    ['missing calendar mapping', (text: string) => text.replace(/\s*calendarMappings: \[[\s\S]*?\n\s*\],/, '')],
-    ['duplicate calendar API ID', (text: string) => text.replace(
-      "apiCalendarId: 'api-personal'",
-      "apiCalendarId: 'api-personal'",
-    ).replace(
-      "caldavHref: 'https://caldav.calendar.naver.com/collections/personal/'",
-      "caldavHref: 'https://caldav.calendar.naver.com/collections/personal/',\n              },\n              {\n                apiCalendarId: 'api-personal',\n                caldavHref: 'https://caldav.calendar.naver.com/collections/work/'",
-    )],
-    ['cross-origin calendar href', (text: string) => text.replace('https://caldav.calendar.naver.com/collections/personal/', 'https://attacker.example/collections/personal/')],
-    ['base-root calendar href', (text: string) => text.replace('https://caldav.calendar.naver.com/collections/personal/', 'https://caldav.calendar.naver.com/')],
-    ['encoded traversal calendar href', (text: string) => text.replace('collections/personal/', 'collections/%252e%252e/admin/')],
+    ['wrong provider', (text: string) => text.replace("provider: 'google'", "provider: 'naver'")],
+    ['wrong Google client path', (text: string) => text.replace('/google-oauth-client', '/wrong-client')],
+    ['wrong Google token path', (text: string) => text.replace('/google-oauth-token', '/wrong-token')],
+    ['wrong Google binding path', (text: string) => text.replace('/google-calendar-binding', '/wrong-binding')],
+    ['wrong Google account', (text: string) => text.replace('yangisu12@gmail.com', 'other@gmail.com')],
+    ['duplicate secret path', (text: string) => text.replace('/google-oauth-token', '/google-oauth-client')],
     ['placeholder', (text: string) => text.replace("timezone: 'Asia/Seoul'", "timezone: '<replace-timezone>'")],
   ])('rejects %s through the full hardened config contract used by --check', (_label, mutate) => {
     const root = mkdtempSync(resolve(tmpdir(), 'ocpa-check-config-'));
@@ -525,49 +513,23 @@ describe('deployment scripts', () => {
       const secretRoot = resolve(root, 'secrets');
       const configSecretRoot = secretRoot.replaceAll('\\', '/');
       const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
-        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
-        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
-        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal');
+        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot);
       writeFileSync(config, baseline, { mode: 0o600 });
       const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' });
+      const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(valid.status, valid.stderr).toBe(0);
       writeFileSync(config, mutate(baseline), { mode: 0o600 });
-      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, 'disabled'], { encoding: 'utf8' }).status).not.toBe(0);
+      expect(spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' }).status).not.toBe(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
     const checkBlock = readFileSync(installer, 'utf8').split('if [[ "$MODE" == check ]]; then')[1]!.split('\nfi')[0]!;
     expect(checkBlock).toContain('validate_config_file "$ACTIVE_CONFIG_FILE"');
-    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" "$CALDAV_EXPECTATION"');
+    expect(checkBlock).toContain('node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR"');
     expect(checkBlock).not.toMatch(/config patch|gateway install|cron add|mkdir/);
   });
 
-  it('requires the explicit initial or post-live CalDAV mode without accepting flag reordering', () => {
-    const root = mkdtempSync(resolve(tmpdir(), 'ocpa-caldav-mode-'));
-    try {
-      privateDirectory(root);
-      const config = resolve(root, 'openclaw.json5');
-      const secretRoot = resolve(root, 'secrets');
-      const configSecretRoot = secretRoot.replaceAll('\\', '/');
-      const disabled = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
-        .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
-        .replace('OWNER_APPROVED_NAVER_API_CALENDAR_ID', 'api-personal')
-        .replace('OWNER_APPROVED_CALDAV_COLLECTION', 'collections/personal');
-      const enabled = disabled.replace('caldavReadEnabled: false', 'caldavReadEnabled: true');
-      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
-      const validate = (source: string, mode: string) => {
-        writeFileSync(config, source, { mode: 0o600 });
-        return spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot, mode], { encoding: 'utf8' }).status;
-      };
-      expect(validate(disabled, 'disabled')).toBe(0);
-      expect(validate(disabled, 'enabled')).not.toBe(0);
-      expect(validate(enabled, 'enabled')).toBe(0);
-      expect(validate(enabled, 'disabled')).not.toBe(0);
-      expect(validate(disabled, 'anything')).not.toBe(0);
-    } finally { rmSync(root, { recursive: true, force: true }); }
-
-    expect(spawnSync(gitBash, [installer, '--caldav-enabled', '--check'], { cwd: repo }).status).toBe(64);
-    expect(spawnSync(gitBash, [installer, '--check', '--caldav-enabled', '--extra'], { cwd: repo }).status).toBe(64);
-    expect(spawnSync(gitBash, [installer, '--check', '--caldav-enabled'], { cwd: repo }).status).not.toBe(64);
+  it('rejects obsolete CalDAV installer flags', () => {
+    expect(spawnSync(gitBash, [installer, '--check', '--caldav-enabled'], { cwd: repo }).status).toBe(64);
+    expect(spawnSync(gitBash, [installer, '--caldav-enabled'], { cwd: repo }).status).toBe(64);
   });
 
   it('non-live acceptance emits exactly 32 criterion records with live work not verified', () => {
@@ -575,7 +537,7 @@ describe('deployment scripts', () => {
     const result = spawnSync(gitBash, [acceptance, '--non-live'], { cwd: repo, encoding: 'utf8', timeout: 200_000 });
     expect(result.status).toBe(0);
     const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-    expect(summary).toMatchObject({ total: 32, pass: 14, fail: 0, notVerified: 18 });
+    expect(summary).toMatchObject({ total: 32, pass: 15, fail: 0, notVerified: 17 });
     const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
     expect(index.criteria).toHaveLength(32);
     expect(index.criteria.every((item: Record<string, unknown>) =>
@@ -624,7 +586,7 @@ describe('deployment scripts', () => {
       });
       expect(result.status).toBe(2);
       const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
-      expect(summary).toMatchObject({ total: 32, pass: 14, fail: 0, notVerified: 18 });
+      expect(summary).toMatchObject({ total: 32, pass: 15, fail: 0, notVerified: 17 });
       const index = JSON.parse(readFileSync(resolve(repo, summary.index), 'utf8'));
       expect(index.criteria.filter((item: Record<string, unknown>) => item.status === 'NOT_VERIFIED')
         .map((item: Record<string, unknown>) => String(item.criterionId)).sort())
