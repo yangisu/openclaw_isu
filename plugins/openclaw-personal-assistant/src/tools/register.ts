@@ -9,6 +9,7 @@ import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
 import { briefingParameters, createBriefingTool } from './briefing.js';
 import { createResourceTool } from './resource.js';
+import { createStudyTool } from './study.js';
 
 const absoluteWslPath = Type.String({ pattern: '^/(?!.*(?:^|/)\\.\\.(?:/|$)).+' });
 
@@ -36,5 +37,8 @@ export function registerAssistantTools(api: OpenClawPluginApi): void {
   api.registerTool(context => createBriefingTool(api, context), { name: 'assistant_briefing', optional: true });
   api.registerTool(context => createResourceTool(api, context), {
     name: 'assistant_resource_store', optional: true,
+  });
+  api.registerTool(context => createStudyTool(api, context), {
+    name: 'assistant_study_manage', optional: true,
   });
 }

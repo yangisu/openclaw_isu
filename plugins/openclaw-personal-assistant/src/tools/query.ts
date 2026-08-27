@@ -17,6 +17,8 @@ import { SecretFileStore } from '../secrets/file-store.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
 import { ResourceCatalog } from '../resources/catalog.js';
 import type { ResourceSearchHit, StoredResource } from '../resources/types.js';
+import { StudyStore } from '../study/store.js';
+import type { StudyBlock, StudyDayStatus } from '../study/types.js';
 import { WorkspaceRepository } from '../workspace/repository.js';
 import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
 import {
@@ -60,6 +62,8 @@ export const queryParameters = Type.Union([
       maxLength: 14,
     }),
   }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal('study_blocks') }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal('study_day_status') }, { additionalProperties: false }),
 ]);
 
 type QueryParameters = Static<typeof queryParameters>;
@@ -77,6 +81,11 @@ export interface QueryCatalog {
   close(): void;
 }
 
+export interface QueryStudyStore {
+  current(now: Date): StudyDayStatus;
+  close(): void;
+}
+
 export interface CalendarReader {
   listEvents(range: { start: string; end: string }, signal?: AbortSignal): Promise<CalendarEvent[]>;
 }
@@ -86,12 +95,16 @@ export interface QueryToolDependencies {
   openCalendar?: (config: AssistantToolConfig) => CalendarReader;
   openHealth?: (config: AssistantToolConfig) => SubsystemHealthJournal;
   openCatalog?: (config: AssistantToolConfig) => QueryCatalog;
+  openStudyStore?: (config: AssistantToolConfig) => QueryStudyStore;
+  now?: () => Date;
 }
 
 interface QueryResult {
-  kind: 'records' | 'calendar' | 'resource_search' | 'resource_read';
+  kind: 'records' | 'calendar' | 'resource_search' | 'resource_read'
+    | 'study_blocks' | 'study_day_status';
   trust: 'quoted_untrusted_data';
-  items: ParsedRecord[] | CalendarEvent[] | ResourceSearchHit[] | StoredResource[];
+  items: ParsedRecord[] | CalendarEvent[] | ResourceSearchHit[] | StoredResource[]
+    | StudyBlock[] | StudyDayStatus[];
 }
 
 export function createQueryTool(
@@ -129,6 +142,20 @@ export function createQueryTool(
         }
         const items = await calendar.listEvents({ start: params.from, end: params.to }, signal);
         return jsonResult({ kind: 'calendar', trust: 'quoted_untrusted_data', items });
+      }
+
+      if (params.kind === 'study_blocks' || params.kind === 'study_day_status') {
+        const store = (dependencies.openStudyStore ?? openStudyStore)(config);
+        try {
+          const status = store.current((dependencies.now ?? (() => new Date()))());
+          return jsonResult({
+            kind: params.kind,
+            trust: 'quoted_untrusted_data',
+            items: params.kind === 'study_blocks' ? status.blocks : [status],
+          });
+        } finally {
+          store.close();
+        }
       }
 
       const repository = (dependencies.openRepository ?? openRepository)(config);
@@ -171,6 +198,10 @@ function openRepository(config: AssistantToolConfig): QueryRepository {
 
 function openCatalog(config: AssistantToolConfig): QueryCatalog {
   return new ResourceCatalog(config.stateDir);
+}
+
+function openStudyStore(config: AssistantToolConfig): QueryStudyStore {
+  return new StudyStore(config.stateDir);
 }
 
 export function openGoogleCalendarReader(config: AssistantToolConfig): CalendarReader {
