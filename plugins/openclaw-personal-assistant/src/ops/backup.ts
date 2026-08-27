@@ -1259,7 +1259,8 @@ const DEFAULT_PATH_SAFETY: PathSafety = {
       const output = await runExecFileCapture({
         executable: 'powershell.exe',
         args: ['-NoProfile', '-NonInteractive', '-Command',
-          '$p=$args[0];[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)', windowsPath],
+          '$p=$env:OPENCLAW_PS_PATH;[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)'],
+        env: { ...process.env, OPENCLAW_PS_PATH: windowsPath },
         timeoutMs: 10_000,
       });
       return parseWindowsReparseClassification(output);
@@ -1544,7 +1545,8 @@ async function verifyWindowsAclPath(path: string): Promise<void> {
       const output = await runExecFileCapture({
         executable: 'powershell.exe',
         args: ['-NoProfile', '-NonInteractive', '-Command',
-          '$p=$args[0];$a=Get-Acl -LiteralPath $p;$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.Owner;if($o -notmatch "^S-"){$o=([Security.Principal.NTAccount]$o).Translate([Security.Principal.SecurityIdentifier]).Value};$r=@($a.Access|%{$s=$_.IdentityReference;if($s -isnot [Security.Principal.SecurityIdentifier]){$s=$s.Translate([Security.Principal.SecurityIdentifier])};@{sid=$s.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4', windowsPath],
+          '$p=$env:OPENCLAW_PS_PATH;$a=Get-Acl -LiteralPath $p;$u=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$o=$a.Owner;if($o -notmatch "^S-"){$o=([Security.Principal.NTAccount]$o).Translate([Security.Principal.SecurityIdentifier]).Value};$r=@($a.Access|%{$s=$_.IdentityReference;if($s -isnot [Security.Principal.SecurityIdentifier]){$s=$s.Translate([Security.Principal.SecurityIdentifier])};@{sid=$s.Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString()}});@{currentSid=$u;ownerSid=$o;protected=$a.AreAccessRulesProtected;rules=$r}|ConvertTo-Json -Compress -Depth 4'],
+        env: { ...process.env, OPENCLAW_PS_PATH: windowsPath },
         timeoutMs: 10_000,
       });
       validateWindowsBackupAcl(output);
@@ -1593,7 +1595,7 @@ public static class OpenClawBoundDelete {
   public static void Delete(string path, string expected) { using (var h=Open(path, READ_ATTRIBUTES | DELETE, 0)) { var actual=Id(Info(h)); if(actual != expected) throw new IOException("identity mismatch"); var d=new DISPOSITION { DeleteFile=true }; if(!SetFileInformationByHandle(h.DangerousGetHandle(), 4, ref d, (uint)Marshal.SizeOf(typeof(DISPOSITION)))) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); } }
 }
 '@
-if ($args[0] -eq 'capture') { [OpenClawBoundDelete]::Capture($args[1]) } elseif ($args[0] -eq 'delete') { [OpenClawBoundDelete]::Delete($args[1], $args[2]) } else { throw 'invalid operation' }
+if ($env:OPENCLAW_PS_ACTION -eq 'capture') { [OpenClawBoundDelete]::Capture($env:OPENCLAW_PS_PATH) } elseif ($env:OPENCLAW_PS_ACTION -eq 'delete') { [OpenClawBoundDelete]::Delete($env:OPENCLAW_PS_PATH, $env:OPENCLAW_PS_EXPECTED) } else { throw 'invalid operation' }
 `;
 
 async function windowsNtfsPath(path: string): Promise<{ executable: string; path: string } | undefined> {
@@ -1617,7 +1619,8 @@ const defaultIdentityBoundDeleter: IdentityBoundDeleter = {
     if (!target) throw new BackupError('retention_identity_delete_unavailable', 'Identity-bound deletion is unavailable for this backup filesystem');
     try {
       const output = (await runExecFileCapture({ executable: target.executable,
-        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT, 'capture', target.path], timeoutMs: 10_000 })).trim();
+        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT],
+        env: { ...process.env, OPENCLAW_PS_ACTION: 'capture', OPENCLAW_PS_PATH: target.path }, timeoutMs: 10_000 })).trim();
       return parseNtfsFileIdentity(output);
     } catch { throw new BackupError('retention_identity_delete_unavailable', 'Authoritative NTFS file identity could not be captured'); }
   },
@@ -1626,7 +1629,9 @@ const defaultIdentityBoundDeleter: IdentityBoundDeleter = {
     if (!target) throw new BackupError('retention_identity_delete_unavailable', 'Identity-bound deletion is unavailable for this backup filesystem');
     try {
       await runExecFileCapture({ executable: target.executable,
-        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT, 'delete', target.path, `${expected.volumeId}|${expected.fileId}`], timeoutMs: 10_000 });
+        args: ['-NoProfile', '-NonInteractive', '-Command', NTFS_IDENTITY_DELETE_SCRIPT],
+        env: { ...process.env, OPENCLAW_PS_ACTION: 'delete', OPENCLAW_PS_PATH: target.path,
+          OPENCLAW_PS_EXPECTED: `${expected.volumeId}|${expected.fileId}` }, timeoutMs: 10_000 });
     } catch { throw new BackupError('retention_identity_changed', 'NTFS identity-bound deletion failed closed'); }
   },
 };

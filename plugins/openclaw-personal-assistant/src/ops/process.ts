@@ -13,6 +13,7 @@ export interface ExecFileRequest {
   executable: string;
   args: readonly string[];
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -27,6 +28,7 @@ export function runExecFileCapture(request: ExecFileRequest): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = execFile(request.executable, [...request.args], {
       ...(request.cwd ? { cwd: request.cwd } : {}),
+      ...(request.env ? { env: request.env } : {}),
       timeout: timeoutMs,
       maxBuffer: 64 * 1024,
       shell: false,
