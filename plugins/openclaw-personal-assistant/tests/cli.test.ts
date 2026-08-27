@@ -214,6 +214,143 @@ describe('operational CLI', () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(callback.stdout).toEqual([]);
   });
+
+  it('imports Google Desktop credentials and reports token status without exposing secrets or using network', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-google-oauth-cli-'));
+    const clientFile = join(root, 'google-client');
+    const tokenFile = join(root, 'google-token');
+    const state = join(root, 'state');
+    const credentials = new CliMemoryStore<unknown>();
+    const tokens = new CliMemoryStore<unknown>({
+      version: 1, accessToken: 'private-access', refreshToken: 'private-refresh',
+      expiresAt: '2030-01-01T01:00:00.000Z',
+      scope: 'https://www.googleapis.com/auth/calendar.app.created',
+    });
+    const fetch = vi.fn();
+    const inputSecret = 'private-google-client-secret';
+    const configured = capture(JSON.stringify({ installed: {
+      client_id: 'client.apps.googleusercontent.com', client_secret: inputSecret,
+      project_id: 'openclaw-personal', auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+      token_uri: 'https://oauth2.googleapis.com/token',
+      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+      redirect_uris: ['http://localhost'],
+    } }));
+    const dependencies: CliDependencies = {
+      googleCredentialStore: () => credentials,
+      googleTokenStore: () => tokens as never,
+      googleFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+    };
+
+    expect(await runCli(['google', 'oauth', 'configure', '--client-file', clientFile], configured.io, dependencies)).toBe(0);
+    expect(credentials.value).toEqual({
+      version: 1, clientId: 'client.apps.googleusercontent.com', clientSecret: inputSecret,
+    });
+    const status = capture();
+    expect(await runCli([
+      'google', 'oauth', 'status', '--client-file', clientFile, '--token-file', tokenFile, '--state', state,
+    ], status.io, dependencies)).toBe(0);
+    expect(JSON.parse(status.stdout[0]!)).toEqual({
+      status: 'fresh', expiresAt: '2030-01-01T01:00:00.000Z', redactedErrorCode: null,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect([...configured.stdout, ...status.stdout, ...configured.stderr, ...status.stderr].join('\n'))
+      .not.toMatch(/private-google-client-secret|private-access|private-refresh/);
+  });
+
+  it('creates the dedicated Google calendar once and verifies the stored binding on rerun', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-google-calendar-cli-'));
+    const clientFile = join(root, 'google-client');
+    const tokenFile = join(root, 'google-token');
+    const bindingFile = join(root, 'google-binding');
+    const state = join(root, 'state');
+    const credentials = new CliMemoryStore<unknown>({
+      version: 1, clientId: 'client.apps.googleusercontent.com', clientSecret: 'private-secret',
+    });
+    const tokens = new CliMemoryStore<unknown>({
+      version: 1, accessToken: 'private-access', refreshToken: 'private-refresh',
+      expiresAt: '2030-01-01T01:00:00.000Z',
+      scope: 'https://www.googleapis.com/auth/calendar.app.created',
+    });
+    const binding = new CliMemoryStore<unknown>();
+    const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') return new Response(JSON.stringify({
+        id: 'created@group.calendar.google.com', summary: 'openclaw_cal', timeZone: 'Asia/Seoul',
+      }), { status: 200 });
+      expect(decodeURIComponent(String(input))).toContain('/calendars/created@group.calendar.google.com');
+      return new Response(JSON.stringify({
+        id: 'created@group.calendar.google.com', summary: 'openclaw_cal', timeZone: 'Asia/Seoul',
+      }), { status: 200 });
+    });
+    const dependencies: CliDependencies = {
+      googleCredentialStore: () => credentials,
+      googleTokenStore: () => tokens as never,
+      googleBindingStore: () => binding as never,
+      googleBindingExists: () => binding.value !== undefined,
+      googleFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+    };
+    const args = [
+      'google', 'calendar', 'bootstrap', '--client-file', clientFile, '--token-file', tokenFile,
+      '--binding-file', bindingFile, '--state', state,
+    ];
+
+    expect(await runCli(args, capture().io, dependencies)).toBe(0);
+    expect(binding.value).toEqual({
+      version: 1, calendarId: 'created@group.calendar.google.com', summary: 'openclaw_cal',
+      timeZone: 'Asia/Seoul', createdAt: '2030-01-01T00:00:00.000Z',
+    });
+    expect(await runCli(args, capture().io, dependencies)).toBe(0);
+    expect(fetch.mock.calls.filter(call => call[1]?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('runs a zero-residue Google Calendar create-update-delete PoC', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ocpa-google-poc-cli-'));
+    const bindingValue = {
+      version: 1 as const, calendarId: 'created@group.calendar.google.com', summary: 'openclaw_cal' as const,
+      timeZone: 'Asia/Seoul' as const, createdAt: '2030-01-01T00:00:00.000Z',
+    };
+    const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = decodeURIComponent(String(input));
+      if (!url.includes('/events')) return new Response(JSON.stringify({
+        id: bindingValue.calendarId, summary: bindingValue.summary, timeZone: bindingValue.timeZone,
+      }), { status: 200 });
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 });
+      if (init?.method === 'GET') return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      const body = JSON.parse(String(init?.body));
+      const eventId = url.split('/events/')[1] ?? body.id;
+      return new Response(JSON.stringify({
+        id: eventId, etag: init?.method === 'PATCH' ? '"etag-2"' : '"etag-1"',
+        status: 'confirmed', summary: body.summary,
+        start: body.start ?? { dateTime: '2030-01-01T01:00:00.000Z' },
+        end: body.end ?? { dateTime: '2030-01-01T02:00:00.000Z' },
+      }), { status: 200 });
+    });
+    const dependencies: CliDependencies = {
+      googleCredentialStore: () => new CliMemoryStore({
+        version: 1 as const, clientId: 'client.apps.googleusercontent.com', clientSecret: 'private-secret',
+      }),
+      googleTokenStore: () => new CliMemoryStore({
+        version: 1 as const, accessToken: 'private-access', refreshToken: 'private-refresh',
+        expiresAt: '2030-01-01T01:00:00.000Z',
+        scope: 'https://www.googleapis.com/auth/calendar.app.created' as const,
+      }),
+      googleBindingStore: () => new CliMemoryStore(bindingValue),
+      googleBindingExists: () => true,
+      googleFetch: fetch,
+      now: () => Date.parse('2030-01-01T00:00:00.123Z'),
+    };
+    const output = capture();
+    expect(await runCli([
+      'google', 'calendar', 'poc', '--client-file', join(root, 'client'), '--token-file', join(root, 'token'),
+      '--binding-file', join(root, 'binding'), '--state', join(root, 'state'),
+    ], output.io, dependencies)).toBe(0);
+    expect(JSON.parse(output.stdout[0]!)).toEqual({
+      status: 'PASS', created: true, updated: true, deleted: true, remaining: 0, redactedErrorCode: null,
+    });
+    expect(fetch.mock.calls.map(call => call[1]?.method)).toEqual(['GET', 'POST', 'PATCH', 'DELETE', 'GET']);
+    expect(output.stdout.join('\n')).not.toMatch(/private-secret|private-access|private-refresh/);
+  });
   it('initializes only private directories and non-secret templates without overwriting data', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ocpa-cli-'));
     const out = capture();

@@ -1,4 +1,5 @@
 import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import { join } from 'node:path';
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
@@ -7,8 +8,12 @@ import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
 import { Type, type Static } from 'typebox';
 import { Value } from 'typebox/value';
 
-import { CalDavClient } from '../calendar/caldav.js';
+import { GoogleCalendarApi, validateGoogleCalendarBinding } from '../calendar/google-api.js';
+import {
+  GoogleOAuth, validateGoogleOAuthClientCredentials, type GoogleTokenSet,
+} from '../calendar/google-oauth.js';
 import type { CalendarEvent } from '../calendar/ical.js';
+import { SecretFileStore } from '../secrets/file-store.js';
 import type { ParsedRecord, RecordKind } from '../domain.js';
 import { WorkspaceRepository } from '../workspace/repository.js';
 import { SubsystemHealthStore, type SubsystemHealthJournal } from '../state/health.js';
@@ -16,7 +21,7 @@ import {
   AssistantToolError,
   assertOwner,
   loadConfigFromApi,
-  requireCalendarReadConfig,
+  requireGoogleCalendarConfig,
   type AssistantToolConfig,
 } from './trust.js';
 
@@ -73,7 +78,7 @@ export function createQueryTool(
   return {
     name: 'assistant_query',
     label: 'Assistant Query',
-    description: 'Read owner-scoped local records or Naver CalDAV events as quoted untrusted data.',
+    description: 'Read owner-scoped local records or the dedicated Google calendar as quoted untrusted data.',
     parameters: queryParameters,
     async execute(_toolCallId, params, signal) {
       const config = loadConfigFromApi(api);
@@ -87,13 +92,13 @@ export function createQueryTool(
         validateRange(params.from, params.to);
         let calendar: CalendarReader;
         try {
-          calendar = (dependencies.openCalendar ?? openCalendar)(config);
+          calendar = (dependencies.openCalendar ?? openGoogleCalendarReader)(config);
         } catch (error) {
-          if (error instanceof AssistantToolError && error.code === 'caldav_read_disabled') {
+          if (error instanceof AssistantToolError) {
             const health = (dependencies.openHealth ?? (scoped => new SubsystemHealthStore(scoped.stateDir)))(config);
             try {
-              health.report({ target: 'naver-caldav', errorCode: error.code,
-                message: 'Calendar reads are disabled pending authorized live validation' });
+              health.report({ target: 'google-calendar', errorCode: error.code,
+                message: 'Google Calendar is unavailable' });
             } finally { health.close(); }
           }
           throw error;
@@ -121,14 +126,30 @@ function openRepository(config: AssistantToolConfig): QueryRepository {
   return new WorkspaceRepository(config);
 }
 
-function openCalendar(config: AssistantToolConfig): CalendarReader {
-  const calendar = requireCalendarReadConfig(config);
-  const client = new CalDavClient({
-    baseUrl: calendar.caldavBaseUrl,
-    secretFile: calendar.caldavSecretFile,
-    calendarMappings: calendar.calendarMappings,
-  });
-  return { listEvents: (range, signal) => client.listMappedEvents(range, signal) };
+export function openGoogleCalendarReader(config: AssistantToolConfig): CalendarReader {
+  const calendar = requireGoogleCalendarConfig(config);
+  const credentialStore = new SecretFileStore<unknown>(calendar.googleOAuthClientFile, 16_384);
+  const tokenStore = new SecretFileStore<GoogleTokenSet>(calendar.googleTokenFile, 32_768);
+  const bindingStore = new SecretFileStore<unknown>(calendar.googleCalendarBindingFile, 16_384);
+  let clientPromise: Promise<GoogleCalendarApi> | undefined;
+  const client = async (): Promise<GoogleCalendarApi> => {
+    clientPromise ??= Promise.all([credentialStore.read(), bindingStore.read()]).then(([rawCredentials, rawBinding]) => {
+      const credentials = validateGoogleOAuthClientCredentials(rawCredentials);
+      const oauth = new GoogleOAuth({
+        clientId: credentials.clientId,
+        clientSecret: credentials.clientSecret,
+        expectedAccount: calendar.expectedAccount,
+        stateDbPath: join(config.stateDir, 'google-oauth-state.sqlite3'),
+        tokenStore,
+      });
+      return new GoogleCalendarApi({
+        binding: validateGoogleCalendarBinding(rawBinding),
+        accessToken: () => oauth.getValidAccessToken(),
+      });
+    });
+    return clientPromise;
+  };
+  return { listEvents: async (range, signal) => (await client()).listEvents(range, signal) };
 }
 
 function validateRange(from: string, to: string): void {

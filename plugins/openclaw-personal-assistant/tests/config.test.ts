@@ -11,19 +11,24 @@ const validConfig = {
 } as const;
 
 describe('loadConfig', () => {
-  it('loads calendarMappings through the hardened plugin config boundary', () => {
+  it('loads the exact Google calendar configuration through the hardened plugin config boundary', () => {
     const loaded = loadConfigFromApi({ pluginConfig: {
       ...validConfig,
       calendar: {
-        caldavBaseUrl: 'https://caldav.example.test/',
-        caldavSecretFile: '/home/user/.openclaw/secrets/caldav',
-        naverTokenFile: '/home/user/.openclaw/secrets/oauth',
-        calendarMappings: [{ apiCalendarId: 'api-personal', caldavHref: '/collections/personal/' }],
+        provider: 'google',
+        googleOAuthClientFile: '/home/user/.openclaw/secrets/google-oauth-client',
+        googleTokenFile: '/home/user/.openclaw/secrets/google-oauth-token',
+        googleCalendarBindingFile: '/home/user/.openclaw/secrets/google-calendar-binding',
+        expectedAccount: 'yangisu12@gmail.com',
       },
     } } as never);
-    expect(loaded.calendar?.calendarMappings).toEqual([
-      { apiCalendarId: 'api-personal', caldavHref: 'https://caldav.example.test/collections/personal/' },
-    ]);
+    expect(loaded.calendar).toEqual({
+      provider: 'google',
+      googleOAuthClientFile: '/home/user/.openclaw/secrets/google-oauth-client',
+      googleTokenFile: '/home/user/.openclaw/secrets/google-oauth-token',
+      googleCalendarBindingFile: '/home/user/.openclaw/secrets/google-calendar-binding',
+      expectedAccount: 'yangisu12@gmail.com',
+    });
   });
 
   it('loads explicit API IDs mapped to exact canonical same-origin collection URLs', () => {

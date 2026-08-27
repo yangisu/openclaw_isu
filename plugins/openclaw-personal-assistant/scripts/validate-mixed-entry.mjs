@@ -2,8 +2,7 @@ import entry from '../dist/index.js';
 
 const expectedTools = [
   'assistant_briefing',
-  'assistant_calendar_confirm',
-  'assistant_calendar_prepare',
+  'assistant_calendar_manage',
   'assistant_mutate',
   'assistant_query',
 ];
@@ -19,6 +18,13 @@ const api = {
     backupDir: '/private/backups',
     telegramUserId: '123456789',
     timezone: 'Asia/Seoul',
+    calendar: {
+      provider: 'google',
+      googleOAuthClientFile: '/private/secrets/google-oauth-client',
+      googleTokenFile: '/private/secrets/google-oauth-token',
+      googleCalendarBindingFile: '/private/secrets/google-calendar-binding',
+      expectedAccount: 'yangisu12@gmail.com',
+    },
   },
   registerTool(tool, options) { tools.push({ tool, options }); },
   registerService(service) { services.push(service); },
@@ -33,9 +39,8 @@ entry.register(api);
 const actualTools = tools.map(({ options }) => options?.name).sort();
 if (JSON.stringify(actualTools) !== JSON.stringify(expectedTools) ||
     tools.some(({ options }) => options?.optional !== true) ||
-    services.length !== 1 || services[0]?.id !== 'openclaw-personal-assistant-calendar-recovery' ||
-    commands.length !== 1 || commands[0]?.name !== 'assistant-confirm' ||
-    commands[0]?.requireAuth !== true || commands[0]?.exposeSenderIsOwner !== true ||
+    services.length !== 0 ||
+    commands.length !== 0 ||
     hooks.length !== 0) {
   throw new Error('mixed_entry_registration_invalid');
 }

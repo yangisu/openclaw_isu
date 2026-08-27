@@ -3,6 +3,7 @@
 
 import { chmod, lstat, mkdir, open, readFile, realpath, stat } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,6 +18,18 @@ import {
 } from './calendar/oauth.js';
 import { SecretFileStore } from './secrets/file-store.js';
 import { runMaintenanceFromConfig, validateMaintenanceConfigFromFile } from './ops/maintenance.js';
+import {
+  GoogleOAuth,
+  parseGoogleDesktopCredentials,
+  validateGoogleOAuthClientCredentials,
+  validateGoogleTokenSet,
+  type GoogleTokenSet,
+} from './calendar/google-oauth.js';
+import {
+  GoogleCalendarApi,
+  validateGoogleCalendarBinding,
+  type GoogleCalendarBinding,
+} from './calendar/google-api.js';
 
 export interface CliIo {
   stdout(value: string): void;
@@ -29,6 +42,11 @@ export interface CliDependencies {
   credentialStore?: (path: string) => SecretStore<unknown>;
   tokenStore?: (path: string) => SecretStore<NaverTokenSet>;
   oauthFetch?: FetchLike;
+  googleCredentialStore?: (path: string) => SecretStore<unknown>;
+  googleTokenStore?: (path: string) => SecretStore<GoogleTokenSet>;
+  googleBindingStore?: (path: string) => SecretStore<GoogleCalendarBinding>;
+  googleBindingExists?: (path: string) => boolean | Promise<boolean>;
+  googleFetch?: FetchLike;
   now?: () => number;
   maintenanceRunner?: typeof runMaintenanceFromConfig;
   maintenanceConfigChecker?: typeof validateMaintenanceConfigFromFile;
@@ -60,10 +78,11 @@ export async function runCli(
     if (command === 'poc') return await poc(rest, io);
     if (command === 'doctor') return await doctor(rest, io, dependencies);
     if (command === 'oauth') return await oauth(rest, io, dependencies);
+    if (command === 'google') return await google(rest, io, dependencies);
     if (command === 'backup') return await backup(rest, io);
     if (command === 'restore') return await restore(rest, io);
     if (command === 'maintenance') return await maintenance(rest, io, dependencies);
-    throw usageError('expected init, poc, doctor, oauth, backup, restore, or maintenance');
+    throw usageError('expected init, poc, doctor, oauth, google, backup, restore, or maintenance');
   } catch (error) {
     const code = safeErrorCode(error);
     io.stderr(JSON.stringify({ status: 'error', redactedErrorCode: code }));
@@ -71,6 +90,232 @@ export async function runCli(
     return code === 'cli_usage' || code.startsWith('path_') ? EXIT.usage : EXIT.operation;
   }
 }
+
+async function google(args: readonly string[], io: CliIo, dependencies: CliDependencies): Promise<number> {
+  const [group, action, ...optionArgs] = args;
+  if (group === 'oauth') return googleOAuth(String(action), optionArgs, io, dependencies);
+  if (group === 'calendar') return googleCalendar(String(action), optionArgs, io, dependencies);
+  throw usageError('expected google oauth or google calendar');
+}
+
+async function googleOAuth(
+  action: string,
+  args: readonly string[],
+  io: CliIo,
+  dependencies: CliDependencies,
+): Promise<number> {
+  if (action === 'configure') {
+    const options = parseOptions(args, ['client-file']);
+    const clientFile = requiredAbsolute(options, 'client-file');
+    let parsed: unknown;
+    try { parsed = JSON.parse(await readPrivateInput(io)); }
+    catch { throw usageError('invalid Google OAuth credential input'); }
+    const credentials = parseGoogleDesktopCredentials(parsed);
+    await googleCredentialStore(clientFile, dependencies).write(credentials);
+    io.stdout(JSON.stringify({ status: 'configured', redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  if (action === 'status') {
+    const options = parseOptions(args, ['client-file', 'token-file', 'state']);
+    const clientFile = requiredAbsolute(options, 'client-file');
+    const tokenFile = requiredAbsolute(options, 'token-file');
+    requiredAbsolute(options, 'state');
+    try {
+      validateGoogleOAuthClientCredentials(await googleCredentialStore(clientFile, dependencies).read());
+      const tokens = validateGoogleTokenSet(await googleTokenStore(tokenFile, dependencies).read());
+      const now = dependencies.now?.() ?? Date.now();
+      const status = Date.parse(tokens.expiresAt) - now > 5 * 60_000 ? 'fresh' : 'refreshable';
+      io.stdout(JSON.stringify({ status, expiresAt: tokens.expiresAt, redactedErrorCode: null }));
+      return EXIT.ok;
+    } catch (error) {
+      io.stdout(JSON.stringify({ status: 'unusable', expiresAt: null, redactedErrorCode: safeErrorCode(error) }));
+      return EXIT.gateClosed;
+    }
+  }
+  if (action === 'authorize') {
+    const options = parseOptions(args, ['client-file', 'token-file', 'state']);
+    const clientFile = requiredAbsolute(options, 'client-file');
+    const tokenFile = requiredAbsolute(options, 'token-file');
+    const stateDir = requiredAbsolute(options, 'state');
+    await preparePrivateStateDirectory(stateDir);
+    const credentials = validateGoogleOAuthClientCredentials(
+      await googleCredentialStore(clientFile, dependencies).read(),
+    );
+    const tokenStore = googleTokenStore(tokenFile, dependencies);
+    const oauth = new GoogleOAuth({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      expectedAccount: 'yangisu12@gmail.com',
+      stateDbPath: join(stateDir, 'google-oauth-state.sqlite3'),
+      tokenStore,
+      ...(dependencies.googleFetch === undefined ? {} : { fetch: dependencies.googleFetch }),
+      ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    });
+    await authorizeWithLoopback(oauth, io);
+    return EXIT.ok;
+  }
+  if (action === 'revoke') {
+    const options = parseOptions(args, ['client-file', 'token-file', 'state']);
+    const clientFile = requiredAbsolute(options, 'client-file');
+    const tokenFile = requiredAbsolute(options, 'token-file');
+    const stateDir = requiredAbsolute(options, 'state');
+    const credentials = validateGoogleOAuthClientCredentials(
+      await googleCredentialStore(clientFile, dependencies).read(),
+    );
+    const oauth = new GoogleOAuth({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      expectedAccount: 'yangisu12@gmail.com',
+      stateDbPath: join(stateDir, 'google-oauth-state.sqlite3'),
+      tokenStore: googleTokenStore(tokenFile, dependencies),
+      ...(dependencies.googleFetch === undefined ? {} : { fetch: dependencies.googleFetch }),
+      ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+    });
+    await oauth.revoke();
+    io.stdout(JSON.stringify({ status: 'revoked', redactedErrorCode: null }));
+    return EXIT.ok;
+  }
+  throw usageError('unsupported Google OAuth action');
+}
+
+async function googleCalendar(
+  action: string,
+  args: readonly string[],
+  io: CliIo,
+  dependencies: CliDependencies,
+): Promise<number> {
+  if (!['bootstrap', 'poc'].includes(action)) throw usageError('unsupported Google Calendar action');
+  const options = parseOptions(args, ['client-file', 'token-file', 'binding-file', 'state']);
+  const clientFile = requiredAbsolute(options, 'client-file');
+  const tokenFile = requiredAbsolute(options, 'token-file');
+  const bindingFile = requiredAbsolute(options, 'binding-file');
+  const stateDir = requiredAbsolute(options, 'state');
+  await preparePrivateStateDirectory(stateDir);
+  const credentials = validateGoogleOAuthClientCredentials(
+    await googleCredentialStore(clientFile, dependencies).read(),
+  );
+  const oauth = new GoogleOAuth({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    expectedAccount: 'yangisu12@gmail.com',
+    stateDbPath: join(stateDir, 'google-oauth-state.sqlite3'),
+    tokenStore: googleTokenStore(tokenFile, dependencies),
+    ...(dependencies.googleFetch === undefined ? {} : { fetch: dependencies.googleFetch }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+  });
+  const bindingStore = googleBindingStore(bindingFile, dependencies);
+  const exists = dependencies.googleBindingExists
+    ? await dependencies.googleBindingExists(bindingFile)
+    : await lstat(bindingFile).then(info => info.isFile() && !info.isSymbolicLink()).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    });
+  const existingBinding = exists ? validateGoogleCalendarBinding(await bindingStore.read()) : undefined;
+  const api = await GoogleCalendarApi.bootstrap({
+    accessToken: () => oauth.getValidAccessToken(),
+    bindingStore,
+    ...(existingBinding === undefined ? {} : { existingBinding }),
+    ...(dependencies.googleFetch === undefined ? {} : { fetch: dependencies.googleFetch }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+  });
+  if (action === 'bootstrap') {
+    io.stdout(JSON.stringify({
+      status: 'ready', calendarSummary: api.binding.summary,
+      timeZone: api.binding.timeZone, redactedErrorCode: null,
+    }));
+    return EXIT.ok;
+  }
+  return googleCalendarPoc(api, io, dependencies.now?.() ?? Date.now());
+}
+
+function googleCredentialStore(path: string, dependencies: CliDependencies): SecretStore<unknown> {
+  return dependencies.googleCredentialStore?.(path) ?? new SecretFileStore<unknown>(path, 16_384);
+}
+
+function googleTokenStore(path: string, dependencies: CliDependencies): SecretStore<GoogleTokenSet> {
+  return dependencies.googleTokenStore?.(path) ?? new SecretFileStore<GoogleTokenSet>(path, 32_768);
+}
+
+function googleBindingStore(path: string, dependencies: CliDependencies): SecretStore<GoogleCalendarBinding> {
+  return dependencies.googleBindingStore?.(path) ?? new SecretFileStore<GoogleCalendarBinding>(path, 16_384);
+}
+
+async function authorizeWithLoopback(oauth: GoogleOAuth, io: CliIo): Promise<void> {
+  let settle: (() => void) | undefined;
+  let fail: ((error: unknown) => void) | undefined;
+  const completed = new Promise<void>((resolvePromise, reject) => { settle = resolvePromise; fail = reject; });
+  const server = createServer(async (request, response) => {
+    try {
+      if (request.method !== 'GET' || !request.url) throw usageError('invalid Google OAuth callback');
+      const address = server.address();
+      if (!address || typeof address === 'string') throw usageError('invalid Google OAuth listener');
+      const callbackUrl = new URL(request.url, `http://127.0.0.1:${address.port}`).href;
+      await oauth.handleCallback(callbackUrl);
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><meta charset="utf-8"><title>OpenClaw</title><p>Google Calendar authorization completed. You may close this tab.</p>');
+      settle?.();
+    } catch (error) {
+      response.writeHead(400, { 'content-type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><meta charset="utf-8"><title>OpenClaw</title><p>Authorization failed. Return to the terminal.</p>');
+      fail?.(error);
+    }
+  });
+  try {
+    await new Promise<void>((resolvePromise, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolvePromise);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw usageError('invalid Google OAuth listener');
+    const authorization = oauth.begin(`http://127.0.0.1:${address.port}/google/callback`);
+    io.stdout(JSON.stringify({
+      status: 'authorization_required',
+      authorizationUrl: authorization.authorizationUrl,
+      expiresAt: authorization.expiresAt,
+      redactedErrorCode: null,
+    }));
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        completed,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(Object.assign(new Error('Google OAuth authorization timed out'), { code: 'google_oauth_timeout' })),
+            10 * 60_000,
+          );
+          timeout.unref();
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+    io.stdout(JSON.stringify({ status: 'authorized', redactedErrorCode: null }));
+  } finally {
+    await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+  }
+}
+
+async function googleCalendarPoc(api: GoogleCalendarApi, io: CliIo, now: number): Promise<number> {
+  const exactSecond = Math.floor(now / 1_000) * 1_000;
+  const suffix = Math.floor(exactSecond / 1_000).toString(16).padStart(16, '0');
+  const eventId = `oc${suffix}${suffix}`.slice(0, 34);
+  const start = new Date(exactSecond + 60 * 60_000).toISOString();
+  const end = new Date(exactSecond + 2 * 60 * 60_000).toISOString();
+  const created = await api.createEvent({ eventId, summary: '[OpenClaw PoC]', dtstart: start, dtend: end });
+  const updated = await api.updateEvent(eventId, created.etag, { summary: '[OpenClaw PoC updated]' });
+  await api.deleteEvent(eventId, updated.etag);
+  const remaining = (await api.listEvents({
+    start: new Date(exactSecond).toISOString(), end: new Date(exactSecond + 24 * 60 * 60_000).toISOString(),
+  })).filter(event => event.eventId === eventId).length;
+  if (remaining !== 0) {
+    throw Object.assign(new Error('Google Calendar PoC residue remains'), { code: 'calendar_poc_residue' });
+  }
+  io.stdout(JSON.stringify({
+    status: 'PASS', created: true, updated: true, deleted: true, remaining: 0, redactedErrorCode: null,
+  }));
+  return EXIT.ok;
+}
+
 
 async function oauth(args: readonly string[], io: CliIo, dependencies: CliDependencies): Promise<number> {
   const [action, ...optionArgs] = args;

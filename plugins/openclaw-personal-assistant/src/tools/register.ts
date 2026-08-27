@@ -3,10 +3,7 @@ import { Type } from 'typebox';
 
 import { TELEGRAM_USER_ID_PATTERN } from '../telegram-user-id.js';
 import {
-  calendarConfirmParameters,
-  calendarPrepareParameters,
-  createCalendarConfirmTool,
-  createCalendarPrepareTool,
+  createCalendarManageTool,
 } from './calendar.js';
 import { createMutationTool, mutationParameters } from './mutate.js';
 import { createQueryTool, queryParameters } from './query.js';
@@ -21,26 +18,19 @@ export const configSchema = Type.Object({
   telegramUserId: Type.String({ pattern: TELEGRAM_USER_ID_PATTERN, maxLength: 19 }),
   timezone: Type.Literal('Asia/Seoul'),
   calendar: Type.Optional(Type.Object({
-    caldavReadEnabled: Type.Optional(Type.Boolean()),
-    caldavBaseUrl: Type.Optional(Type.String({ pattern: '^https://' })),
-    caldavSecretFile: Type.Optional(absoluteWslPath),
-    naverOAuthClientFile: Type.Optional(absoluteWslPath),
-    naverTokenFile: Type.Optional(absoluteWslPath),
-    calendarMappings: Type.Optional(Type.Array(Type.Object({
-      apiCalendarId: Type.String({ minLength: 1, maxLength: 1024 }),
-      caldavHref: Type.String({ minLength: 1, maxLength: 4096 }),
-    }, { additionalProperties: false }), { minItems: 1, maxItems: 10 })),
+    provider: Type.Literal('google'),
+    googleOAuthClientFile: absoluteWslPath,
+    googleTokenFile: absoluteWslPath,
+    googleCalendarBindingFile: absoluteWslPath,
+    expectedAccount: Type.Literal('yangisu12@gmail.com'),
   }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
 export function registerAssistantTools(api: OpenClawPluginApi): void {
   api.registerTool(context => createQueryTool(api, context), { name: 'assistant_query', optional: true });
   api.registerTool(context => createMutationTool(api, context), { name: 'assistant_mutate', optional: true });
-  api.registerTool(context => createCalendarPrepareTool(api, context), {
-    name: 'assistant_calendar_prepare', optional: true,
-  });
-  api.registerTool(context => createCalendarConfirmTool(api, context), {
-    name: 'assistant_calendar_confirm', optional: true,
+  api.registerTool(context => createCalendarManageTool(api, context), {
+    name: 'assistant_calendar_manage', optional: true,
   });
   api.registerTool(context => createBriefingTool(api, context), { name: 'assistant_briefing', optional: true });
 }

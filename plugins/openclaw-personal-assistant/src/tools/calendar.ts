@@ -1,4 +1,5 @@
 import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type {
   OpenClawPluginApi,
@@ -29,9 +30,25 @@ import {
 } from '../calendar/outbox.js';
 import { SecretFileStore } from '../secrets/file-store.js';
 import {
+  GoogleCalendarApi,
+  GoogleCalendarError,
+  validateGoogleCalendarBinding,
+  type GoogleCalendarEvent,
+  type GoogleEventMutation,
+  type GoogleEventPatch,
+} from '../calendar/google-api.js';
+import { GoogleCalendarLedger, type MutationRecord } from '../calendar/google-ledger.js';
+import {
+  GoogleOAuth,
+  validateGoogleOAuthClientCredentials,
+  type GoogleOAuthClientCredentials,
+  type GoogleTokenSet,
+} from '../calendar/google-oauth.js';
+import {
   AssistantToolError,
   assertOwner,
   loadConfigFromApi,
+  requireGoogleCalendarConfig,
   requireCalendarWriteConfig,
   type AssistantToolConfig,
 } from './trust.js';
@@ -257,4 +274,220 @@ export async function createCalendarWriteApi(
     accessToken,
     ...(dependencies.calendarFetch === undefined ? {} : { fetch: dependencies.calendarFetch }),
   });
+}
+
+const googleEventIdSchema = Type.String({ pattern: '^[A-Za-z0-9_-]{1,1024}$', maxLength: 1024 });
+const googleEtagSchema = Type.String({ pattern: '^"[^"\\r\\n]{1,1022}"$', maxLength: 1024 });
+
+const calendarCreateParameters = Type.Object({
+  action: Type.Literal('create'),
+  requestId: uuidSchema,
+  summary: Type.String({ minLength: 1, maxLength: 1000 }),
+  dtstart: eventDateSchema,
+  dtend: eventDateSchema,
+  location: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
+  description: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
+  rrule: Type.Optional(recurrenceSchema),
+}, { additionalProperties: false });
+
+const calendarUpdateParameters = Type.Object({
+  action: Type.Literal('update'),
+  requestId: uuidSchema,
+  eventId: googleEventIdSchema,
+  etag: googleEtagSchema,
+  summary: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
+  dtstart: Type.Optional(eventDateSchema),
+  dtend: Type.Optional(eventDateSchema),
+  location: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 1000 }), Type.Null()])),
+  description: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 8000 }), Type.Null()])),
+  rrule: Type.Optional(Type.Union([recurrenceSchema, Type.Null()])),
+}, { additionalProperties: false });
+
+const calendarDeleteParameters = Type.Object({
+  action: Type.Literal('delete'),
+  requestId: uuidSchema,
+  eventId: googleEventIdSchema,
+  etag: googleEtagSchema,
+}, { additionalProperties: false });
+
+export const calendarManageParameters = Type.Union([
+  calendarCreateParameters, calendarUpdateParameters, calendarDeleteParameters,
+]);
+
+type CalendarManageParameters = Static<typeof calendarManageParameters>;
+
+export interface CalendarManageApi {
+  createEvent(input: GoogleEventMutation, signal?: AbortSignal): Promise<GoogleCalendarEvent>;
+  getEvent(eventId: string, signal?: AbortSignal): Promise<GoogleCalendarEvent>;
+  updateEvent(eventId: string, etag: string, patch: GoogleEventPatch, signal?: AbortSignal): Promise<GoogleCalendarEvent>;
+  deleteEvent(eventId: string, etag: string, signal?: AbortSignal): Promise<{ deleted: true }>;
+}
+
+export interface CalendarManageDependencies {
+  openLedger?: (config: AssistantToolConfig) => GoogleCalendarLedger;
+  openApi?: (config: AssistantToolConfig) => Promise<CalendarManageApi>;
+  closeLedger?: boolean;
+}
+
+interface CalendarManageResult {
+  action: 'create' | 'update' | 'delete';
+  status: 'succeeded';
+  replayed: boolean;
+  eventId: string;
+  event?: GoogleCalendarEvent;
+  deleted?: true;
+}
+
+export function createCalendarManageTool(
+  api: OpenClawPluginApi,
+  toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
+  dependencies: CalendarManageDependencies = {},
+): AgentTool<typeof calendarManageParameters, CalendarManageResult> {
+  return {
+    name: 'assistant_calendar_manage',
+    label: 'Assistant Google Calendar Manage',
+    description: 'Create, update, or delete one event in the owner-only app-created Google calendar.',
+    parameters: calendarManageParameters,
+    async execute(_toolCallId, params, signal) {
+      const config = loadConfigFromApi(api);
+      assertOwner(toolContext, config);
+      if (!Value.Check(calendarManageParameters, params)) {
+        throw new AssistantToolError('invalid_parameters', 'Calendar mutation parameters do not match the tool schema');
+      }
+      validateManageParameters(params);
+      signal?.throwIfAborted();
+      const eventId = params.action === 'create'
+        ? `oc${params.requestId.replaceAll('-', '')}`
+        : params.eventId;
+      const payloadHash = hashManageParameters(params, eventId);
+      const ledger = (dependencies.openLedger ?? openGoogleLedger)(config);
+      let record: MutationRecord;
+      try {
+        record = ledger.claim({
+          requestId: params.requestId,
+          action: params.action,
+          eventId,
+          payloadHash,
+          ...(params.action === 'create' ? {} : { etag: params.etag }),
+        });
+        if (record.status === 'succeeded') {
+          return jsonResult({
+            action: params.action,
+            status: 'succeeded',
+            replayed: true,
+            eventId,
+            ...(params.action === 'delete' ? { deleted: true as const } : {}),
+          });
+        }
+        if (record.status === 'failed' || record.status === 'unknown') {
+          throw new AssistantToolError(
+            record.errorCode ?? 'calendar_result_unknown',
+            'A previous calendar mutation with this request ID did not complete safely',
+          );
+        }
+        ledger.markSubmitting(params.requestId);
+        const calendar = await (dependencies.openApi ?? openGoogleApi)(config);
+        try {
+          if (params.action === 'create') {
+            const created = await calendar.createEvent({
+              eventId,
+              summary: params.summary,
+              dtstart: params.dtstart,
+              dtend: params.dtend,
+              ...(params.location === undefined ? {} : { location: params.location }),
+              ...(params.description === undefined ? {} : { description: params.description }),
+              ...(params.rrule === undefined ? {} : { rrule: params.rrule as RecurrenceRule }),
+            }, signal);
+            ledger.finish(params.requestId, { status: 'succeeded', resultEtag: created.etag, errorCode: null });
+            return jsonResult({ action: 'create', status: 'succeeded', replayed: false, eventId, event: created });
+          }
+
+          const current = await calendar.getEvent(eventId, signal);
+          if (current.recurringEventId) {
+            throw new AssistantToolError(
+              'calendar_recurring_instance_unsupported',
+              'Individual recurring event instances are not supported',
+            );
+          }
+          if (current.etag !== params.etag) {
+            throw new AssistantToolError('calendar_conflict', 'Calendar event changed; query it again before mutation');
+          }
+          if (params.action === 'update') {
+            const patch = googlePatch(params);
+            const updated = await calendar.updateEvent(eventId, params.etag, patch, signal);
+            ledger.finish(params.requestId, { status: 'succeeded', resultEtag: updated.etag, errorCode: null });
+            return jsonResult({ action: 'update', status: 'succeeded', replayed: false, eventId, event: updated });
+          }
+          await calendar.deleteEvent(eventId, params.etag, signal);
+          ledger.finish(params.requestId, { status: 'succeeded', errorCode: null });
+          return jsonResult({ action: 'delete', status: 'succeeded', replayed: false, eventId, deleted: true });
+        } catch (error) {
+          const code = calendarErrorCode(error);
+          const uncertain = ['calendar_timeout', 'calendar_request_failed', 'calendar_server'].includes(code);
+          try {
+            ledger.finish(params.requestId, {
+              status: uncertain ? 'unknown' : 'failed',
+              errorCode: uncertain ? 'calendar_result_unknown' : code,
+            });
+          } catch { /* retain the original operation error */ }
+          if (error instanceof AssistantToolError) throw error;
+          throw new AssistantToolError(code, 'Google Calendar mutation failed');
+        }
+      } finally {
+        if (dependencies.closeLedger !== false) ledger.close();
+      }
+    },
+  };
+}
+
+function validateManageParameters(params: CalendarManageParameters): void {
+  if (params.action !== 'update') return;
+  const patchKeys = ['summary', 'dtstart', 'dtend', 'location', 'description', 'rrule'] as const;
+  if (!patchKeys.some(key => params[key] !== undefined)
+    || ((params.dtstart === undefined) !== (params.dtend === undefined))) {
+    throw new AssistantToolError('invalid_parameters', 'Calendar update must contain a complete change');
+  }
+}
+
+function googlePatch(params: Extract<CalendarManageParameters, { action: 'update' }>): GoogleEventPatch {
+  return {
+    ...(params.summary === undefined ? {} : { summary: params.summary }),
+    ...(params.dtstart === undefined ? {} : { dtstart: params.dtstart }),
+    ...(params.dtend === undefined ? {} : { dtend: params.dtend }),
+    ...(params.location === undefined ? {} : { location: params.location }),
+    ...(params.description === undefined ? {} : { description: params.description }),
+    ...(params.rrule === undefined ? {} : { rrule: params.rrule as RecurrenceRule | null }),
+  };
+}
+
+function hashManageParameters(params: CalendarManageParameters, eventId: string): string {
+  return createHash('sha256').update(JSON.stringify({ ...params, eventId })).digest('hex');
+}
+
+function calendarErrorCode(error: unknown): string {
+  if (error instanceof GoogleCalendarError || error instanceof AssistantToolError) return error.code;
+  return 'calendar_request_failed';
+}
+
+function openGoogleLedger(config: AssistantToolConfig): GoogleCalendarLedger {
+  return new GoogleCalendarLedger(join(config.stateDir, 'google-calendar-mutations.sqlite3'));
+}
+
+async function openGoogleApi(config: AssistantToolConfig): Promise<CalendarManageApi> {
+  const calendar = requireGoogleCalendarConfig(config);
+  const credentials = validateGoogleOAuthClientCredentials(
+    await new SecretFileStore<unknown>(calendar.googleOAuthClientFile, 16_384).read(),
+  );
+  const tokenStore = new SecretFileStore<GoogleTokenSet>(calendar.googleTokenFile, 32_768);
+  const binding = validateGoogleCalendarBinding(
+    await new SecretFileStore<unknown>(calendar.googleCalendarBindingFile, 16_384).read(),
+  );
+  const oauth = new GoogleOAuth({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    expectedAccount: calendar.expectedAccount,
+    stateDbPath: join(config.stateDir, 'google-oauth-state.sqlite3'),
+    tokenStore,
+  });
+  return new GoogleCalendarApi({ binding, accessToken: () => oauth.getValidAccessToken() });
 }
