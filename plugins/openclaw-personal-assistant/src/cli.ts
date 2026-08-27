@@ -296,15 +296,16 @@ async function authorizeWithLoopback(oauth: GoogleOAuth, io: CliIo): Promise<voi
 }
 
 async function googleCalendarPoc(api: GoogleCalendarApi, io: CliIo, now: number): Promise<number> {
-  const suffix = Math.floor(now / 1_000).toString(16).padStart(16, '0');
+  const exactSecond = Math.floor(now / 1_000) * 1_000;
+  const suffix = Math.floor(exactSecond / 1_000).toString(16).padStart(16, '0');
   const eventId = `oc${suffix}${suffix}`.slice(0, 34);
-  const start = new Date(now + 60 * 60_000).toISOString();
-  const end = new Date(now + 2 * 60 * 60_000).toISOString();
+  const start = new Date(exactSecond + 60 * 60_000).toISOString();
+  const end = new Date(exactSecond + 2 * 60 * 60_000).toISOString();
   const created = await api.createEvent({ eventId, summary: '[OpenClaw PoC]', dtstart: start, dtend: end });
   const updated = await api.updateEvent(eventId, created.etag, { summary: '[OpenClaw PoC updated]' });
   await api.deleteEvent(eventId, updated.etag);
   const remaining = (await api.listEvents({
-    start: new Date(now).toISOString(), end: new Date(now + 24 * 60 * 60_000).toISOString(),
+    start: new Date(exactSecond).toISOString(), end: new Date(exactSecond + 24 * 60 * 60_000).toISOString(),
   })).filter(event => event.eventId === eventId).length;
   if (remaining !== 0) {
     throw Object.assign(new Error('Google Calendar PoC residue remains'), { code: 'calendar_poc_residue' });

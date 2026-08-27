@@ -338,7 +338,7 @@ describe('operational CLI', () => {
       googleBindingStore: () => new CliMemoryStore(bindingValue),
       googleBindingExists: () => true,
       googleFetch: fetch,
-      now: () => Date.parse('2030-01-01T00:00:00.000Z'),
+      now: () => Date.parse('2030-01-01T00:00:00.123Z'),
     };
     const output = capture();
     expect(await runCli([
