@@ -30,6 +30,18 @@ export interface StoredResource extends ResourceIdentity {
   contentSha256: string;
 }
 
+export interface ResourceSearchHit {
+  id: string;
+  url: string;
+  title: string;
+  summary: string;
+  tags: string[];
+  contentType: ResourceContentType;
+  extractedAt: string;
+  score: number;
+  excerpt: string;
+}
+
 export class ResourceArchiveError extends Error {
   constructor(
     public readonly code: string,
