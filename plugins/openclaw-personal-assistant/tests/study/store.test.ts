@@ -96,4 +96,15 @@ describe('StudyStore', () => {
       blockAt('10:00'), blockAt('10:40'),
     ])).toThrow(expect.objectContaining({ code: 'study_block_overlap' }));
   });
+
+  it('persists report delivery acknowledgements independently by day and kind', async () => {
+    const store = await fixture();
+    expect(store.isReportDelivered('2026-08-27', 'interim')).toBe(false);
+    expect(store.isReportDelivered('2026-08-27', 'final')).toBe(false);
+
+    store.markReportDelivered('2026-08-27', 'interim', at('22:00'));
+
+    expect(store.isReportDelivered('2026-08-27', 'interim')).toBe(true);
+    expect(store.isReportDelivered('2026-08-27', 'final')).toBe(false);
+  });
 });

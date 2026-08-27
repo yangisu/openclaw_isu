@@ -78,7 +78,7 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     ]);
   });
 
-  it('registers only the six approved tools in full mode before command integration', () => {
+  it('registers the six tools, four commands, one callback handler, and study service in full mode', () => {
     const registerTool = vi.fn();
     const registerService = vi.fn();
     const registerCommand = vi.fn();
@@ -90,7 +90,10 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     } as never);
 
     expect(registerTool).toHaveBeenCalledTimes(6);
-    expect(registerService).not.toHaveBeenCalled();
+    expect(registerService).toHaveBeenCalledTimes(1);
+    expect(registerService.mock.calls[0]?.[0]).toMatchObject({
+      id: 'openclaw-personal-assistant-study-coach',
+    });
     expect(registerCommand).toHaveBeenCalledTimes(4);
     expect(registerInteractiveHandler).toHaveBeenCalledTimes(1);
     expect(on).not.toHaveBeenCalled();

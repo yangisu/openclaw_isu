@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 
 import { StudyStore } from '../study/store.js';
+import { notifyStudyScheduleChanged } from '../study/signal.js';
 import type { StudyBlock, StudyTransitionAction } from '../study/types.js';
 import { assertOwner, loadConfigFromApi, type AssistantToolConfig } from '../tools/trust.js';
 
@@ -106,6 +107,7 @@ async function handleStudyCallback(
         action,
         (dependencies.now ?? (() => new Date()))(),
       ).block;
+      notifyStudyScheduleChanged();
     } catch (error) {
       if ((error as { code?: unknown }).code === 'invalid_study_transition') {
         block = store.get(match[2]!);

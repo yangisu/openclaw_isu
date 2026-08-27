@@ -9,6 +9,7 @@ import { Value } from 'typebox/value';
 
 import type { ParsedRecord } from '../domain.js';
 import { StudyStore } from '../study/store.js';
+import { notifyStudyScheduleChanged } from '../study/signal.js';
 import type {
   StudyDayStatus,
   StudyPlanBlockInput,
@@ -170,6 +171,7 @@ export function createStudyTool(
           const result = params.action === 'plan'
             ? store.plan(params.operationId, params.studyId, params.blocks)
             : store.replaceFuture(params.operationId, params.studyId, params.blocks, now);
+          notifyStudyScheduleChanged();
           return jsonResult({ action: params.action, ...result });
         } finally {
           store.close();
@@ -191,12 +193,14 @@ export function createStudyTool(
             ...(params.followUpMinutes === undefined ? {} : { followUpMinutes: params.followUpMinutes }),
             ...(params.maxFollowUps === undefined ? {} : { maxFollowUps: params.maxFollowUps }),
           });
+          notifyStudyScheduleChanged();
           return jsonResult({ action: 'settings_set', ...result });
         }
         const transition: StudyTransitionAction = params.action === 'snooze'
           ? { type: 'snooze', ...(params.minutes === undefined ? {} : { minutes: params.minutes }) }
           : { type: params.action };
         const result = store.transition(params.operationId, params.blockId, transition, now);
+        notifyStudyScheduleChanged();
         return jsonResult({ action: params.action, ...result });
       } finally {
         store.close();

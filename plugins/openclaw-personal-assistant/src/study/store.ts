@@ -336,6 +336,23 @@ export class StudyStore {
     };
   }
 
+  isReportDelivered(dayKey: string, kind: 'interim' | 'final'): boolean {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT delivered_at FROM study_reports WHERE day_key = ? AND kind = ?
+    `).get(dayKey, kind) as { delivered_at: string | null } | undefined;
+    return typeof row?.delivered_at === 'string';
+  }
+
+  markReportDelivered(dayKey: string, kind: 'interim' | 'final', at: Date): void {
+    this.assertOpen();
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(dayKey)) fail('invalid_study_day_key', 'study day key is invalid');
+    this.database.prepare(`
+      INSERT INTO study_reports (day_key, kind, delivered_at) VALUES (?, ?, ?)
+      ON CONFLICT(day_key, kind) DO UPDATE SET delivered_at = excluded.delivered_at
+    `).run(dayKey, kind, toSeoulTimestamp(at));
+  }
+
   nextDue(_now: Date): StudyDueAction | null {
     this.assertOpen();
     const row = this.database.prepare(`

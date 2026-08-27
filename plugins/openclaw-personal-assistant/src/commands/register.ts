@@ -11,6 +11,7 @@ import { ResourceCatalog } from '../resources/catalog.js';
 import type { ResourceSearchHit, StoredResource } from '../resources/types.js';
 import { canonicalizeResourceUrl } from '../resources/types.js';
 import { StudyStore } from '../study/store.js';
+import { notifyStudyScheduleChanged } from '../study/signal.js';
 import type {
   StudyDayStatus,
   StudySettings,
@@ -175,6 +176,7 @@ export function registerAssistantCommands(
             : { type: match[1] as 'done' | 'skip' };
           const operationId = `study-command-${(dependencies.operationId ?? randomUUID)()}`;
           const result = store.transition(operationId, match[2]!, action, now);
+          notifyStudyScheduleChanged();
           return { text: `공부 블록 ${result.block.id}: ${studyStatusLabel(result.block.status)}` };
         } finally {
           store.close();

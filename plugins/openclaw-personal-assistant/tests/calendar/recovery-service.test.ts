@@ -7,6 +7,7 @@ describe('retired CalDAV recovery surface', () => {
     const tools: string[] = [];
     const registerService = vi.fn();
     const registerCommand = vi.fn();
+    const registerInteractiveHandler = vi.fn();
     entry.register({
       registrationMode: 'full',
       pluginConfig: {
@@ -28,6 +29,7 @@ describe('retired CalDAV recovery surface', () => {
       },
       registerService,
       registerCommand,
+      registerInteractiveHandler,
       registerHook: vi.fn(),
     } as never);
 
@@ -36,8 +38,14 @@ describe('retired CalDAV recovery surface', () => {
       'assistant_calendar_manage',
       'assistant_mutate',
       'assistant_query',
+      'assistant_resource_store',
+      'assistant_study_manage',
     ]);
-    expect(registerService).not.toHaveBeenCalled();
-    expect(registerCommand).not.toHaveBeenCalled();
+    expect(registerService).toHaveBeenCalledTimes(1);
+    expect(registerService.mock.calls[0]?.[0]).toMatchObject({
+      id: 'openclaw-personal-assistant-study-coach',
+    });
+    expect(registerCommand).toHaveBeenCalledTimes(4);
+    expect(registerInteractiveHandler).toHaveBeenCalledTimes(1);
   });
 });

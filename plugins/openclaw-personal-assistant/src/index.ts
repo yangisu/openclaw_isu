@@ -5,6 +5,7 @@ import {
 import { configSchema, registerAssistantTools } from './tools/register.js';
 import { registerAssistantCommands } from './commands/register.js';
 import { registerStudyInteractiveHandler } from './commands/telegram-study.js';
+import { createStudyCoachService } from './study/service.js';
 
 const entry: OpenClawPluginDefinition = definePluginEntry({
   id: 'openclaw-personal-assistant',
@@ -18,6 +19,7 @@ const entry: OpenClawPluginDefinition = definePluginEntry({
     if (api.registrationMode === 'full') {
       registerAssistantCommands(api);
       registerStudyInteractiveHandler(api);
+      api.registerService(createStudyCoachService(api));
     }
   },
 });
