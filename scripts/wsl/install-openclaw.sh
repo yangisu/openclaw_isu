@@ -231,11 +231,11 @@ validate_secret_tree
 validate_config_file "$CONFIG_FILE"
 node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$CONFIG_FILE" "$SECRET_DIR" disabled
 "$OPENCLAW" config patch --file "$CONFIG_FILE" --dry-run --json >/dev/null
+run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 
 run npm --prefix "$PLUGIN_ROOT" ci
 run npm --prefix "$PLUGIN_ROOT" run plugin:validate
 run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"
-run "$OPENCLAW" config patch --file "$CONFIG_FILE"
 validate_config_file "$ACTIVE_CONFIG_FILE"
 validate_active_config_path
 node "$HARDENED_CONFIG_VALIDATOR" "$OPENCLAW" "$ACTIVE_CONFIG_FILE" "$SECRET_DIR" disabled
@@ -249,6 +249,16 @@ node "$PLUGIN_ROOT/dist/cli.js" maintenance check --config "$MAINTENANCE_CONFIG_
 
 run "$OPENCLAW" gateway install --force
 run systemctl --user enable --now openclaw-gateway.service
+GATEWAY_READY=0
+for _ in {1..30}; do
+  if systemctl --user is-active --quiet openclaw-gateway.service \
+    && "$OPENCLAW" cron list --json >/dev/null 2>&1; then
+    GATEWAY_READY=1
+    break
+  fi
+  sleep 1
+done
+[[ "$GATEWAY_READY" == 1 ]] || { say 'gateway_not_ready'; exit 1; }
 run "$OPENCLAW" cron add --declaration-key "$CRON_KEY" --name 'Personal assistant hourly briefing' \
   --cron "$CRON_EXPR" --tz "$CRON_TZ" --exact --session isolated --message "$CRON_MESSAGE" \
   --trigger-script "$CRON_TRIGGER" --announce --channel telegram --to "$OWNER_ID" --json

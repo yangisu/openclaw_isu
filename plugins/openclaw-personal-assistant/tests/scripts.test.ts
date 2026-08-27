@@ -277,6 +277,20 @@ describe('deployment scripts', () => {
     expect(checkBlock).not.toMatch(/run plugin:validate|run (?:plugin:)?build/);
   });
 
+  it('applies required plugin config before linking and waits for gateway Cron readiness', () => {
+    const source = readFileSync(installer, 'utf8');
+    const patch = source.indexOf('run "$OPENCLAW" config patch --file "$CONFIG_FILE"');
+    const install = source.indexOf('run "$OPENCLAW" plugins install --link "$PLUGIN_ROOT"');
+    const service = source.indexOf('run systemctl --user enable --now openclaw-gateway.service');
+    const readyProbe = source.indexOf('"$OPENCLAW" cron list --json >/dev/null 2>&1', service);
+    const cronAdd = source.indexOf('run "$OPENCLAW" cron add', service);
+    expect(patch).toBeGreaterThan(-1);
+    expect(patch).toBeLessThan(install);
+    expect(readyProbe).toBeGreaterThan(service);
+    expect(readyProbe).toBeLessThan(cronAdd);
+    expect(source.slice(service, cronAdd)).toContain('gateway_not_ready');
+  });
+
   it('keeps the installed manifest CalDAV activation and fan-out bounds aligned with runtime config', () => {
     const manifest = JSON.parse(readFileSync(resolve(repo, 'plugins/openclaw-personal-assistant/openclaw.plugin.json'), 'utf8')) as {
       configSchema: { properties: { calendar: { properties: Record<string, { type?: string; maxItems?: number }> } } };
