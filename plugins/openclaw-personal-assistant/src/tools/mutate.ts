@@ -8,6 +8,7 @@ import { Type, type Static, type TSchema } from 'typebox';
 import { Value } from 'typebox/value';
 
 import type { AddRecordInput, AssistantRecord, ParsedRecord, RecordKind } from '../domain.js';
+import { scheduleAssignmentBlocks } from '../study/assignment-scheduler.js';
 import {
   WorkspaceRepository,
   type AddTaskInput,
@@ -53,11 +54,16 @@ const taskFieldsSchema = Type.Object({
 }, { additionalProperties: false, minProperties: 1 });
 const studyFieldsSchema = Type.Object({
   status: Type.Optional(workStatusSchema),
+  category: Type.Optional(Type.Union([Type.Literal('school'), Type.Literal('personal')])),
+  course_name: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
   subject: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
   target_amount: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
   unit: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
   progress: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
   target_date: Type.Optional(dateSchema),
+  deadline: Type.Optional(timestampSchema),
+  is_assignment: Type.Optional(Type.Boolean()),
+  subtask_ids: Type.Optional(Type.Array(taskIdSchema, { maxItems: 64, uniqueItems: true })),
   recurrence: Type.Optional(Type.Union([
     Type.Literal('none'), Type.Literal('daily'), Type.Literal('weekly'),
   ])),
@@ -133,11 +139,16 @@ export const mutationParameters = Type.Union([
     title: Type.String({ minLength: 1, maxLength: 500 }),
     body: Type.Optional(Type.String({ maxLength: 16_000 })),
     status: Type.Optional(workStatusSchema),
+    category: Type.Optional(Type.Union([Type.Literal('school'), Type.Literal('personal')])),
+    courseName: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
     subject: Type.String({ minLength: 1, maxLength: 500 }),
     targetAmount: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
     unit: Type.String({ minLength: 1, maxLength: 100 }),
     progress: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
     targetDate: Type.Optional(dateSchema),
+    deadline: Type.Optional(timestampSchema),
+    isAssignment: Type.Optional(Type.Boolean()),
+    subtaskIds: Type.Optional(Type.Array(taskIdSchema, { maxItems: 64, uniqueItems: true })),
     recurrence: Type.Optional(Type.Union([
       Type.Literal('none'), Type.Literal('daily'), Type.Literal('weekly'),
     ])),
@@ -175,6 +186,16 @@ export const mutationParameters = Type.Union([
     supersedes: Type.Optional(memoryIdSchema),
     sensitivity: Type.Optional(Type.Union([Type.Literal('normal'), Type.Literal('sensitive')])),
   }, { additionalProperties: false }),
+  Type.Object({
+    operationId: operationIdSchema,
+    action: Type.Literal('plan_assignment'),
+    courseName: Type.String({ minLength: 1, maxLength: 500 }),
+    assignmentTitle: Type.String({ minLength: 1, maxLength: 500 }),
+    deadline: timestampSchema,
+    totalEstimatedMinutes: Type.Optional(Type.Integer({ minimum: 10, maximum: 100_000 })),
+    blockDurationMinutes: Type.Optional(Type.Integer({ minimum: 10, maximum: 180 })),
+    customSteps: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 32 })),
+  }, { additionalProperties: false }),
   ...modifySchemas,
   ...archiveSchemas,
 ]);
@@ -201,7 +222,7 @@ export function createMutationTool(
   return {
     name: 'assistant_mutate',
     label: 'Assistant Mutate',
-    description: 'Add, modify, or archive one owner-scoped local record with an idempotent operation ID.',
+    description: 'Add, modify, or archive one owner-scoped local record with an idempotent operation ID, or plan an assignment into focused blocks.',
     parameters: mutationParameters,
     async execute(_toolCallId, params, signal) {
       const config = loadConfigFromApi(api);
@@ -209,7 +230,9 @@ export function createMutationTool(
       if (!Value.Check(mutationParameters, params)) {
         throw new AssistantToolError('invalid_parameters', 'Mutation parameters do not match the tool schema');
       }
-      if (params.action !== 'add') assertTargetMatchesRecordType(params.targetId, params.recordType);
+      if (params.action !== 'add' && params.action !== 'plan_assignment') {
+        assertTargetMatchesRecordType(params.targetId, params.recordType);
+      }
       let addInput: AddRecordInput | undefined;
       let patch: RecordPatch | undefined;
       if (params.action === 'add') {
@@ -236,7 +259,42 @@ export function createMutationTool(
       const repository = (dependencies.openRepository ?? openRepository)(config);
       try {
         let result: MutationResult;
-        if (params.action === 'add') {
+        if (params.action === 'plan_assignment') {
+          const scheduled = scheduleAssignmentBlocks({
+            courseName: params.courseName,
+            assignmentTitle: params.assignmentTitle,
+            deadline: params.deadline,
+            totalEstimatedMinutes: params.totalEstimatedMinutes,
+            blockDurationMinutes: params.blockDurationMinutes,
+            customSteps: params.customSteps,
+          });
+
+          // 1. Add main study record
+          const studyResult = await repository.addRecord(
+            `${params.operationId}-study`,
+            scheduled.studyRecordInput,
+          );
+
+          // 2. Add subtasks
+          const subtaskIds: string[] = [];
+          for (let i = 0; i < scheduled.subtaskInputs.length; i++) {
+            const subtask = scheduled.subtaskInputs[i];
+            const taskResult = await repository.addTask(
+              `${params.operationId}-subtask-${i + 1}`,
+              subtask,
+            );
+            subtaskIds.push(taskResult.id);
+          }
+
+          // 3. Update main study record with subtask_ids
+          const updated = await repository.updateRecord(
+            `${params.operationId}-update-links`,
+            studyResult.id,
+            { fields: { subtask_ids: subtaskIds } },
+          );
+
+          return jsonResult(updated);
+        } else if (params.action === 'add') {
           if (addInput!.kind === 'task') {
             const { kind: _kind, ...taskInput } = addInput!;
             result = await repository.addTask(params.operationId, taskInput);
@@ -282,8 +340,13 @@ function addInputFromParameters(
         targetAmount: params.targetAmount,
         unit: params.unit,
         ...(params.status === undefined ? {} : { status: params.status }),
+        ...(params.category === undefined ? {} : { category: params.category }),
+        ...(params.courseName === undefined ? {} : { courseName: params.courseName }),
         ...(params.progress === undefined ? {} : { progress: params.progress }),
         ...(params.targetDate === undefined ? {} : { targetDate: params.targetDate }),
+        ...(params.deadline === undefined ? {} : { deadline: params.deadline }),
+        ...(params.isAssignment === undefined ? {} : { isAssignment: params.isAssignment }),
+        ...(params.subtaskIds === undefined ? {} : { subtaskIds: params.subtaskIds }),
         ...(params.recurrence === undefined ? {} : { recurrence: params.recurrence }),
         ...(params.reviewDates === undefined ? {} : { reviewDates: params.reviewDates }),
       };

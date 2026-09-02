@@ -799,6 +799,52 @@ describe('OpenClaw personal-assistant tool boundary', () => {
     })).resolves.toMatchObject({ details: { kind: 'calendar', items: [] } });
     expect(openCalendar).toHaveBeenCalledTimes(1);
   });
+
+  it('plans an assignment into a study record and subtasks via assistant_mutate', async () => {
+    const addRecord = vi.fn(async (opId, input) => ({
+      operationId: opId,
+      id: 'S-20260902-001',
+      replayed: false,
+      record: { id: 'S-20260902-001', title: input.title, orderedFields: [], fields: {}, body: '' },
+    }));
+    let taskCounter = 1;
+    const addTask = vi.fn(async (opId, input) => ({
+      operationId: opId,
+      id: `T-20260902-00${taskCounter++}`,
+      replayed: false,
+      record: { id: `T-20260902-00${taskCounter}`, title: input.title, orderedFields: [], fields: {}, body: '' },
+    }));
+    const updateRecord = vi.fn(async (opId, targetId, patch) => ({
+      operationId: opId,
+      id: targetId,
+      replayed: false,
+      record: { id: targetId, title: 'Study', orderedFields: [], fields: patch.fields ?? {}, body: '' },
+    }));
+    const openRepository = vi.fn(() => ({
+      addRecord, addTask, updateRecord,
+      archiveRecord: vi.fn(),
+      close: vi.fn(),
+    }));
+
+    const tool = createMutationTool(api(), ownerContext, { openRepository });
+    const result = await tool.execute('call-plan-assignment', {
+      operationId: 'plan-hw-1',
+      action: 'plan_assignment',
+      courseName: '컴퓨터네트워크',
+      assignmentTitle: '소켓 프로그래밍 과제',
+      deadline: '2026-09-08T23:59:00+09:00',
+      totalEstimatedMinutes: 150, // 3 blocks
+    });
+
+    expect(openRepository).toHaveBeenCalledTimes(1);
+    expect(addRecord).toHaveBeenCalledTimes(1);
+    expect(addTask).toHaveBeenCalledTimes(3);
+    expect(updateRecord).toHaveBeenCalledTimes(1);
+    expect(result.details).toMatchObject({
+      operationId: 'plan-hw-1-update-links',
+      id: 'S-20260902-001',
+    });
+  });
 });
 
 class MemoryStore<T> {

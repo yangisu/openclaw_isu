@@ -285,8 +285,9 @@ function validateOperationId(operationId: string): void {
 const UPDATE_FIELDS: Readonly<Record<RecordKind, ReadonlySet<string>>> = {
   task: new Set(['type', 'created_at', 'source', 'status', 'priority', 'due_at', 'completed_at']),
   study: new Set([
-    'type', 'created_at', 'source', 'status', 'subject', 'target_amount', 'unit', 'progress',
-    'target_date', 'recurrence', 'review_dates',
+    'type', 'created_at', 'source', 'status', 'category', 'course_name', 'subject',
+    'target_amount', 'unit', 'progress', 'target_date', 'deadline', 'is_assignment',
+    'subtask_ids', 'recurrence', 'review_dates',
   ]),
   note: new Set(['type', 'created_at', 'source', 'status', 'url', 'tags']),
   preference: new Set(['type', 'created_at', 'source', 'active', 'supersedes']),
@@ -354,11 +355,17 @@ export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void 
         );
       }
     }
-    for (const key of ['due_at', 'completed_at', 'resolved_at', 'entry_at'] as const) {
+    for (const key of ['due_at', 'completed_at', 'resolved_at', 'entry_at', 'deadline'] as const) {
       const value = fields[key];
       if (value !== undefined && !isStrictTimestamp(value)) {
         throw new WorkspaceRepositoryError('invalid_timestamp', `${key} must be RFC 3339 with +09:00`);
       }
+    }
+    if (fields.category !== undefined && fields.category !== 'school' && fields.category !== 'personal') {
+      throw new WorkspaceRepositoryError('invalid_category', 'category must be school or personal');
+    }
+    if (fields.is_assignment !== undefined && typeof fields.is_assignment !== 'boolean') {
+      throw new WorkspaceRepositoryError('invalid_boolean', 'is_assignment must be boolean');
     }
     if (fields.target_date !== undefined && !isStrictDate(fields.target_date)) {
       throw new WorkspaceRepositoryError('invalid_date', 'target_date must be a valid YYYY-MM-DD value');
@@ -367,6 +374,7 @@ export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void 
       ['review_dates', 64, undefined],
       ['tags', 64, 100],
       ['related_ids', 64, undefined],
+      ['subtask_ids', 64, undefined],
     ] as const) {
       const value = fields[key];
       if (value !== undefined
@@ -383,7 +391,7 @@ export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void 
       }
     }
     for (const [key, maximum] of [
-      ['subject', 500], ['unit', 100], ['url', 2_048], ['reason', 1_000], ['original_text', 4_000],
+      ['subject', 500], ['course_name', 500], ['unit', 100], ['url', 2_048], ['reason', 1_000], ['original_text', 4_000],
     ] as const) {
       const value = fields[key];
       if (value !== undefined
@@ -438,11 +446,16 @@ function addRecordFields(input: AddRecordInput, timestamp: string): AssistantRec
         ...common,
         type: 'study',
         status: input.status ?? 'open',
+        ...(input.category === undefined ? {} : { category: input.category }),
+        ...(input.courseName === undefined ? {} : { course_name: input.courseName }),
         subject: input.subject,
         target_amount: input.targetAmount,
         unit: input.unit,
         progress: input.progress ?? 0,
         ...(input.targetDate === undefined ? {} : { target_date: input.targetDate }),
+        ...(input.deadline === undefined ? {} : { deadline: input.deadline }),
+        ...(input.isAssignment === undefined ? {} : { is_assignment: input.isAssignment }),
+        ...(input.subtaskIds === undefined ? {} : { subtask_ids: input.subtaskIds }),
         ...(input.recurrence === undefined ? {} : { recurrence: input.recurrence }),
         ...(input.reviewDates === undefined ? {} : { review_dates: input.reviewDates }),
       } satisfies StudyRecord;
@@ -508,7 +521,20 @@ export function validateAddRecordInput(input: AddRecordInput): void {
   }
   if (input.kind === 'study') {
     assertAddStringLimit(input.subject, 500, 'study subject');
+    if (input.courseName !== undefined) assertAddStringLimit(input.courseName, 500, 'courseName');
     assertAddStringLimit(input.unit, 100, 'study unit');
+    if (input.category !== undefined && input.category !== 'school' && input.category !== 'personal') {
+      throw new WorkspaceRepositoryError('invalid_category', 'category must be school or personal');
+    }
+    if (input.deadline !== undefined && !isStrictTimestamp(input.deadline)) {
+      throw new WorkspaceRepositoryError('invalid_timestamp', 'deadline must be RFC 3339 with +09:00');
+    }
+    if (input.isAssignment !== undefined && typeof input.isAssignment !== 'boolean') {
+      throw new WorkspaceRepositoryError('invalid_boolean', 'isAssignment must be boolean');
+    }
+    if (input.subtaskIds !== undefined) {
+      assertAddArray(input.subtaskIds, 64, 'invalid_subtask_ids', 'subtaskIds');
+    }
     if (!Number.isSafeInteger(input.targetAmount)) {
       throw new WorkspaceRepositoryError(
         'invalid_target_amount',

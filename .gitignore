@@ -1,3 +1,23 @@
+# Dependencies & Build
+node_modules/
+dist/
+*.log
+
+# Worktrees, acceptance runs & backups
 .worktrees/
-artifacts/acceptance/
 backups/
+artifacts/acceptance/
+
+# Secrets & Local runtime state
+secrets/
+state/
+*.age
+*.age.committed
+*.age.uncommitted
+.env
+.env.*
+*.local
+
+# OS files
+.DS_Store
+Thumbs.db

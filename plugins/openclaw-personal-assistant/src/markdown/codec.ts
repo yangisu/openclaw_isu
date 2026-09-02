@@ -32,21 +32,21 @@ const TYPE_TO_KIND: Readonly<Record<string, RecordKind>> = {
 };
 
 const STRING_FIELDS = new Set([
-  'type', 'source', 'subject', 'unit', 'url', 'reason', 'original_text',
+  'type', 'source', 'subject', 'course_name', 'unit', 'url', 'reason', 'original_text',
   'archive_reason',
 ]);
 const STRING_LIST_FIELDS = new Set(['tags']);
 const DATE_LIST_FIELDS = new Set(['review_dates']);
-const ID_LIST_FIELDS = new Set(['related_ids']);
-const BOOLEAN_FIELDS = new Set(['active']);
+const ID_LIST_FIELDS = new Set(['related_ids', 'subtask_ids']);
+const BOOLEAN_FIELDS = new Set(['active', 'is_assignment']);
 const INTEGER_FIELDS = new Set(['target_amount', 'progress']);
 const TIMESTAMP_FIELDS = new Set([
   'created_at', 'updated_at', 'due_at', 'completed_at', 'resolved_at',
-  'archived_at', 'entry_at',
+  'archived_at', 'entry_at', 'deadline',
 ]);
 const DATE_FIELDS = new Set(['target_date']);
 const ENUM_FIELDS = new Set([
-  'status', 'priority', 'recurrence', 'sensitivity',
+  'status', 'priority', 'recurrence', 'sensitivity', 'category',
 ]);
 const ID_FIELDS = new Set(['supersedes', 'target_id']);
 
@@ -236,6 +236,10 @@ export function validateRecord(record: ParsedRecord): void {
       break;
     case 'study': {
       assertEnum(requireField(record, 'status'), ['open', 'in_progress', 'done', 'archived'], 'invalid_status');
+      if ('category' in record.fields) {
+        assertEnum(record.fields.category, ['school', 'personal'], 'invalid_category');
+      }
+      if ('course_name' in record.fields) assertJsonStringField(record, 'course_name', false);
       assertJsonStringField(record, 'subject');
       const targetAmount = requireField(record, 'target_amount');
       assertInteger(targetAmount, 'invalid_target_amount');
@@ -245,6 +249,15 @@ export function validateRecord(record: ParsedRecord): void {
       assertInteger(progress, 'invalid_progress');
       if (progress < 0 || progress > targetAmount) invalid('invalid_progress', 'progress must be between zero and target_amount');
       if ('target_date' in record.fields) assertDate(record.fields.target_date);
+      if ('deadline' in record.fields) assertTimestamp(record.fields.deadline);
+      if ('is_assignment' in record.fields) assertBoolean(record.fields.is_assignment);
+      if ('subtask_ids' in record.fields) {
+        assertJsonArray(record, 'subtask_ids', value => {
+          if (typeof value !== 'string' || !isAnyRecordId(value)) {
+            invalid('invalid_subtask_ids', 'subtask_ids must contain record IDs');
+          }
+        });
+      }
       if ('recurrence' in record.fields) assertEnum(record.fields.recurrence, ['none', 'daily', 'weekly'], 'invalid_recurrence');
       if ('review_dates' in record.fields) {
         assertJsonArray(record, 'review_dates', value => assertDate(value));

@@ -43,14 +43,21 @@ export interface TaskRecord extends CommonRecordFields {
   completed_at?: string;
 }
 
+export type StudyCategory = 'school' | 'personal';
+
 export interface StudyRecord extends CommonRecordFields {
   type: 'study';
   status: 'open' | 'in_progress' | 'done' | 'archived';
+  category?: StudyCategory;
+  course_name?: string;
   subject: string;
   target_amount: number;
   unit: string;
   progress: number;
   target_date?: string;
+  deadline?: string;
+  is_assignment?: boolean;
+  subtask_ids?: string[];
   recurrence?: 'none' | 'daily' | 'weekly';
   review_dates?: string[];
 }
@@ -107,11 +114,16 @@ export interface AddTaskRecordInput extends AddRecordBase {
 export interface AddStudyRecordInput extends AddRecordBase {
   kind: 'study';
   status?: StudyRecord['status'];
+  category?: StudyCategory;
+  courseName?: string;
   subject: string;
   targetAmount: number;
   unit: string;
   progress?: number;
   targetDate?: string;
+  deadline?: string;
+  isAssignment?: boolean;
+  subtaskIds?: string[];
   recurrence?: StudyRecord['recurrence'];
   reviewDates?: string[];
 }

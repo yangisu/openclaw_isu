@@ -24,11 +24,15 @@ export interface BriefingStudy {
   id: string;
   title: string;
   status: 'open' | 'in_progress' | 'done' | 'archived';
+  category?: 'school' | 'personal';
+  courseName?: string;
   subject: string;
   progress: number;
   targetAmount: number;
   unit: string;
   targetDate?: string;
+  deadline?: string;
+  isAssignment?: boolean;
   recurrence?: 'none' | 'daily' | 'weekly';
   reviewDates?: string[];
 }
@@ -115,12 +119,20 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
       || finiteDate(left.dueAt!) - finiteDate(right.dueAt!)
       || left.id.localeCompare(right.id));
 
-  const todayStudy = input.studies
-    .filter(study => activeStatus(study.status) && (
-      study.targetDate === today
-      || study.recurrence === 'daily'
-      || study.reviewDates?.includes(today)
-    ))
+  const activeStudies = input.studies.filter(study => activeStatus(study.status) && (
+    study.targetDate === today
+    || (study.deadline && seoulDate(study.deadline) === today)
+    || study.recurrence === 'daily'
+    || study.reviewDates?.includes(today)
+  ));
+
+  const schoolAssignments = activeStudies
+    .filter(study => study.category === 'school' || study.isAssignment === true)
+    .sort((left, right) => (left.deadline ? finiteDate(left.deadline) : Number.MAX_SAFE_INTEGER) - (right.deadline ? finiteDate(right.deadline) : Number.MAX_SAFE_INTEGER)
+      || left.subject.localeCompare(right.subject) || left.id.localeCompare(right.id));
+
+  const personalStudies = activeStudies
+    .filter(study => study.category !== 'school' && study.isAssignment !== true)
     .sort((left, right) => left.subject.localeCompare(right.subject) || left.id.localeCompare(right.id));
 
   const overdue = [
@@ -132,11 +144,11 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
         days: calendarDayDifference(seoulDate(task.dueAt!), today),
       })),
     ...input.studies
-      .filter(study => activeStatus(study.status) && study.targetDate)
+      .filter(study => activeStatus(study.status) && (study.targetDate || study.deadline))
       .map(study => ({
         id: study.id,
         title: study.subject,
-        days: calendarDayDifference(study.targetDate!, today),
+        days: calendarDayDifference(study.targetDate ?? seoulDate(study.deadline!), today),
       })),
   ].filter(item => item.days >= 2)
     .sort((left, right) => right.days - left.days || left.id.localeCompare(right.id));
@@ -163,8 +175,19 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
       })),
     },
     {
-      heading: '📚 Study today',
-      entries: todayStudy.map(study => ({
+      heading: '🏫 School & Assignments',
+      entries: schoolAssignments.map(study => {
+        const prefix = study.courseName ? `[${study.courseName}] ` : '';
+        const deadlineText = study.deadline ? ` — ${seoulTime(study.deadline)} due` : '';
+        return {
+          text: `${prefix}${study.subject} ${study.progress}/${study.targetAmount} ${study.unit}${deadlineText}`
+            + (study.reviewDates?.includes(today) ? ' · review today' : ''),
+        };
+      }),
+    },
+    {
+      heading: '📚 Personal Study',
+      entries: personalStudies.map(study => ({
         text: `${study.subject} ${study.progress}/${study.targetAmount} ${study.unit}`
           + (study.reviewDates?.includes(today) ? ' · review today' : ''),
       })),

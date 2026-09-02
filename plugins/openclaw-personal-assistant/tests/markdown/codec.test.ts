@@ -165,4 +165,42 @@ describe('typed markdown codec', () => {
   ] as const)('rejects %s where the contract requires a bare value', (_name, kind, text, code) => {
     expect(() => parseDocument(kind, text)).toThrow(expect.objectContaining({ code }));
   });
+
+  it('serializes and parses study with school category and assignment fields', () => {
+    const studyDoc = [
+      '# Study',
+      '',
+      '### S-20260902-001 알고리즘 과제 1',
+      '- type: "study"',
+      '- status: open',
+      '- category: school',
+      '- course_name: "알고리즘"',
+      '- subject: "알고리즘 과제 1"',
+      '- target_amount: 4',
+      '- unit: "블록"',
+      '- progress: 0',
+      '- deadline: 2026-09-08T18:00:00+09:00',
+      '- is_assignment: true',
+      '- subtask_ids: ["T-20260902-001","T-20260902-002"]',
+      '- created_at: 2026-09-02T09:00:00+09:00',
+      '- updated_at: 2026-09-02T09:00:00+09:00',
+      '- source: "telegram"',
+      '',
+      '과제 본문 설명',
+      '',
+    ].join('\n');
+
+    const parsed = parseDocument('study', studyDoc);
+    expect(parsed.records).toHaveLength(1);
+    expect(parsed.records[0].fields).toMatchObject({
+      category: 'school',
+      course_name: '알고리즘',
+      is_assignment: true,
+      deadline: '2026-09-08T18:00:00+09:00',
+      subtask_ids: ['T-20260902-001', 'T-20260902-002'],
+    });
+
+    const serialized = serializeDocument(parsed);
+    expect(serialized).toBe(studyDoc);
+  });
 });
