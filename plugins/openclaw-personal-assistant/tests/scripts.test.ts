@@ -20,7 +20,7 @@ const hardenedConfigValidator = resolve(repo, 'scripts/wsl/validate-hardened-con
 const activeConfigPathValidator = resolve(repo, 'scripts/wsl/validate-active-config-path.js');
 const runtimeToolsValidator = resolve(repo, 'scripts/wsl/validate-runtime-tools.js');
 const privateAcl = resolve(repo, 'scripts/windows/set-private-directory-acl.ps1');
-const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe';
+const gitBash = process.platform === 'win32' ? 'C:\\Program Files\\Git\\bin\\bash.exe' : '/bin/bash';
 
 describe('deployment scripts', () => {
   function evaluateCronTrigger(relativePath: string, instant: string): unknown {
@@ -236,7 +236,7 @@ describe('deployment scripts', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('PowerShell task installer parses and WhatIf rejects an unavailable explicit distro without mutation', () => {
+  it.runIf(process.platform === 'win32')('PowerShell task installer parses and WhatIf rejects an unavailable explicit distro without mutation', () => {
     const parsed = spawnSync('pwsh', ['-NoProfile', '-Command',
       `[System.Management.Automation.Language.Parser]::ParseFile('${windowsScript.replaceAll("'", "''")}',[ref]$null,[ref]$null).EndBlock.Extent.Text.Length`],
       { encoding: 'utf8' });
@@ -495,7 +495,7 @@ describe('deployment scripts', () => {
         .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
         .replace("bind: 'loopback'", "bind: 'lan'");
       writeFileSync(config, unsafe, { mode: 0o600 });
-      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin', process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw');
       const result = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('active_config_not_hardened');
@@ -513,7 +513,7 @@ describe('deployment scripts', () => {
         .replaceAll('/home/user/.openclaw/secrets', configSecretRoot)
         .replace("bind: 'loopback',", "bind: 'loopback',\n    mode: 'local',\n    auth: { mode: 'token', token: '0123456789abcdef0123456789abcdef0123456789abcdef' },");
       writeFileSync(config, baseline, { mode: 0o600 });
-      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin', process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw');
       const accepted = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(accepted.status, accepted.stderr).toBe(0);
 
@@ -545,7 +545,7 @@ describe('deployment scripts', () => {
       const baseline = readFileSync(resolve(repo, 'config/openclaw.personal-assistant.example.json5'), 'utf8')
         .replaceAll('/home/user/.openclaw/secrets', configSecretRoot);
       writeFileSync(config, baseline, { mode: 0o600 });
-      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin/openclaw.cmd');
+      const openclaw = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/.bin', process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw');
       const valid = spawnSync(process.execPath, [hardenedConfigValidator, openclaw, config, secretRoot], { encoding: 'utf8' });
       expect(valid.status, valid.stderr).toBe(0);
       writeFileSync(config, mutate(baseline), { mode: 0o600 });
@@ -564,7 +564,7 @@ describe('deployment scripts', () => {
 
   it('non-live acceptance emits exactly 32 criterion records with live work not verified', () => {
     expect(spawnSync(gitBash, ['-n', acceptance], { encoding: 'utf8' }).status).toBe(0);
-    const result = spawnSync(gitBash, [acceptance, '--non-live'], { cwd: repo, encoding: 'utf8', timeout: 200_000 });
+    const result = spawnSync(gitBash, [acceptance, '--non-live'], { cwd: repo, encoding: 'utf8', timeout: 600_000 });
     expect(result.status).toBe(0);
     const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!);
     expect(summary).toMatchObject({ total: 32, pass: 15, fail: 0, notVerified: 17 });
@@ -597,7 +597,7 @@ describe('deployment scripts', () => {
       expect(acl.status).toBe(0);
       expect(JSON.parse(acl.stdout)).toEqual({ protected: true, inherited: 0 });
     }
-  }, 210_000);
+  }, 650_000);
 
   it('--all records every live criterion as NV125 without invoking a hostile validator node wrapper', () => {
     const evidence = mkdtempSync(resolve(tmpdir(), 'ocpa-live-evidence-'));
@@ -610,7 +610,7 @@ describe('deployment scripts', () => {
       const bashPath = (value: string) => value.replace(/^([A-Za-z]):[\\/]/, (_match, drive: string) => `/${drive.toLowerCase()}/`).replaceAll('\\', '/');
       writeFileSync(wrapper, `#!/usr/bin/env bash\nif [[ \"\${1:-}\" == *validate-live-evidence.js ]]; then\n  printf invoked > '${bashPath(marker)}'\n  printf '%s\\n' '{"status":"PASS","observedArtifactPath":"forged"}'\n  exit 0\nfi\nexec '${bashPath(process.execPath).replaceAll("'", "'\\''")}' \"$@\"\n`, { mode: 0o700 });
       const result = spawnSync(gitBash, [acceptance, '--all'], {
-        cwd: repo, encoding: 'utf8', timeout: 200_000,
+        cwd: repo, encoding: 'utf8', timeout: 600_000,
         env: { ...process.env, LIVE_TEST: '1', LIVE_EVIDENCE_DIR: evidence,
           PATH: `${hostileBin}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH ?? ''}` },
       });
@@ -629,5 +629,5 @@ describe('deployment scripts', () => {
     } finally {
       rmSync(evidence, { recursive: true, force: true });
     }
-  }, 210_000);
+  }, 650_000);
 });

@@ -286,7 +286,14 @@ describe('OpenClaw personal-assistant tool boundary', () => {
       report(error: typeof active[number]) { active.splice(0, active.length, error); },
       recover: vi.fn(), listActive: () => [...active], close: vi.fn(),
     };
-    const gatedApi = api({ calendar: googleCalendarConfig });
+    const missingCalendarConfig = {
+      provider: 'google' as const,
+      googleOAuthClientFile: '/nonexistent/secrets/google-oauth-client',
+      googleTokenFile: '/nonexistent/secrets/google-oauth-token',
+      googleCalendarBindingFile: '/nonexistent/secrets/google-calendar-binding',
+      expectedAccount: 'yangisu12@gmail.com' as const,
+    };
+    const gatedApi = api({ calendar: missingCalendarConfig });
     try {
       const query = createQueryTool(gatedApi, ownerContext, {
         openRepository: () => ({ async query() { return []; }, close() {} }), openHealth: () => health,
