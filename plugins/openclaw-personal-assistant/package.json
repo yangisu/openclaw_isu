@@ -27,7 +27,7 @@
     "vitest": "4.1.11"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.5.17"
+    "openclaw": "^2026.8.1"
   },
   "openclaw": {
     "extensions": [

@@ -1,10 +1,10 @@
-import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import type { AnyAgentTool } from 'openclaw/plugin-sdk/core';
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from 'openclaw/plugin-sdk/plugin-entry';
 import { jsonResult } from 'openclaw/plugin-sdk/tool-results';
-import { Type } from 'typebox';
+import { Type, type Static } from 'typebox';
 import { Value } from 'typebox/value';
 
 import type {
@@ -50,13 +50,13 @@ export function createBriefingTool(
   toolContext: Pick<OpenClawPluginToolContext,
     'requesterSenderId' | 'senderIsOwner' | 'sessionKey' | 'deliveryContext'>,
   dependencies: BriefingToolDependencies = {},
-): AgentTool<typeof briefingParameters> {
+): AnyAgentTool {
   return {
     name: 'assistant_briefing',
     label: 'Assistant Briefing',
     description: 'Build one deterministic owner briefing from local records and fresh calendar state.',
     parameters: briefingParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof briefingParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       const deliveryTarget = assertOwnerOrTrustedBriefingCron(toolContext, config);
       if (!Value.Check(briefingParameters, params)) {

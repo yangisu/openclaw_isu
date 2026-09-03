@@ -1,4 +1,4 @@
-import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import type { AnyAgentTool } from 'openclaw/plugin-sdk/core';
 import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
@@ -218,13 +218,13 @@ export function createMutationTool(
   api: OpenClawPluginApi,
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: MutationToolDependencies = {},
-): AgentTool<typeof mutationParameters, MutationResult> {
+): AnyAgentTool {
   return {
     name: 'assistant_mutate',
     label: 'Assistant Mutate',
     description: 'Add, modify, or archive one owner-scoped local record with an idempotent operation ID, or plan an assignment into focused blocks.',
     parameters: mutationParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof mutationParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       assertOwner(toolContext, config);
       if (!Value.Check(mutationParameters, params)) {

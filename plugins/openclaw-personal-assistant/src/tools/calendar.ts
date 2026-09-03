@@ -1,4 +1,4 @@
-import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import type { AnyAgentTool } from 'openclaw/plugin-sdk/core';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type {
@@ -144,13 +144,13 @@ export function createCalendarPrepareTool(
   api: OpenClawPluginApi,
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: CalendarPrepareDependencies = {},
-): AgentTool<typeof calendarPrepareParameters, CalendarPrepareResult> {
+): AnyAgentTool {
   return {
     name: 'assistant_calendar_prepare',
     label: 'Assistant Calendar Prepare',
     description: 'Prepare one Naver calendar event locally and return its content-bound confirmation identifiers.',
     parameters: calendarPrepareParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof calendarPrepareParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       assertOwner(toolContext, config);
       if (!Value.Check(calendarPrepareParameters, params)) {
@@ -196,13 +196,13 @@ export function createCalendarConfirmTool(
   api: OpenClawPluginApi,
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: CalendarConfirmDependencies = {},
-): AgentTool<typeof calendarConfirmParameters, CalendarConfirmResult> {
+): AnyAgentTool {
   return {
     name: 'assistant_calendar_confirm',
     label: 'Assistant Calendar Confirm',
     description: 'Create one prepared Naver event after explicit owner confirmation.',
     parameters: calendarConfirmParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof calendarConfirmParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       const senderId = assertOwner(toolContext, config);
       if (!Value.Check(calendarConfirmParameters, params)) {
@@ -342,13 +342,13 @@ export function createCalendarManageTool(
   api: OpenClawPluginApi,
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: CalendarManageDependencies = {},
-): AgentTool<typeof calendarManageParameters, CalendarManageResult> {
+): AnyAgentTool {
   return {
     name: 'assistant_calendar_manage',
     label: 'Assistant Google Calendar Manage',
     description: 'Create, update, or delete one event in the owner-only app-created Google calendar.',
     parameters: calendarManageParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof calendarManageParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       assertOwner(toolContext, config);
       if (!Value.Check(calendarManageParameters, params)) {

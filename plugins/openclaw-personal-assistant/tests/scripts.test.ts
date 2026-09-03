@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -263,7 +263,7 @@ describe('deployment scripts', () => {
     const result = spawnSync(gitBash, [installer, '--dry-run'], { encoding: 'utf8' });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('DRY_RUN');
-    expect(result.stdout).toContain('OpenClaw 2026.7.1');
+    expect(result.stdout).toContain('OpenClaw 2026.8.1');
     expect(result.stdout).toContain('Node >=24.15.0 <25.0.0');
     expect(result.stdout).toContain('assistant_briefing,assistant_calendar_manage,assistant_mutate,assistant_query');
     expect(result.stdout).toContain('0 8-22 * * *');
@@ -478,8 +478,9 @@ describe('deployment scripts', () => {
     expect(source).toContain('OPENCLAW_STATE_DIR="$OPENCLAW_HOME"');
     expect(source).toContain('ACTIVE_CONFIG_FILE="$OPENCLAW_STATE_DIR/openclaw.json"');
     expect(source).toContain('OPENCLAW_CONFIG_PATH="$ACTIVE_CONFIG_FILE"');
-    const runtimePaths = readFileSync(resolve(repo,
-      'plugins/openclaw-personal-assistant/node_modules/openclaw/dist/runtime-paths-C6MOwQ_j.js'), 'utf8');
+    const dist = resolve(repo, 'plugins/openclaw-personal-assistant/node_modules/openclaw/dist');
+    const runtimePathsFile = readdirSync(dist).find(name => /^runtime-paths-.*\.js$/.test(name))!;
+    const runtimePaths = readFileSync(resolve(dist, runtimePathsFile), 'utf8');
     expect(runtimePaths).toContain('OPENCLAW_CONFIG_PATH: sharedEnv.configPath');
     expect(runtimePaths).toContain('const configPath = env.OPENCLAW_CONFIG_PATH');
   });

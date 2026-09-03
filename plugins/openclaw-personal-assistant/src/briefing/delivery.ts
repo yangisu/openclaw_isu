@@ -1,4 +1,4 @@
-import { sendDurableMessageBatch } from 'openclaw/plugin-sdk/channel-message-runtime';
+import { sendDurableMessageBatch } from 'openclaw/plugin-sdk/channel-message';
 
 import type { AlertClaim, AlertJournal } from '../state/alerts.js';
 

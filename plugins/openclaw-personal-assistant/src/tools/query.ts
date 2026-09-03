@@ -1,4 +1,4 @@
-import type { AgentTool } from 'openclaw/plugin-sdk/agent-core';
+import type { AnyAgentTool } from 'openclaw/plugin-sdk/core';
 import { join } from 'node:path';
 import type {
   OpenClawPluginApi,
@@ -74,13 +74,13 @@ export function createQueryTool(
   api: OpenClawPluginApi,
   toolContext: Pick<OpenClawPluginToolContext, 'requesterSenderId'>,
   dependencies: QueryToolDependencies = {},
-): AgentTool<typeof queryParameters, QueryResult> {
+): AnyAgentTool {
   return {
     name: 'assistant_query',
     label: 'Assistant Query',
     description: 'Read owner-scoped local records or the dedicated Google calendar as quoted untrusted data.',
     parameters: queryParameters,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId: string, params: Static<typeof queryParameters>, signal?: AbortSignal) {
       const config = loadConfigFromApi(api);
       assertOwner(toolContext, config);
       if (!Value.Check(queryParameters, params)) {
