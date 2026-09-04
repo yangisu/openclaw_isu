@@ -18,6 +18,13 @@ export interface BriefingTask {
   status: 'open' | 'in_progress' | 'done' | 'archived';
   priority: 'high' | 'normal' | 'low';
   dueAt?: string;
+  parentId?: string;
+  studyId?: string;
+  plannedDate?: string;
+  scheduledStart?: string;
+  scheduledEnd?: string;
+  stepIndex?: number;
+  totalSteps?: number;
 }
 
 export interface BriefingStudy {
@@ -35,6 +42,7 @@ export interface BriefingStudy {
   isAssignment?: boolean;
   recurrence?: 'none' | 'daily' | 'weekly';
   reviewDates?: string[];
+  subtaskIds?: string[];
 }
 
 export interface ActiveSubsystemError {
@@ -114,10 +122,20 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
 
   const priorityRank = { high: 0, normal: 1, low: 2 } as const;
   const dueToday = input.tasks
-    .filter(task => activeStatus(task.status) && task.dueAt && seoulDate(task.dueAt) === today)
+    .filter(task => activeStatus(task.status) && task.dueAt && seoulDate(task.dueAt) === today && !task.studyId)
     .sort((left, right) => priorityRank[left.priority] - priorityRank[right.priority]
       || finiteDate(left.dueAt!) - finiteDate(right.dueAt!)
       || left.id.localeCompare(right.id));
+
+  const plannedTasks = input.tasks
+    .filter(task => activeStatus(task.status) && (
+      task.plannedDate === today || (task.scheduledStart && seoulDate(task.scheduledStart) === today)
+    ))
+    .sort((left, right) => {
+      const leftStart = left.scheduledStart ? finiteDate(left.scheduledStart) : Number.MAX_SAFE_INTEGER;
+      const rightStart = right.scheduledStart ? finiteDate(right.scheduledStart) : Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart || left.id.localeCompare(right.id);
+    });
 
   const activeStudies = input.studies.filter(study => activeStatus(study.status) && (
     study.targetDate === today
@@ -137,7 +155,7 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
 
   const overdue = [
     ...input.tasks
-      .filter(task => activeStatus(task.status) && task.dueAt)
+      .filter(task => activeStatus(task.status) && task.dueAt && !task.studyId)
       .map(task => ({
         id: task.id,
         title: task.title,
@@ -147,7 +165,7 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
       .filter(study => activeStatus(study.status) && (study.targetDate || study.deadline))
       .map(study => ({
         id: study.id,
-        title: study.subject,
+        title: study.courseName ? `[${study.courseName}] ${study.subject}` : study.subject,
         days: calendarDayDifference(study.targetDate ?? seoulDate(study.deadline!), today),
       })),
   ].filter(item => item.days >= 2)
@@ -175,6 +193,17 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
       })),
     },
     {
+      heading: 'Planned today',
+      entries: plannedTasks.map(task => {
+        const timeSpan = task.scheduledStart && task.scheduledEnd
+          ? ` (${seoulTime(task.scheduledStart)}~${seoulTime(task.scheduledEnd)})`
+          : '';
+        return {
+          text: `${task.title}${timeSpan}`,
+        };
+      }),
+    },
+    {
       heading: '🏫 School & Assignments',
       entries: schoolAssignments.map(study => {
         const prefix = study.courseName ? `[${study.courseName}] ` : '';
@@ -193,8 +222,10 @@ function selectSections(input: BriefingInput, now: Date, today: string): Section
       })),
     },
     {
-      heading: 'Easy to miss',
-      entries: overdue.map(item => ({ text: `${item.days} days overdue: ${item.title}` })),
+      heading: 'Overdue',
+      entries: overdue.map(item => ({
+        text: `${item.days} ${item.days === 1 ? 'day' : 'days'} overdue: ${item.title}`,
+      })),
     },
     {
       heading: 'Active errors',

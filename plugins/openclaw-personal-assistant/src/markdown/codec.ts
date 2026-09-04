@@ -39,16 +39,16 @@ const STRING_LIST_FIELDS = new Set(['tags']);
 const DATE_LIST_FIELDS = new Set(['review_dates']);
 const ID_LIST_FIELDS = new Set(['related_ids', 'subtask_ids']);
 const BOOLEAN_FIELDS = new Set(['active', 'is_assignment']);
-const INTEGER_FIELDS = new Set(['target_amount', 'progress']);
+const INTEGER_FIELDS = new Set(['target_amount', 'progress', 'step_index', 'total_steps']);
 const TIMESTAMP_FIELDS = new Set([
   'created_at', 'updated_at', 'due_at', 'completed_at', 'resolved_at',
-  'archived_at', 'entry_at', 'deadline',
+  'archived_at', 'entry_at', 'deadline', 'scheduled_start', 'scheduled_end',
 ]);
-const DATE_FIELDS = new Set(['target_date']);
+const DATE_FIELDS = new Set(['target_date', 'planned_date']);
 const ENUM_FIELDS = new Set([
   'status', 'priority', 'recurrence', 'sensitivity', 'category',
 ]);
-const ID_FIELDS = new Set(['supersedes', 'target_id']);
+const ID_FIELDS = new Set(['supersedes', 'target_id', 'parent_id', 'study_id']);
 
 const KIND_ID_PREFIX: Readonly<Record<RecordKind, string>> = {
   task: 'T',
@@ -230,8 +230,29 @@ export function validateRecord(record: ParsedRecord): void {
     case 'task':
       assertEnum(requireField(record, 'status'), ['open', 'in_progress', 'done', 'archived'], 'invalid_status');
       assertEnum(requireField(record, 'priority'), ['high', 'normal', 'low'], 'invalid_priority');
-      for (const key of ['due_at', 'completed_at'] as const) {
+      for (const key of ['due_at', 'completed_at', 'scheduled_start', 'scheduled_end'] as const) {
         if (key in record.fields) assertTimestamp(record.fields[key]);
+      }
+      if ('planned_date' in record.fields) assertDate(record.fields.planned_date);
+      if ('step_index' in record.fields) {
+        assertInteger(record.fields.step_index, 'invalid_integer');
+        if (record.fields.step_index < 1) invalid('invalid_integer', 'step_index must be at least 1');
+      }
+      if ('total_steps' in record.fields) {
+        assertInteger(record.fields.total_steps, 'invalid_integer');
+        if (record.fields.total_steps < 1) invalid('invalid_integer', 'total_steps must be at least 1');
+      }
+      if ('parent_id' in record.fields) {
+        const parentId = record.fields.parent_id;
+        if (typeof parentId !== 'string' || !isAnyRecordId(parentId)) {
+          invalid('invalid_parent_id', 'parent_id must be a record ID');
+        }
+      }
+      if ('study_id' in record.fields) {
+        const studyId = record.fields.study_id;
+        if (typeof studyId !== 'string' || !isAnyRecordId(studyId)) {
+          invalid('invalid_study_id', 'study_id must be a record ID');
+        }
       }
       break;
     case 'study': {

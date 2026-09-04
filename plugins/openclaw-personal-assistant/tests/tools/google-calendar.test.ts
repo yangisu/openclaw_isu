@@ -35,7 +35,11 @@ function event(eventId: string, overrides: Record<string, unknown> = {}) {
 }
 
 describe('assistant_calendar_manage', () => {
-  it('defines create, update and delete without any arbitrary calendar or invitation fields', () => {
+  it('defines create, update and delete without any arbitrary calendar or invitation fields, with optional requestId', () => {
+    expect(Value.Check(calendarManageParameters, {
+      action: 'create',
+      summary: '병원', dtstart: '2026-08-27T10:00:00+09:00', dtend: '2026-08-27T11:00:00+09:00',
+    })).toBe(true);
     expect(Value.Check(calendarManageParameters, {
       action: 'create', requestId: '12345678-1234-4234-8234-1234567890ab',
       summary: '병원', dtstart: '2026-08-27T10:00:00+09:00', dtend: '2026-08-27T11:00:00+09:00',
@@ -129,6 +133,35 @@ describe('assistant_calendar_manage', () => {
       action: 'delete', requestId: '42345678-1234-4234-8234-1234567890ab',
       eventId: 'instance1', etag: '"etag-1"',
     })).rejects.toMatchObject({ code: 'calendar_recurring_instance_unsupported' });
+    ledger.close();
+  });
+
+  it('automatically generates a valid UUID requestId when omitted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'google-tool-auto-uuid-'));
+    roots.push(root);
+    const ledger = new GoogleCalendarLedger(join(root, 'ledger.sqlite3'));
+    const createEvent = vi.fn(async input => event(input.eventId));
+    const api: CalendarManageApi = {
+      createEvent,
+      async getEvent(eventId) { return event(eventId); },
+      async updateEvent() { throw new Error('not used'); },
+      async deleteEvent() { throw new Error('not used'); },
+    };
+    const tool = createCalendarManageTool(pluginApi(), { requesterSenderId: config.telegramUserId }, {
+      openLedger: () => ledger,
+      openApi: async () => api,
+      closeLedger: false,
+    });
+    const params = {
+      action: 'create' as const,
+      summary: '치과 진료', dtstart: '2026-08-27T14:00:00+09:00', dtend: '2026-08-27T15:00:00+09:00',
+    };
+
+    const res = await tool.execute('call-auto', params);
+    expect(res.details).toMatchObject({
+      action: 'create', status: 'succeeded', replayed: false,
+    });
+    expect(createEvent).toHaveBeenCalledTimes(1);
     ledger.close();
   });
 });

@@ -136,6 +136,13 @@ function taskFromRecord(record: ParsedRecord): BriefingTask[] {
     status: status as BriefingTask['status'],
     priority: priority as BriefingTask['priority'],
     ...(typeof fields.due_at === 'string' ? { dueAt: fields.due_at } : {}),
+    ...(typeof fields.parent_id === 'string' ? { parentId: fields.parent_id } : {}),
+    ...(typeof fields.study_id === 'string' ? { studyId: fields.study_id } : {}),
+    ...(typeof fields.planned_date === 'string' ? { plannedDate: fields.planned_date } : {}),
+    ...(typeof fields.scheduled_start === 'string' ? { scheduledStart: fields.scheduled_start } : {}),
+    ...(typeof fields.scheduled_end === 'string' ? { scheduledEnd: fields.scheduled_end } : {}),
+    ...(typeof fields.step_index === 'number' ? { stepIndex: fields.step_index } : {}),
+    ...(typeof fields.total_steps === 'number' ? { totalSteps: fields.total_steps } : {}),
   }];
 }
 
@@ -152,12 +159,19 @@ function studyFromRecord(record: ParsedRecord): BriefingStudy[] {
     progress: fields.progress,
     targetAmount: fields.target_amount,
     unit: fields.unit,
+    ...(typeof fields.category === 'string' ? { category: fields.category as BriefingStudy['category'] } : {}),
+    ...(typeof fields.course_name === 'string' ? { courseName: fields.course_name } : {}),
+    ...(typeof fields.deadline === 'string' ? { deadline: fields.deadline } : {}),
+    ...(typeof fields.is_assignment === 'boolean' ? { isAssignment: fields.is_assignment } : {}),
     ...(typeof fields.target_date === 'string' ? { targetDate: fields.target_date } : {}),
     ...(['none', 'daily', 'weekly'].includes(String(fields.recurrence))
       ? { recurrence: fields.recurrence as BriefingStudy['recurrence'] }
       : {}),
     ...(Array.isArray(fields.review_dates) && fields.review_dates.every(value => typeof value === 'string')
       ? { reviewDates: fields.review_dates as string[] }
+      : {}),
+    ...(Array.isArray(fields.subtask_ids) && fields.subtask_ids.every(value => typeof value === 'string')
+      ? { subtaskIds: fields.subtask_ids as string[] }
       : {}),
   }];
 }

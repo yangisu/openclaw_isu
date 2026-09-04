@@ -1,5 +1,5 @@
 import type { AnyAgentTool } from 'openclaw/plugin-sdk/core';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type {
   OpenClawPluginApi,
@@ -37,7 +37,11 @@ import {
   type GoogleEventMutation,
   type GoogleEventPatch,
 } from '../calendar/google-api.js';
-import { GoogleCalendarLedger, type MutationRecord } from '../calendar/google-ledger.js';
+import {
+  GoogleCalendarLedger,
+  GoogleCalendarLedgerError,
+  type MutationRecord,
+} from '../calendar/google-ledger.js';
 import {
   GoogleOAuth,
   validateGoogleOAuthClientCredentials,
@@ -281,7 +285,7 @@ const googleEtagSchema = Type.String({ pattern: '^"[^"\\r\\n]{1,1022}"$', maxLen
 
 const calendarCreateParameters = Type.Object({
   action: Type.Literal('create'),
-  requestId: uuidSchema,
+  requestId: Type.Optional(uuidSchema),
   summary: Type.String({ minLength: 1, maxLength: 1000 }),
   dtstart: eventDateSchema,
   dtend: eventDateSchema,
@@ -292,7 +296,7 @@ const calendarCreateParameters = Type.Object({
 
 const calendarUpdateParameters = Type.Object({
   action: Type.Literal('update'),
-  requestId: uuidSchema,
+  requestId: Type.Optional(uuidSchema),
   eventId: googleEventIdSchema,
   etag: googleEtagSchema,
   summary: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
@@ -305,7 +309,7 @@ const calendarUpdateParameters = Type.Object({
 
 const calendarDeleteParameters = Type.Object({
   action: Type.Literal('delete'),
-  requestId: uuidSchema,
+  requestId: Type.Optional(uuidSchema),
   eventId: googleEventIdSchema,
   etag: googleEtagSchema,
 }, { additionalProperties: false });
@@ -356,15 +360,16 @@ export function createCalendarManageTool(
       }
       validateManageParameters(params);
       signal?.throwIfAborted();
+      const requestId = params.requestId ?? randomUUID();
       const eventId = params.action === 'create'
-        ? `oc${params.requestId.replaceAll('-', '')}`
+        ? `oc${requestId.replaceAll('-', '')}`
         : params.eventId;
       const payloadHash = hashManageParameters(params, eventId);
       const ledger = (dependencies.openLedger ?? openGoogleLedger)(config);
       let record: MutationRecord;
       try {
         record = ledger.claim({
-          requestId: params.requestId,
+          requestId,
           action: params.action,
           eventId,
           payloadHash,
@@ -385,7 +390,7 @@ export function createCalendarManageTool(
             'A previous calendar mutation with this request ID did not complete safely',
           );
         }
-        ledger.markSubmitting(params.requestId);
+        ledger.markSubmitting(requestId);
         const calendar = await (dependencies.openApi ?? openGoogleApi)(config);
         try {
           if (params.action === 'create') {
@@ -398,7 +403,7 @@ export function createCalendarManageTool(
               ...(params.description === undefined ? {} : { description: params.description }),
               ...(params.rrule === undefined ? {} : { rrule: params.rrule as RecurrenceRule }),
             }, signal);
-            ledger.finish(params.requestId, { status: 'succeeded', resultEtag: created.etag, errorCode: null });
+            ledger.finish(requestId, { status: 'succeeded', resultEtag: created.etag, errorCode: null });
             return jsonResult({ action: 'create', status: 'succeeded', replayed: false, eventId, event: created });
           }
 
@@ -415,29 +420,66 @@ export function createCalendarManageTool(
           if (params.action === 'update') {
             const patch = googlePatch(params);
             const updated = await calendar.updateEvent(eventId, params.etag, patch, signal);
-            ledger.finish(params.requestId, { status: 'succeeded', resultEtag: updated.etag, errorCode: null });
+            ledger.finish(requestId, { status: 'succeeded', resultEtag: updated.etag, errorCode: null });
             return jsonResult({ action: 'update', status: 'succeeded', replayed: false, eventId, event: updated });
           }
           await calendar.deleteEvent(eventId, params.etag, signal);
-          ledger.finish(params.requestId, { status: 'succeeded', errorCode: null });
+          ledger.finish(requestId, { status: 'succeeded', errorCode: null });
           return jsonResult({ action: 'delete', status: 'succeeded', replayed: false, eventId, deleted: true });
         } catch (error) {
+          if (error instanceof GoogleCalendarLedgerError) {
+            throw new AssistantToolError(
+              error.code,
+              userFriendlyCalendarError(error.code),
+            );
+          }
           const code = calendarErrorCode(error);
           const uncertain = ['calendar_timeout', 'calendar_request_failed', 'calendar_server'].includes(code);
           try {
-            ledger.finish(params.requestId, {
+            ledger.finish(requestId, {
               status: uncertain ? 'unknown' : 'failed',
               errorCode: uncertain ? 'calendar_result_unknown' : code,
             });
           } catch { /* retain the original operation error */ }
           if (error instanceof AssistantToolError) throw error;
-          throw new AssistantToolError(code, 'Google Calendar mutation failed');
+          throw new AssistantToolError(code, userFriendlyCalendarError(code));
         }
+      } catch (error) {
+        if (error instanceof GoogleCalendarLedgerError) {
+          throw new AssistantToolError(
+            error.code,
+            userFriendlyCalendarError(error.code),
+          );
+        }
+        throw error;
       } finally {
         if (dependencies.closeLedger !== false) ledger.close();
       }
     },
   };
+}
+
+function userFriendlyCalendarError(code: string): string {
+  switch (code) {
+    case 'invalid_claim':
+    case 'invalid_parameters':
+      return '캘린더 등록/수정 요청 검증에 실패했습니다. 다시 시도해 주세요.';
+    case 'calendar_conflict':
+      return '캘린더 일정이 변경되었습니다. 다시 조회 후 수정해 주세요.';
+    case 'calendar_binding_invalid':
+      return '구글 캘린더 설정(바인딩)이 올바르지 않습니다.';
+    case 'google_oauth_account_mismatch':
+    case 'calendar_auth':
+      return '구글 캘린더 계정 인증에 실패했습니다.';
+    case 'calendar_not_found':
+      return '해당 캘린더 일정을 찾을 수 없습니다.';
+    case 'calendar_rate_limited':
+      return '구글 캘린더 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.';
+    case 'calendar_timeout':
+      return '구글 캘린더 요청 시간이 초과되었습니다.';
+    default:
+      return '구글 캘린더 요청 처리에 실패했습니다.';
+  }
 }
 
 function validateManageParameters(params: CalendarManageParameters): void {
@@ -461,7 +503,21 @@ function googlePatch(params: Extract<CalendarManageParameters, { action: 'update
 }
 
 function hashManageParameters(params: CalendarManageParameters, eventId: string): string {
-  return createHash('sha256').update(JSON.stringify({ ...params, eventId })).digest('hex');
+  const canonical: Record<string, unknown> = {
+    action: params.action,
+    eventId,
+  };
+  if (params.action !== 'create') {
+    canonical.etag = params.etag;
+  }
+  if ('summary' in params && params.summary !== undefined) canonical.summary = params.summary;
+  if ('dtstart' in params && params.dtstart !== undefined) canonical.dtstart = params.dtstart;
+  if ('dtend' in params && params.dtend !== undefined) canonical.dtend = params.dtend;
+  if ('location' in params && params.location !== undefined) canonical.location = params.location;
+  if ('description' in params && params.description !== undefined) canonical.description = params.description;
+  if ('rrule' in params && params.rrule !== undefined) canonical.rrule = params.rrule;
+
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
 function calendarErrorCode(error: unknown): string {

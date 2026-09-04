@@ -44,6 +44,13 @@ export interface AddTaskInput {
   priority?: TaskRecord['priority'];
   dueAt?: string;
   completedAt?: string;
+  parentId?: string;
+  studyId?: string;
+  plannedDate?: string;
+  scheduledStart?: string;
+  scheduledEnd?: string;
+  stepIndex?: number;
+  totalSteps?: number;
   source: string;
 }
 
@@ -283,7 +290,11 @@ function validateOperationId(operationId: string): void {
 }
 
 const UPDATE_FIELDS: Readonly<Record<RecordKind, ReadonlySet<string>>> = {
-  task: new Set(['type', 'created_at', 'source', 'status', 'priority', 'due_at', 'completed_at']),
+  task: new Set([
+    'type', 'created_at', 'source', 'status', 'priority', 'due_at', 'completed_at',
+    'parent_id', 'study_id', 'planned_date', 'scheduled_start', 'scheduled_end',
+    'step_index', 'total_steps',
+  ]),
   study: new Set([
     'type', 'created_at', 'source', 'status', 'category', 'course_name', 'subject',
     'target_amount', 'unit', 'progress', 'target_date', 'deadline', 'is_assignment',
@@ -347,15 +358,17 @@ export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void 
     for (const [key, value] of [
       ['target_amount', fields.target_amount],
       ['progress', fields.progress],
+      ['step_index', fields.step_index],
+      ['total_steps', fields.total_steps],
     ] as const) {
-      if (value !== undefined && !Number.isSafeInteger(value)) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 0)) {
         throw new WorkspaceRepositoryError(
-          key === 'progress' ? 'invalid_progress' : 'invalid_target_amount',
-          `${key} must be a safe decimal integer`,
+          key === 'progress' ? 'invalid_progress' : `invalid_${key}`,
+          `${key} must be a safe non-negative decimal integer`,
         );
       }
     }
-    for (const key of ['due_at', 'completed_at', 'resolved_at', 'entry_at', 'deadline'] as const) {
+    for (const key of ['due_at', 'completed_at', 'resolved_at', 'entry_at', 'deadline', 'scheduled_start', 'scheduled_end'] as const) {
       const value = fields[key];
       if (value !== undefined && !isStrictTimestamp(value)) {
         throw new WorkspaceRepositoryError('invalid_timestamp', `${key} must be RFC 3339 with +09:00`);
@@ -367,8 +380,11 @@ export function validateRecordPatch(kind: RecordKind, patch: RecordPatch): void 
     if (fields.is_assignment !== undefined && typeof fields.is_assignment !== 'boolean') {
       throw new WorkspaceRepositoryError('invalid_boolean', 'is_assignment must be boolean');
     }
-    if (fields.target_date !== undefined && !isStrictDate(fields.target_date)) {
-      throw new WorkspaceRepositoryError('invalid_date', 'target_date must be a valid YYYY-MM-DD value');
+    for (const key of ['target_date', 'planned_date'] as const) {
+      const value = fields[key];
+      if (value !== undefined && !isStrictDate(value)) {
+        throw new WorkspaceRepositoryError('invalid_date', `${key} must be a valid YYYY-MM-DD value`);
+      }
     }
     for (const [key, maximum, itemMaximum] of [
       ['review_dates', 64, undefined],
@@ -440,6 +456,13 @@ function addRecordFields(input: AddRecordInput, timestamp: string): AssistantRec
         priority: input.priority ?? 'normal',
         ...(input.dueAt === undefined ? {} : { due_at: input.dueAt }),
         ...(input.completedAt === undefined ? {} : { completed_at: input.completedAt }),
+        ...(input.parentId === undefined ? {} : { parent_id: input.parentId }),
+        ...(input.studyId === undefined ? {} : { study_id: input.studyId }),
+        ...(input.plannedDate === undefined ? {} : { planned_date: input.plannedDate }),
+        ...(input.scheduledStart === undefined ? {} : { scheduled_start: input.scheduledStart }),
+        ...(input.scheduledEnd === undefined ? {} : { scheduled_end: input.scheduledEnd }),
+        ...(input.stepIndex === undefined ? {} : { step_index: input.stepIndex }),
+        ...(input.totalSteps === undefined ? {} : { total_steps: input.totalSteps }),
       } satisfies TaskRecord;
     case 'study':
       return {
@@ -550,6 +573,28 @@ export function validateAddRecordInput(input: AddRecordInput): void {
     if (input.reviewDates !== undefined) {
       assertAddArray(input.reviewDates, 64, 'invalid_review_dates', 'reviewDates');
     }
+  } else if (input.kind === 'task') {
+    if (input.dueAt !== undefined && !isStrictTimestamp(input.dueAt)) {
+      throw new WorkspaceRepositoryError('invalid_timestamp', 'dueAt must be RFC 3339 with +09:00');
+    }
+    if (input.completedAt !== undefined && !isStrictTimestamp(input.completedAt)) {
+      throw new WorkspaceRepositoryError('invalid_timestamp', 'completedAt must be RFC 3339 with +09:00');
+    }
+    if (input.scheduledStart !== undefined && !isStrictTimestamp(input.scheduledStart)) {
+      throw new WorkspaceRepositoryError('invalid_timestamp', 'scheduledStart must be RFC 3339 with +09:00');
+    }
+    if (input.scheduledEnd !== undefined && !isStrictTimestamp(input.scheduledEnd)) {
+      throw new WorkspaceRepositoryError('invalid_timestamp', 'scheduledEnd must be RFC 3339 with +09:00');
+    }
+    if (input.plannedDate !== undefined && !isStrictDate(input.plannedDate)) {
+      throw new WorkspaceRepositoryError('invalid_date', 'plannedDate must be a valid YYYY-MM-DD value');
+    }
+    if (input.stepIndex !== undefined && (!Number.isSafeInteger(input.stepIndex) || input.stepIndex < 1)) {
+      throw new WorkspaceRepositoryError('invalid_integer', 'stepIndex must be a safe positive integer');
+    }
+    if (input.totalSteps !== undefined && (!Number.isSafeInteger(input.totalSteps) || input.totalSteps < 1)) {
+      throw new WorkspaceRepositoryError('invalid_integer', 'totalSteps must be a safe positive integer');
+    }
   } else if (input.kind === 'note') {
     if (input.url !== undefined) assertAddStringLimit(input.url, 2_048, 'note URL');
     if (input.tags !== undefined) {
@@ -643,6 +688,13 @@ export class WorkspaceRepository {
       ...(input.priority === undefined ? {} : { priority: input.priority }),
       ...(input.dueAt === undefined ? {} : { dueAt: input.dueAt }),
       ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+      ...(input.studyId === undefined ? {} : { studyId: input.studyId }),
+      ...(input.plannedDate === undefined ? {} : { plannedDate: input.plannedDate }),
+      ...(input.scheduledStart === undefined ? {} : { scheduledStart: input.scheduledStart }),
+      ...(input.scheduledEnd === undefined ? {} : { scheduledEnd: input.scheduledEnd }),
+      ...(input.stepIndex === undefined ? {} : { stepIndex: input.stepIndex }),
+      ...(input.totalSteps === undefined ? {} : { totalSteps: input.totalSteps }),
       source: input.source,
     };
     const typedInput: AddRecordInput = { kind: 'task', ...safeInput };

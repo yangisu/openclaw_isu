@@ -62,8 +62,8 @@ export function decomposeAssignment(input: AssignmentDecomposeInput): Decomposed
   if (input.customSteps && input.customSteps.length > 0) {
     const steps: DecomposedStep[] = input.customSteps.map((step, idx) => ({
       stepIndex: idx + 1,
-      title: `[${idx + 1}/${input.customSteps!.length}] [${input.courseName}] ${input.assignmentTitle}: ${step}`,
-      description: `${input.courseName} 과제: ${input.assignmentTitle} - ${step}`,
+      title: `[${input.courseName}] ${input.assignmentTitle}: ${idx + 1}단계 - ${step}`,
+      description: `${input.courseName} 과제: ${input.assignmentTitle} (${idx + 1}/${input.customSteps!.length}단계: ${step})`,
       durationMinutes: blockDuration,
     }));
     return {
@@ -95,8 +95,8 @@ export function decomposeAssignment(input: AssignmentDecomposeInput): Decomposed
 
     steps.push({
       stepIndex: i,
-      title: `[${i}/${totalBlocks}] [${input.courseName}] ${input.assignmentTitle}: ${milestone}`,
-      description: `${input.courseName} 과제: ${input.assignmentTitle} (${i}/${totalBlocks} 블록)`,
+      title: `[${input.courseName}] ${input.assignmentTitle}: ${i}단계 - ${milestone}`,
+      description: `${input.courseName} 과제: ${input.assignmentTitle} (${i}/${totalBlocks}단계: ${milestone})`,
       durationMinutes: blockDuration,
     });
   }
@@ -230,9 +230,14 @@ export function scheduleAssignmentBlocks(input: AssignmentScheduleInput): Assign
 
   const subtaskInputs: AddTaskInput[] = blocks.map((block, idx) => ({
     title: block.title,
-    body: `과제: ${input.assignmentTitle}\n단계: ${decomposed.steps[idx].description}\n집중 시간: ${block.start} ~ ${block.end}`,
-    priority: 'high',
-    dueAt: block.end,
+    body: `과제: ${input.assignmentTitle}\n단계: ${decomposed.steps[idx].description}\n집중 예정 시간: ${block.start} ~ ${block.end}\n마감일: ${input.deadline}`,
+    priority: 'normal',
+    dueAt: input.deadline,
+    plannedDate: formatSeoulDate(new Date(block.start)),
+    scheduledStart: block.start,
+    scheduledEnd: block.end,
+    stepIndex: block.stepIndex,
+    totalSteps: decomposed.totalBlocks,
     source: 'telegram',
   }));
 

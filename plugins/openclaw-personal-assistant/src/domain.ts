@@ -41,6 +41,13 @@ export interface TaskRecord extends CommonRecordFields {
   priority: 'high' | 'normal' | 'low';
   due_at?: string;
   completed_at?: string;
+  parent_id?: string;
+  study_id?: string;
+  planned_date?: string;
+  scheduled_start?: string;
+  scheduled_end?: string;
+  step_index?: number;
+  total_steps?: number;
 }
 
 export type StudyCategory = 'school' | 'personal';
@@ -109,6 +116,13 @@ export interface AddTaskRecordInput extends AddRecordBase {
   priority?: TaskRecord['priority'];
   dueAt?: string;
   completedAt?: string;
+  parentId?: string;
+  studyId?: string;
+  plannedDate?: string;
+  scheduledStart?: string;
+  scheduledEnd?: string;
+  stepIndex?: number;
+  totalSteps?: number;
 }
 
 export interface AddStudyRecordInput extends AddRecordBase {

@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   decomposeAssignment,
   scheduleAssignmentBlocks,
@@ -17,10 +17,12 @@ describe('assignment breakdown & scheduling engine', () => {
 
     expect(decomposed.totalBlocks).toBe(4);
     expect(decomposed.steps).toHaveLength(4);
-    expect(decomposed.steps[0].title).toContain('[1/4]');
-    expect(decomposed.steps[0].title).toContain('요구사항 분석');
-    expect(decomposed.steps[3].title).toContain('[4/4]');
-    expect(decomposed.steps[3].title).toContain('최종 검토');
+    expect(decomposed.steps[0].title).toContain('1단계 - 요구사항 분석');
+    expect(decomposed.steps[0].title).not.toContain('[1/4]');
+    expect(decomposed.steps[0].stepIndex).toBe(1);
+    expect(decomposed.steps[3].title).toContain('4단계 - 최종 검토');
+    expect(decomposed.steps[3].title).not.toContain('[4/4]');
+    expect(decomposed.steps[3].stepIndex).toBe(4);
   });
 
   it('allocates slots backward before deadline avoiding sleep window (02:00-08:00) and existing events', () => {
@@ -86,7 +88,12 @@ describe('assignment breakdown & scheduling engine', () => {
     });
 
     expect(result.subtaskInputs).toHaveLength(2);
-    expect(result.subtaskInputs[0].priority).toBe('high');
-    expect(result.subtaskInputs[0].dueAt).toBeDefined();
+    expect(result.subtaskInputs[0].priority).toBe('normal');
+    expect(result.subtaskInputs[0].dueAt).toBe(input.deadline);
+    expect(result.subtaskInputs[0].plannedDate).toBeDefined();
+    expect(result.subtaskInputs[0].scheduledStart).toBeDefined();
+    expect(result.subtaskInputs[0].scheduledEnd).toBeDefined();
+    expect(result.subtaskInputs[0].stepIndex).toBe(1);
+    expect(result.subtaskInputs[0].totalSteps).toBe(2);
   });
 });

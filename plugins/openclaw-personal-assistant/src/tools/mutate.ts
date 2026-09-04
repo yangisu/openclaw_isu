@@ -51,6 +51,13 @@ const taskFieldsSchema = Type.Object({
   priority: Type.Optional(Type.Union([Type.Literal('high'), Type.Literal('normal'), Type.Literal('low')])),
   due_at: Type.Optional(timestampSchema),
   completed_at: Type.Optional(timestampSchema),
+  parent_id: Type.Optional(targetIdSchema),
+  study_id: Type.Optional(studyIdSchema),
+  planned_date: Type.Optional(dateSchema),
+  scheduled_start: Type.Optional(timestampSchema),
+  scheduled_end: Type.Optional(timestampSchema),
+  step_index: Type.Optional(Type.Integer({ minimum: 1, maximum: 999 })),
+  total_steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 999 })),
 }, { additionalProperties: false, minProperties: 1 });
 const studyFieldsSchema = Type.Object({
   status: Type.Optional(workStatusSchema),
@@ -131,6 +138,13 @@ export const mutationParameters = Type.Union([
     priority: Type.Optional(Type.Union([Type.Literal('high'), Type.Literal('normal'), Type.Literal('low')])),
     dueAt: Type.Optional(timestampSchema),
     completedAt: Type.Optional(timestampSchema),
+    parentId: Type.Optional(targetIdSchema),
+    studyId: Type.Optional(studyIdSchema),
+    plannedDate: Type.Optional(dateSchema),
+    scheduledStart: Type.Optional(timestampSchema),
+    scheduledEnd: Type.Optional(timestampSchema),
+    stepIndex: Type.Optional(Type.Integer({ minimum: 1, maximum: 999 })),
+    totalSteps: Type.Optional(Type.Integer({ minimum: 1, maximum: 999 })),
   }, { additionalProperties: false }),
   Type.Object({
     operationId: operationIdSchema,
@@ -278,7 +292,10 @@ export function createMutationTool(
           // 2. Add subtasks
           const subtaskIds: string[] = [];
           for (let i = 0; i < scheduled.subtaskInputs.length; i++) {
-            const subtask = scheduled.subtaskInputs[i];
+            const subtask = {
+              ...scheduled.subtaskInputs[i],
+              studyId: studyResult.id,
+            };
             const taskResult = await repository.addTask(
               `${params.operationId}-subtask-${i + 1}`,
               subtask,
@@ -331,6 +348,13 @@ function addInputFromParameters(
         ...(params.priority === undefined ? {} : { priority: params.priority }),
         ...(params.dueAt === undefined ? {} : { dueAt: params.dueAt }),
         ...(params.completedAt === undefined ? {} : { completedAt: params.completedAt }),
+        ...(params.parentId === undefined ? {} : { parentId: params.parentId }),
+        ...(params.studyId === undefined ? {} : { studyId: params.studyId }),
+        ...(params.plannedDate === undefined ? {} : { plannedDate: params.plannedDate }),
+        ...(params.scheduledStart === undefined ? {} : { scheduledStart: params.scheduledStart }),
+        ...(params.scheduledEnd === undefined ? {} : { scheduledEnd: params.scheduledEnd }),
+        ...(params.stepIndex === undefined ? {} : { stepIndex: params.stepIndex }),
+        ...(params.totalSteps === undefined ? {} : { totalSteps: params.totalSteps }),
       };
     case 'study':
       return {
